@@ -1,0 +1,56 @@
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Datasets: keep scripts and documentation under data/, exclude local assets
+data/raw/
+data/nuscenes/
+data/can_bus/
+data/maps/
+data/interim/
+data/processed/
+
+# Model weights and training artifacts
+models/
+checkpoints/
+outputs/
+runs/
+wandb/
+tensorboard/
+artifacts/
+.cache/
+huggingface/
+*.ckpt
+*.bin
+*.pth
+*.pt
+*.safetensors
+*.onnx
+
+# Generated media and reports
+demo/assets/generated/
+reports/generated/
