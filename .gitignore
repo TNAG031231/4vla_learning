@@ -23,16 +23,31 @@ venv/
 
 # Logs and temporary files
 *.log
+logs/
 tmp/
 temp/
+scratch/
 
-# Datasets: keep scripts and documentation under data/, exclude local assets
-data/raw/
+# Datasets and archives
 data/nuscenes/
-data/can_bus/
-data/maps/
-data/interim/
-data/processed/
+data/outputs/
+data/generated/
+data/cache/
+data/**/*.tgz
+data/**/*.tar
+data/**/*.tar.gz
+data/**/*.zip
+datasets/
+nuscenes/
+can_bus/
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+
+# Local environment audit snapshots
+env_bishe_pip_freeze.txt
+env_bishe_conda_export.yaml
 
 # Model weights and training artifacts
 models/
@@ -44,6 +59,7 @@ tensorboard/
 artifacts/
 .cache/
 huggingface/
+conda-meta/
 *.ckpt
 *.bin
 *.pth
@@ -54,3 +70,20 @@ huggingface/
 # Generated media and reports
 demo/assets/generated/
 reports/generated/
+
+# Codex temporary planning files
+docs/specs/
+specs/
+**/2026-*-*-*-design.md
+**/2026-*-*-*-plan.md
+**/codex_task_*.md
+**/debug_notes*.md
+**/tmp_notes*.md
+
+# One-off debug scripts in project root
+/debug_*.py
+/try_*.py
+/tmp_*.py
+/temp_*.py
+/check_*_tmp.py
+/test_*_tmp.py

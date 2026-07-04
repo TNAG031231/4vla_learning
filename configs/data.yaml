@@ -1,0 +1,10 @@
+data:
+  nuscenes_root: "${NUSCENES_ROOT}"
+  version: "v1.0-mini"
+  camera: "CAM_FRONT"
+  can_bus_dir: "${NUSCENES_ROOT}/can_bus"
+
+phase1:
+  horizon_sec: 3.0
+  sample_interval_sec: 0.5
+  max_agent_distance_m: 50.0

@@ -1,0 +1,15 @@
+nuscenes-devkit
+numpy
+pandas
+scipy
+scikit-learn
+opencv-python
+pillow
+matplotlib
+pyquaternion
+shapely
+tqdm
+pyyaml
+rich
+pytest
+ipykernel
