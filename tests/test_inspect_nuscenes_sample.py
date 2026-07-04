@@ -63,6 +63,51 @@ class FakeNuScenes:
         return self.records[(table_name, token)]
 
 
+class FakeNearbyNuScenes:
+    def __init__(self, annotation_tokens: list[str]) -> None:
+        self.scene = [{"first_sample_token": "agents"}]
+        self.records = {
+            ("sample", "agents"): {
+                "token": "agents",
+                "scene_token": "scene",
+                "timestamp": 1_000_000,
+                "next": "",
+                "data": {"CAM_FRONT": "agents_camera"},
+                "anns": annotation_tokens,
+            },
+            ("sample_data", "agents_camera"): {
+                "ego_pose_token": "agents_pose",
+            },
+            ("ego_pose", "agents_pose"): {
+                "translation": [10.0, 20.0, 0.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0],
+            },
+            ("sample_annotation", "near"): {
+                "token": "near",
+                "instance_token": "near_instance",
+                "category_name": "vehicle.car",
+                "translation": [20.0, 20.0, 0.0],
+                "size": [2.0, 4.5, 1.7],
+                "rotation": [1.0, 0.0, 0.0, 0.0],
+                "num_lidar_pts": 12,
+                "num_radar_pts": 3,
+            },
+            ("sample_annotation", "far"): {
+                "token": "far",
+                "instance_token": "far_instance",
+                "category_name": "human.pedestrian.adult",
+                "translation": [70.0, 20.0, 0.0],
+                "size": [0.7, 0.8, 1.8],
+                "rotation": [1.0, 0.0, 0.0, 0.0],
+                "num_lidar_pts": 4,
+                "num_radar_pts": 0,
+            },
+        }
+
+    def get(self, table_name: str, token: str) -> dict[str, object]:
+        return self.records[(table_name, token)]
+
+
 def test_global_displacement_is_rotated_into_current_ego_frame() -> None:
     inspection = load_inspection_module()
     current_rotation = Quaternion(
@@ -136,6 +181,7 @@ def test_config_expands_nuscenes_root_environment_variable(
                 "phase1:",
                 "  horizon_sec: 3.0",
                 "  sample_interval_sec: 0.5",
+                "  max_agent_distance_m: 50.0",
             )
         )
     )
@@ -147,3 +193,89 @@ def test_config_expands_nuscenes_root_environment_variable(
     assert config.version == "v1.0-mini"
     assert config.horizon_sec == pytest.approx(3.0)
     assert config.sample_interval_sec == pytest.approx(0.5)
+    assert config.nearby_radius_m == pytest.approx(50.0)
+
+
+def test_global_point_is_transformed_into_current_ego_frame() -> None:
+    inspection = load_inspection_module()
+    current_rotation = Quaternion(
+        axis=[0.0, 0.0, 1.0],
+        angle=math.pi / 2.0,
+    )
+
+    point = inspection.transform_global_point_to_ego(
+        point_global=(10.0, 21.0, 0.0),
+        ego_translation_global=(10.0, 20.0, 0.0),
+        ego_rotation_global=tuple(current_rotation.elements),
+    )
+
+    assert point == pytest.approx((1.0, 0.0, 0.0), abs=1e-9)
+
+
+def test_point_near_ego_origin_preserves_expected_offset() -> None:
+    inspection = load_inspection_module()
+
+    point = inspection.transform_global_point_to_ego(
+        point_global=(10.2, 19.8, 0.1),
+        ego_translation_global=(10.0, 20.0, 0.0),
+        ego_rotation_global=(1.0, 0.0, 0.0, 0.0),
+    )
+
+    assert point == pytest.approx((0.2, -0.2, 0.1))
+
+
+def test_relative_yaw_is_normalized_to_pi_interval() -> None:
+    inspection = load_inspection_module()
+
+    yaw_ego_rad = inspection.transform_global_yaw_to_ego(
+        yaw_global_rad=math.radians(-170.0),
+        ego_yaw_global_rad=math.radians(170.0),
+    )
+
+    assert yaw_ego_rad == pytest.approx(math.radians(20.0))
+    assert -math.pi <= yaw_ego_rad <= math.pi
+
+
+def test_radius_filter_keeps_near_agent_and_excludes_far_agent() -> None:
+    inspection = load_inspection_module()
+
+    result = inspection.get_nearby_agents(
+        nuscenes=FakeNearbyNuScenes(["near", "far"]),
+        sample_token="agents",
+        radius_m=50.0,
+    )
+
+    assert [agent.annotation_token for agent in result.agents] == ["near"]
+    assert result.agents[0].translation_ego == pytest.approx((10.0, 0.0, 0.0))
+    assert result.agents[0].distance_xy_m == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    ("category_name", "expected"),
+    (
+        ("vehicle.car", (True, False)),
+        ("vehicle.bicycle", (True, True)),
+        ("vehicle.motorcycle", (True, True)),
+        ("human.pedestrian.adult", (False, True)),
+        ("movable_object.barrier", (False, False)),
+    ),
+)
+def test_agent_category_classification(
+    category_name: str,
+    expected: tuple[bool, bool],
+) -> None:
+    inspection = load_inspection_module()
+
+    assert inspection.classify_agent_category(category_name) == expected
+
+
+def test_empty_annotations_return_empty_nearby_agents() -> None:
+    inspection = load_inspection_module()
+
+    result = inspection.get_nearby_agents(
+        nuscenes=FakeNearbyNuScenes([]),
+        sample_token="agents",
+        radius_m=50.0,
+    )
+
+    assert result.agents == ()
