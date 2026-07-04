@@ -236,6 +236,45 @@ docs: report experiments and limitations
 - 除非用户明确要求，不得自动 commit 或 push。
 - 永远不得使用 `git push --force`。
 
+## GitHub PR Collaboration Workflow
+
+1. Codex 接到任务后，必须先从最新 `main` 开始并确认工作区状态：
+
+   ```bash
+   git checkout main
+   git pull --ff-only origin main
+   git status --short
+   ```
+
+2. 每个任务使用独立分支，命名格式为 `task_<phase-or-id>_<short-name>`，例如 `task_p1_5_manual_review`；不得直接在 `main` 上修改。
+3. 修改前必须读取 `AGENTS.md`、`README.md`、`project_mvp_plan.md`、存在时的 `docs/progress.md`，以及与任务直接相关的源文件和测试文件。
+4. 提交前禁止使用 `git add .` 或 `git add -A`。必须显式指定文件路径，例如：
+
+   ```bash
+   git add data/verify_labels.py tests/test_verify_labels.py docs/progress.md
+   ```
+
+5. Commit 前必须运行并检查：
+
+   ```bash
+   git status --short
+   git diff --stat
+   git diff -- <相关文件>
+   ```
+
+   同时运行当前改动所需的测试命令。Commit message 沿用本文件既有风格，例如 `feat(data): add manual review export`、`test(data): cover label verification cases` 或 `docs: update confirmed progress`。
+6. 允许使用 `git push -u origin <branch-name>` 推送当前任务分支。永远不得使用 `git push --force`。
+7. GitHub CLI 可用且已登录时，可以创建 PR：
+
+   ```bash
+   gh pr create --base main --head <branch-name> --title "<title>" --body-file <body-file>
+   ```
+
+   若 `gh` 不可用或未登录，不得反复尝试或伪造成功；必须输出 branch name、commit hash、建议 PR title、建议 PR body 和手动创建 PR 的说明。
+8. PR description 作为本轮任务 handoff；`docs/progress.md` 只记录长期稳定且已确认的事实；最终聊天回复也必须包含 handoff summary。除非用户明确要求，不创建 `docs/handoff/`。
+9. PR 和 handoff 必须说明 changed / why / how to verify、当前 phase / gate、未运行的验证及原因，并确认 diff 仅包含相关文件。
+10. 永远不得提交数据集、模型权重、checkpoint、日志、缓存、`.env`、API key、个人文件或大型二进制文件；不得把 planned work 写成 completed work，也不得跳过当前 phase gate。
+
 ## 9. First Task Reminder
 
 项目启动后的第一条工程任务是实现并验证：
