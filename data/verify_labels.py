@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 import json
@@ -596,46 +597,24 @@ def _print_summary(
         )
 
 
-def _evenly_spaced_indices(length: int, count: int) -> tuple[int, ...]:
-    if count >= length:
-        return tuple(range(length))
-    if count == 1:
-        return (length // 2,)
-    return tuple(
-        round(index * (length - 1) / (count - 1))
-        for index in range(count)
-    )
-
-
 def collect_review_sample_tokens(
     nuscenes: NuScenes,
-    sample_count: int,
 ) -> tuple[str, ...]:
-    if sample_count <= 0:
-        raise ValueError("sample_count must be positive")
-    if not nuscenes.scene:
-        return ()
-
-    samples_per_scene = max(
-        1,
-        math.ceil(sample_count / len(nuscenes.scene)),
-    )
-    selected_tokens = []
+    sample_tokens = []
     for scene in nuscenes.scene:
         token = str(scene["first_sample_token"])
-        scene_tokens = []
         while token:
-            scene_tokens.append(token)
+            sample_tokens.append(token)
             sample = nuscenes.get("sample", token)
             token = str(sample["next"])
-        selected_tokens.extend(
-            scene_tokens[index]
-            for index in _evenly_spaced_indices(
-                len(scene_tokens),
-                samples_per_scene,
-            )
-        )
-    return tuple(selected_tokens)
+    return tuple(sample_tokens)
+
+
+def expected_trajectory_points(
+    horizon_sec: float,
+    sample_interval_sec: float,
+) -> int:
+    return math.floor(horizon_sec / sample_interval_sec + 1e-9) + 1
 
 
 def build_review_candidate(
@@ -660,13 +639,37 @@ def build_review_candidate(
         sample_token=sample_token,
         radius_m=max_agent_distance_m,
     )
+    trajectory_points = len(trajectory.points)
+    expected_min_trajectory_points = expected_trajectory_points(
+        horizon_sec=horizon_sec,
+        sample_interval_sec=sample_interval_sec,
+    )
     if trajectory.points:
+        x_values = tuple(point.x_m for point in trajectory.points)
+        y_values = tuple(point.y_m for point in trajectory.points)
+        first_point = trajectory.points[0]
         final_point = trajectory.points[-1]
         forward_displacement_m = final_point.x_m
         lateral_displacement_m = final_point.y_m
+        trajectory_x_range_m = max(x_values) - min(x_values)
+        trajectory_y_range_m = max(y_values) - min(y_values)
+        trajectory_displacement_m = math.hypot(
+            final_point.x_m - first_point.x_m,
+            final_point.y_m - first_point.y_m,
+        )
     else:
         forward_displacement_m = 0.0
         lateral_displacement_m = 0.0
+        trajectory_x_range_m = 0.0
+        trajectory_y_range_m = 0.0
+        trajectory_displacement_m = 0.0
+    trajectory_is_valid = (
+        trajectory_points >= expected_min_trajectory_points
+        and not trajectory.is_truncated
+    )
+    trajectory_invalid_reason = (
+        "" if trajectory_is_valid else "insufficient_future_trajectory"
+    )
 
     return ReviewCandidate(
         sample_token=sample_token,
@@ -680,6 +683,13 @@ def build_review_candidate(
             lateral_displacement_m,
         ),
         nearby_agent_count=len(nearby_agents.agents),
+        trajectory_points=trajectory_points,
+        expected_min_trajectory_points=expected_min_trajectory_points,
+        trajectory_x_range_m=trajectory_x_range_m,
+        trajectory_y_range_m=trajectory_y_range_m,
+        trajectory_displacement_m=trajectory_displacement_m,
+        trajectory_is_valid=trajectory_is_valid,
+        trajectory_invalid_reason=trajectory_invalid_reason,
     )
 
 
@@ -691,7 +701,7 @@ def build_review_candidate_pool(
     sample_interval_sec: float,
     max_agent_distance_m: float,
 ) -> tuple[ReviewCandidate, ...]:
-    return tuple(
+    all_candidates = tuple(
         build_review_candidate(
             nuscenes=nuscenes,
             sample_token=sample_token,
@@ -702,9 +712,34 @@ def build_review_candidate_pool(
         )
         for sample_token in collect_review_sample_tokens(
             nuscenes=nuscenes,
-            sample_count=sample_count,
         )
     )
+    valid_candidates = tuple(
+        candidate
+        for candidate in all_candidates
+        if candidate.trajectory_is_valid
+    )
+    invalid_reasons = Counter(
+        candidate.trajectory_invalid_reason
+        for candidate in all_candidates
+        if not candidate.trajectory_is_valid
+    )
+    print(f"total candidate samples: {len(all_candidates)}")
+    print(f"valid trajectory samples: {len(valid_candidates)}")
+    print(
+        "invalid insufficient_future_trajectory samples: "
+        f"{invalid_reasons['insufficient_future_trajectory']}"
+    )
+    print(
+        "invalid reason distribution: "
+        f"{dict(sorted(invalid_reasons.items()))}"
+    )
+    if len(valid_candidates) < sample_count:
+        print(
+            f"warning: only {len(valid_candidates)} valid trajectory samples "
+            f"available for requested {sample_count}"
+        )
+    return valid_candidates
 
 
 def initialize_review_batch(
@@ -736,6 +771,14 @@ def initialize_review_batch(
         selections=selections,
         label_rule_version=label_rule_version,
         safety_rule_version=safety_rule_version,
+    )
+    selected_point_distribution = Counter(
+        record.trajectory_points for record in records
+    )
+    print(f"selected samples: {len(records)}")
+    print(
+        "selected trajectory_points distribution: "
+        f"{dict(sorted(selected_point_distribution.items()))}"
     )
     if preview:
         for record in records:
@@ -774,7 +817,6 @@ def initialize_review_batch(
     )
     print(f"review manifest: {manifest_path}")
     print(f"review template: {template_path}")
-    print(f"selected samples: {len(records)}")
     return records
 
 

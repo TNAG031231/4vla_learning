@@ -434,7 +434,7 @@ def test_review_records_keep_selection_reason_and_relative_visualization_path(
     assert records[0].safety_rule_version == "unavailable"
 
 
-def test_review_pool_samples_multiple_positions_from_each_scene() -> None:
+def test_review_pool_traverses_scene_samples_before_validity_filtering() -> None:
     visualization = load_visualization_module()
 
     class FakeNuScenes:
@@ -457,10 +457,9 @@ def test_review_pool_samples_multiple_positions_from_each_scene() -> None:
 
     tokens = visualization.collect_review_sample_tokens(
         nuscenes=FakeNuScenes(),
-        sample_count=4,
     )
 
-    assert set(tokens) == {"a-0", "a-2", "b-0", "b-2"}
+    assert set(tokens) == {"a-0", "a-1", "a-2", "b-0", "b-1", "b-2"}
 
 
 def test_review_candidate_uses_existing_trajectory_and_agent_extractors(
@@ -502,7 +501,8 @@ def test_review_candidate_uses_existing_trajectory_and_agent_extractors(
                     -2.0,
                     0.1,
                 ),
-            )
+            ),
+            is_truncated=False,
         ),
     )
     monkeypatch.setattr(
@@ -515,8 +515,8 @@ def test_review_candidate_uses_existing_trajectory_and_agent_extractors(
         nuscenes=FakeNuScenes(),
         sample_token="sample",
         camera="CAM_FRONT",
-        horizon_sec=3.0,
-        sample_interval_sec=0.5,
+        horizon_sec=1.0,
+        sample_interval_sec=1.0,
         max_agent_distance_m=50.0,
     )
 
@@ -525,7 +525,186 @@ def test_review_candidate_uses_existing_trajectory_and_agent_extractors(
     assert candidate.forward_displacement_m == pytest.approx(6.0)
     assert candidate.lateral_displacement_m == pytest.approx(-2.0)
     assert candidate.total_displacement_m == pytest.approx(6.3249, rel=1e-4)
+    assert candidate.trajectory_points == 2
+    assert candidate.expected_min_trajectory_points == 2
+    assert candidate.trajectory_x_range_m == pytest.approx(6.0)
+    assert candidate.trajectory_y_range_m == pytest.approx(2.0)
+    assert candidate.trajectory_is_valid is True
+    assert candidate.trajectory_invalid_reason == ""
     assert candidate.nearby_agent_count == 2
+
+
+def test_single_point_zero_displacement_trajectory_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    visualization = load_visualization_module()
+
+    class FakeNuScenes:
+        records = {
+            ("sample", "tail"): {
+                "scene_token": "scene",
+                "timestamp": 1_000_000,
+                "data": {"CAM_FRONT": "camera"},
+            },
+            ("sample_data", "camera"): {"filename": "tail.jpg"},
+        }
+
+        def get(self, table_name: str, token: str) -> dict[str, object]:
+            return self.records[(table_name, token)]
+
+    monkeypatch.setattr(
+        visualization,
+        "extract_future_ego_trajectory",
+        lambda **_: SimpleNamespace(
+            points=(
+                visualization.TrajectoryPoint(
+                    "tail", 0.0, 0.0, 0.0, 0.0
+                ),
+            ),
+            is_truncated=True,
+        ),
+    )
+    monkeypatch.setattr(
+        visualization,
+        "get_nearby_agents",
+        lambda **_: SimpleNamespace(agents=()),
+    )
+
+    candidate = visualization.build_review_candidate(
+        nuscenes=FakeNuScenes(),
+        sample_token="tail",
+        camera="CAM_FRONT",
+        horizon_sec=3.0,
+        sample_interval_sec=0.5,
+        max_agent_distance_m=50.0,
+    )
+
+    assert candidate.trajectory_points == 1
+    assert candidate.expected_min_trajectory_points == 7
+    assert candidate.trajectory_displacement_m == pytest.approx(0.0)
+    assert candidate.trajectory_is_valid is False
+    assert candidate.trajectory_invalid_reason == (
+        "insufficient_future_trajectory"
+    )
+
+
+def test_candidate_pool_filters_scene_tail_with_insufficient_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    visualization = load_visualization_module()
+    valid = visualization.ReviewCandidate(
+        "valid",
+        "scene",
+        1,
+        "valid.jpg",
+        0.1,
+        0.0,
+        0.1,
+        0,
+        trajectory_points=7,
+        expected_min_trajectory_points=7,
+        trajectory_is_valid=True,
+    )
+    invalid = visualization.ReviewCandidate(
+        "tail",
+        "scene",
+        2,
+        "tail.jpg",
+        0.0,
+        0.0,
+        0.0,
+        0,
+        trajectory_points=1,
+        expected_min_trajectory_points=7,
+        trajectory_is_valid=False,
+        trajectory_invalid_reason="insufficient_future_trajectory",
+    )
+    monkeypatch.setattr(
+        visualization,
+        "collect_review_sample_tokens",
+        lambda **_: ("valid", "tail"),
+    )
+    monkeypatch.setattr(
+        visualization,
+        "build_review_candidate",
+        lambda sample_token, **_: valid if sample_token == "valid" else invalid,
+    )
+
+    candidates = visualization.build_review_candidate_pool(
+        nuscenes=object(),
+        sample_count=2,
+        camera="CAM_FRONT",
+        horizon_sec=3.0,
+        sample_interval_sec=0.5,
+        max_agent_distance_m=50.0,
+    )
+
+    assert candidates == (valid,)
+    output = capsys.readouterr().out
+    assert "total candidate samples: 2" in output
+    assert "valid trajectory samples: 1" in output
+    assert "invalid insufficient_future_trajectory samples: 1" in output
+    assert "warning: only 1 valid trajectory samples" in output
+
+
+def test_low_displacement_requires_complete_future_trajectory() -> None:
+    visualization = load_visualization_module()
+    invalid_tail = visualization.ReviewCandidate(
+        "tail",
+        "scene-tail",
+        1,
+        "tail.jpg",
+        0.0,
+        0.0,
+        0.0,
+        0,
+        trajectory_points=1,
+        expected_min_trajectory_points=7,
+        trajectory_is_valid=False,
+        trajectory_invalid_reason="insufficient_future_trajectory",
+    )
+    valid_stopped = visualization.ReviewCandidate(
+        "stopped",
+        "scene-stopped",
+        2,
+        "stopped.jpg",
+        0.01,
+        0.0,
+        0.01,
+        0,
+        trajectory_points=7,
+        expected_min_trajectory_points=7,
+        trajectory_is_valid=True,
+    )
+    valid_moving = visualization.ReviewCandidate(
+        "moving",
+        "scene-moving",
+        3,
+        "moving.jpg",
+        8.0,
+        0.0,
+        8.0,
+        0,
+        trajectory_points=7,
+        expected_min_trajectory_points=7,
+        trajectory_is_valid=True,
+    )
+
+    selections = visualization.select_review_candidates(
+        candidates=(invalid_tail, valid_stopped, valid_moving),
+        sample_count=2,
+    )
+
+    low_displacement = next(
+        selection
+        for selection in selections
+        if selection.reason == "low_displacement_candidate"
+    )
+    assert low_displacement.candidate.sample_token == "stopped"
+    assert all(
+        selection.candidate.trajectory_is_valid for selection in selections
+    )
 
 
 def test_review_preview_returns_records_without_writing_outputs(
@@ -567,4 +746,7 @@ def test_review_preview_returns_records_without_writing_outputs(
     assert len(records) == 1
     assert records[0].sample_token == "sample"
     assert not (tmp_path / "review").exists()
-    assert '"sample_token": "sample"' in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "selected samples: 1" in output
+    assert "selected trajectory_points distribution: {7: 1}" in output
+    assert '"sample_token": "sample"' in output

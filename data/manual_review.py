@@ -28,6 +28,13 @@ REVIEW_RECORD_FIELDS = (
     "lateral_displacement_m",
     "total_displacement_m",
     "nearby_agent_count",
+    "trajectory_points",
+    "expected_min_trajectory_points",
+    "trajectory_x_range_m",
+    "trajectory_y_range_m",
+    "trajectory_displacement_m",
+    "trajectory_is_valid",
+    "trajectory_invalid_reason",
 )
 LABEL_REVIEW_VALUES = frozenset(
     {"yes", "no", "uncertain", "not_applicable"}
@@ -63,6 +70,13 @@ class ReviewRecord:
     lateral_displacement_m: float
     total_displacement_m: float
     nearby_agent_count: int
+    trajectory_points: int
+    expected_min_trajectory_points: int
+    trajectory_x_range_m: float
+    trajectory_y_range_m: float
+    trajectory_displacement_m: float
+    trajectory_is_valid: bool
+    trajectory_invalid_reason: str
 
 
 @dataclass(frozen=True)
@@ -85,6 +99,13 @@ class ReviewCandidate:
     lateral_displacement_m: float
     total_displacement_m: float
     nearby_agent_count: int
+    trajectory_points: int = 7
+    expected_min_trajectory_points: int = 7
+    trajectory_x_range_m: float = 0.0
+    trajectory_y_range_m: float = 0.0
+    trajectory_displacement_m: float = 0.0
+    trajectory_is_valid: bool = True
+    trajectory_invalid_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -137,6 +158,13 @@ def create_review_record(
     lateral_displacement_m: float = 0.0,
     total_displacement_m: float = 0.0,
     nearby_agent_count: int = 0,
+    trajectory_points: int = 0,
+    expected_min_trajectory_points: int = 0,
+    trajectory_x_range_m: float = 0.0,
+    trajectory_y_range_m: float = 0.0,
+    trajectory_displacement_m: float = 0.0,
+    trajectory_is_valid: bool = False,
+    trajectory_invalid_reason: str = "",
 ) -> ReviewRecord:
     record = ReviewRecord(
         sample_token=sample_token,
@@ -162,6 +190,13 @@ def create_review_record(
         lateral_displacement_m=lateral_displacement_m,
         total_displacement_m=total_displacement_m,
         nearby_agent_count=nearby_agent_count,
+        trajectory_points=trajectory_points,
+        expected_min_trajectory_points=expected_min_trajectory_points,
+        trajectory_x_range_m=trajectory_x_range_m,
+        trajectory_y_range_m=trajectory_y_range_m,
+        trajectory_displacement_m=trajectory_displacement_m,
+        trajectory_is_valid=trajectory_is_valid,
+        trajectory_invalid_reason=trajectory_invalid_reason,
     )
     validate_review_record(record)
     return record
@@ -218,12 +253,15 @@ def select_review_candidates(
     if sample_count <= 0:
         raise ValueError("sample_count must be positive")
 
+    valid_candidates = tuple(
+        candidate for candidate in candidates if candidate.trajectory_is_valid
+    )
     criteria = (
         (
             "high_forward_displacement_candidate",
             tuple(
                 sorted(
-                    candidates,
+                    valid_candidates,
                     key=lambda candidate: (
                         -candidate.forward_displacement_m,
                         candidate.sample_token,
@@ -235,7 +273,7 @@ def select_review_candidates(
             "low_displacement_candidate",
             tuple(
                 sorted(
-                    candidates,
+                    valid_candidates,
                     key=lambda candidate: (
                         candidate.total_displacement_m,
                         candidate.sample_token,
@@ -249,7 +287,7 @@ def select_review_candidates(
                 sorted(
                     (
                         candidate
-                        for candidate in candidates
+                        for candidate in valid_candidates
                         if candidate.nearby_agent_count > 0
                     ),
                     key=lambda candidate: (
@@ -265,7 +303,7 @@ def select_review_candidates(
                 sorted(
                     (
                         candidate
-                        for candidate in candidates
+                        for candidate in valid_candidates
                         if candidate.nearby_agent_count == 0
                     ),
                     key=lambda candidate: candidate.sample_token,
@@ -276,7 +314,7 @@ def select_review_candidates(
             "lateral_displacement_candidate",
             tuple(
                 sorted(
-                    candidates,
+                    valid_candidates,
                     key=lambda candidate: (
                         -abs(candidate.lateral_displacement_m),
                         candidate.sample_token,
@@ -288,7 +326,7 @@ def select_review_candidates(
             "ordinary_motion_candidate",
             tuple(
                 sorted(
-                    candidates,
+                    valid_candidates,
                     key=lambda candidate: (
                         abs(candidate.lateral_displacement_m),
                         -candidate.total_displacement_m,
@@ -319,7 +357,7 @@ def select_review_candidates(
         sorted(
             (
                 candidate
-                for candidate in candidates
+                for candidate in valid_candidates
                 if candidate.sample_token not in selected_tokens
             ),
             key=lambda candidate: (
@@ -370,6 +408,19 @@ def create_review_records(
             ),
             total_displacement_m=selection.candidate.total_displacement_m,
             nearby_agent_count=selection.candidate.nearby_agent_count,
+            trajectory_points=selection.candidate.trajectory_points,
+            expected_min_trajectory_points=(
+                selection.candidate.expected_min_trajectory_points
+            ),
+            trajectory_x_range_m=selection.candidate.trajectory_x_range_m,
+            trajectory_y_range_m=selection.candidate.trajectory_y_range_m,
+            trajectory_displacement_m=(
+                selection.candidate.trajectory_displacement_m
+            ),
+            trajectory_is_valid=selection.candidate.trajectory_is_valid,
+            trajectory_invalid_reason=(
+                selection.candidate.trajectory_invalid_reason
+            ),
         )
         for selection in selections
     )
