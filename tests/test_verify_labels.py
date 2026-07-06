@@ -1,7 +1,9 @@
 import importlib.util
+import json
+from dataclasses import asdict, replace
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from PIL import Image
 import pytest
@@ -164,3 +166,405 @@ def test_summary_contains_trajectory_ranges_and_nearest_agent() -> None:
     assert summary.max_y_m == pytest.approx(0.0)
     assert summary.nearest_agent_distance_m == pytest.approx(5.0)
     assert summary.nearest_agent_category == "vehicle.car"
+
+
+def test_review_record_contains_stable_phase_1_5_schema() -> None:
+    visualization = load_visualization_module()
+
+    record = visualization.create_review_record(
+        sample_token="sample",
+        scene_token="scene",
+        timestamp=1_000_000,
+        cam_front_path="samples/CAM_FRONT/image.jpg",
+        visualization_path="visualizations/sample_one_page.png",
+        selection_reason="has_nearby_agents",
+        label_rule_version="unavailable",
+        safety_rule_version="unavailable",
+    )
+
+    assert tuple(asdict(record)) == visualization.REVIEW_RECORD_FIELDS
+    assert record.derived_action == "not_available"
+    assert record.reviewed_action == ""
+    assert record.label_correct == "uncertain"
+    assert record.trajectory_alignment_correct == "uncertain"
+    assert record.agent_alignment_correct == "uncertain"
+    assert record.visualization_sufficient == "uncertain"
+    assert record.safety_score_reasonable == "not_available"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("label_correct", "maybe"),
+        ("trajectory_alignment_correct", "not_available"),
+        ("agent_alignment_correct", "not_applicable"),
+        ("visualization_sufficient", "not_available"),
+        ("safety_score_reasonable", "not_applicable"),
+    ),
+)
+def test_review_record_rejects_invalid_enum_values(
+    field_name: str,
+    invalid_value: str,
+) -> None:
+    visualization = load_visualization_module()
+    record = visualization.create_review_record(
+        sample_token="sample",
+        scene_token="scene",
+        timestamp=1_000_000,
+        cam_front_path="samples/CAM_FRONT/image.jpg",
+        visualization_path="visualizations/sample_one_page.png",
+        selection_reason="ordinary_motion_candidate",
+        label_rule_version="unavailable",
+        safety_rule_version="unavailable",
+    )
+
+    with pytest.raises(ValueError, match=field_name):
+        visualization.validate_review_record(
+            replace(record, **{field_name: invalid_value})
+        )
+
+
+def test_uncertain_and_not_available_are_not_counted_as_correct() -> None:
+    visualization = load_visualization_module()
+    unreviewed = visualization.create_review_record(
+        sample_token="unreviewed",
+        scene_token="scene-a",
+        timestamp=1_000_000,
+        cam_front_path="samples/CAM_FRONT/a.jpg",
+        visualization_path="visualizations/a.png",
+        selection_reason="low_displacement_candidate",
+        label_rule_version="unavailable",
+        safety_rule_version="unavailable",
+    )
+    confirmed = replace(
+        unreviewed,
+        sample_token="confirmed",
+        label_correct="yes",
+        trajectory_alignment_correct="yes",
+        agent_alignment_correct="yes",
+        visualization_sufficient="yes",
+        safety_score_reasonable="yes",
+    )
+
+    summary = visualization.summarize_review_records(
+        (unreviewed, confirmed)
+    )
+
+    assert summary.total_records == 2
+    assert summary.label_correct == 1
+    assert summary.trajectory_alignment_correct == 1
+    assert summary.agent_alignment_correct == 1
+    assert summary.visualization_sufficient == 1
+    assert summary.safety_score_reasonable == 1
+
+
+def test_review_outputs_share_the_same_complete_schema(
+    tmp_path: Path,
+) -> None:
+    visualization = load_visualization_module()
+    record = visualization.create_review_record(
+        sample_token="sample",
+        scene_token="scene",
+        timestamp=1_000_000,
+        cam_front_path="samples/CAM_FRONT/image.jpg",
+        visualization_path="visualizations/sample_one_page.png",
+        selection_reason="lateral_displacement_candidate",
+        label_rule_version="unavailable",
+        safety_rule_version="unavailable",
+    )
+    manifest_path = tmp_path / "review_manifest.jsonl"
+    template_path = tmp_path / "review_template.csv"
+
+    visualization.write_review_outputs(
+        records=(record,),
+        manifest_path=manifest_path,
+        template_path=template_path,
+    )
+
+    manifest_row = json.loads(manifest_path.read_text().strip())
+    header = template_path.read_text().splitlines()[0].split(",")
+    assert tuple(manifest_row) == visualization.REVIEW_RECORD_FIELDS
+    assert tuple(header) == visualization.REVIEW_RECORD_FIELDS
+
+
+def test_review_cli_arguments_parse_without_dataset_access(
+    tmp_path: Path,
+) -> None:
+    visualization = load_visualization_module()
+
+    arguments = visualization.parse_args(
+        [
+            "--init-review",
+            "--dataroot",
+            str(tmp_path / "nuscenes"),
+            "--output-dir",
+            str(tmp_path / "review"),
+            "--sample-count",
+            "12",
+            "--label-rule-version",
+            "planned-label-rules",
+            "--safety-rule-version",
+            "unavailable",
+            "--preview",
+        ]
+    )
+
+    assert arguments.init_review is True
+    assert arguments.dataroot == tmp_path / "nuscenes"
+    assert arguments.output_dir == tmp_path / "review"
+    assert arguments.sample_count == 12
+    assert arguments.label_rule_version == "planned-label-rules"
+    assert arguments.safety_rule_version == "unavailable"
+    assert arguments.preview is True
+
+
+def test_review_selection_covers_auditable_candidate_reasons() -> None:
+    visualization = load_visualization_module()
+    candidates = (
+        visualization.ReviewCandidate(
+            "forward",
+            "scene-forward",
+            1,
+            "forward.jpg",
+            20.0,
+            0.1,
+            20.0,
+            1,
+        ),
+        visualization.ReviewCandidate(
+            "stopped",
+            "scene-stopped",
+            2,
+            "stopped.jpg",
+            0.1,
+            0.0,
+            0.1,
+            0,
+        ),
+        visualization.ReviewCandidate(
+            "agents",
+            "scene-agents",
+            3,
+            "agents.jpg",
+            5.0,
+            0.2,
+            5.0,
+            8,
+        ),
+        visualization.ReviewCandidate(
+            "empty",
+            "scene-empty",
+            4,
+            "empty.jpg",
+            4.0,
+            0.3,
+            4.0,
+            0,
+        ),
+        visualization.ReviewCandidate(
+            "lateral",
+            "scene-lateral",
+            5,
+            "lateral.jpg",
+            6.0,
+            4.0,
+            7.2,
+            2,
+        ),
+        visualization.ReviewCandidate(
+            "ordinary",
+            "scene-ordinary",
+            6,
+            "ordinary.jpg",
+            7.0,
+            0.05,
+            7.0,
+            1,
+        ),
+    )
+
+    selections = visualization.select_review_candidates(
+        candidates=candidates,
+        sample_count=6,
+    )
+
+    assert len(selections) == 6
+    selected_scenes = {
+        selection.candidate.scene_token for selection in selections
+    }
+    assert len(selected_scenes) == 6
+    assert {selection.reason for selection in selections} == {
+        "high_forward_displacement_candidate",
+        "low_displacement_candidate",
+        "has_nearby_agents",
+        "no_nearby_agents",
+        "lateral_displacement_candidate",
+        "ordinary_motion_candidate",
+    }
+
+
+def test_review_records_keep_selection_reason_and_relative_visualization_path(
+) -> None:
+    visualization = load_visualization_module()
+    selection = visualization.ReviewSelection(
+        candidate=visualization.ReviewCandidate(
+            "sample",
+            "scene",
+            1_000_000,
+            "samples/CAM_FRONT/image.jpg",
+            5.0,
+            0.1,
+            5.0,
+            2,
+        ),
+        reason="has_nearby_agents",
+    )
+
+    records = visualization.create_review_records(
+        selections=(selection,),
+        label_rule_version="planned-label-rules",
+        safety_rule_version="unavailable",
+    )
+
+    assert records[0].visualization_path == (
+        "visualizations/sample_one_page.png"
+    )
+    assert records[0].selection_reason == "has_nearby_agents"
+    assert records[0].label_rule_version == "planned-label-rules"
+    assert records[0].safety_rule_version == "unavailable"
+
+
+def test_review_pool_samples_multiple_positions_from_each_scene() -> None:
+    visualization = load_visualization_module()
+
+    class FakeNuScenes:
+        scene = (
+            {"first_sample_token": "a-0"},
+            {"first_sample_token": "b-0"},
+        )
+        samples = {
+            "a-0": {"next": "a-1"},
+            "a-1": {"next": "a-2"},
+            "a-2": {"next": ""},
+            "b-0": {"next": "b-1"},
+            "b-1": {"next": "b-2"},
+            "b-2": {"next": ""},
+        }
+
+        def get(self, table_name: str, token: str) -> dict[str, str]:
+            assert table_name == "sample"
+            return self.samples[token]
+
+    tokens = visualization.collect_review_sample_tokens(
+        nuscenes=FakeNuScenes(),
+        sample_count=4,
+    )
+
+    assert set(tokens) == {"a-0", "a-2", "b-0", "b-2"}
+
+
+def test_review_candidate_uses_existing_trajectory_and_agent_extractors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    visualization = load_visualization_module()
+
+    class FakeNuScenes:
+        records = {
+            ("sample", "sample"): {
+                "scene_token": "scene",
+                "timestamp": 1_000_000,
+                "data": {"CAM_FRONT": "camera"},
+            },
+            ("sample_data", "camera"): {
+                "filename": "samples/CAM_FRONT/image.jpg",
+            },
+        }
+
+        def get(self, table_name: str, token: str) -> dict[str, object]:
+            return self.records[(table_name, token)]
+
+    monkeypatch.setattr(
+        visualization,
+        "extract_future_ego_trajectory",
+        lambda **_: SimpleNamespace(
+            points=(
+                visualization.TrajectoryPoint(
+                    "current",
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
+                visualization.TrajectoryPoint(
+                    "future",
+                    1.0,
+                    6.0,
+                    -2.0,
+                    0.1,
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        visualization,
+        "get_nearby_agents",
+        lambda **_: SimpleNamespace(agents=("agent-a", "agent-b")),
+    )
+
+    candidate = visualization.build_review_candidate(
+        nuscenes=FakeNuScenes(),
+        sample_token="sample",
+        camera="CAM_FRONT",
+        horizon_sec=3.0,
+        sample_interval_sec=0.5,
+        max_agent_distance_m=50.0,
+    )
+
+    assert candidate.scene_token == "scene"
+    assert candidate.cam_front_path == "samples/CAM_FRONT/image.jpg"
+    assert candidate.forward_displacement_m == pytest.approx(6.0)
+    assert candidate.lateral_displacement_m == pytest.approx(-2.0)
+    assert candidate.total_displacement_m == pytest.approx(6.3249, rel=1e-4)
+    assert candidate.nearby_agent_count == 2
+
+
+def test_review_preview_returns_records_without_writing_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    visualization = load_visualization_module()
+    candidate = visualization.ReviewCandidate(
+        "sample",
+        "scene",
+        1_000_000,
+        "samples/CAM_FRONT/image.jpg",
+        5.0,
+        0.1,
+        5.0,
+        2,
+    )
+    monkeypatch.setattr(
+        visualization,
+        "build_review_candidate_pool",
+        lambda **_: (candidate,),
+    )
+
+    records = visualization.initialize_review_batch(
+        nuscenes=object(),
+        dataroot=tmp_path / "nuscenes",
+        output_dir=tmp_path / "review",
+        sample_count=12,
+        camera="CAM_FRONT",
+        horizon_sec=3.0,
+        sample_interval_sec=0.5,
+        max_agent_distance_m=50.0,
+        label_rule_version="unavailable",
+        safety_rule_version="unavailable",
+        preview=True,
+    )
+
+    assert len(records) == 1
+    assert records[0].sample_token == "sample"
+    assert not (tmp_path / "review").exists()
+    assert '"sample_token": "sample"' in capsys.readouterr().out

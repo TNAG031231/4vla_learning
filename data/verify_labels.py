@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, replace
+import json
 import math
 import os
 from pathlib import Path
@@ -25,6 +27,18 @@ from inspect_nuscenes_sample import (
     extract_future_ego_trajectory,
     get_nearby_agents,
     load_trajectory_config,
+)
+from manual_review import (
+    REVIEW_RECORD_FIELDS,
+    ReviewCandidate,
+    ReviewRecord,
+    ReviewSelection,
+    create_review_records,
+    create_review_record,
+    select_review_candidates,
+    summarize_review_records,
+    validate_review_record,
+    write_review_outputs,
 )
 
 
@@ -582,9 +596,194 @@ def _print_summary(
         )
 
 
-def parse_args() -> argparse.Namespace:
+def _evenly_spaced_indices(length: int, count: int) -> tuple[int, ...]:
+    if count >= length:
+        return tuple(range(length))
+    if count == 1:
+        return (length // 2,)
+    return tuple(
+        round(index * (length - 1) / (count - 1))
+        for index in range(count)
+    )
+
+
+def collect_review_sample_tokens(
+    nuscenes: NuScenes,
+    sample_count: int,
+) -> tuple[str, ...]:
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    if not nuscenes.scene:
+        return ()
+
+    samples_per_scene = max(
+        1,
+        math.ceil(sample_count / len(nuscenes.scene)),
+    )
+    selected_tokens = []
+    for scene in nuscenes.scene:
+        token = str(scene["first_sample_token"])
+        scene_tokens = []
+        while token:
+            scene_tokens.append(token)
+            sample = nuscenes.get("sample", token)
+            token = str(sample["next"])
+        selected_tokens.extend(
+            scene_tokens[index]
+            for index in _evenly_spaced_indices(
+                len(scene_tokens),
+                samples_per_scene,
+            )
+        )
+    return tuple(selected_tokens)
+
+
+def build_review_candidate(
+    nuscenes: NuScenes,
+    sample_token: str,
+    camera: str,
+    horizon_sec: float,
+    sample_interval_sec: float,
+    max_agent_distance_m: float,
+) -> ReviewCandidate:
+    sample = nuscenes.get("sample", sample_token)
+    camera_token = sample["data"][camera]
+    camera_data = nuscenes.get("sample_data", camera_token)
+    trajectory = extract_future_ego_trajectory(
+        nuscenes=nuscenes,
+        sample_token=sample_token,
+        horizon_sec=horizon_sec,
+        sample_interval_sec=sample_interval_sec,
+    )
+    nearby_agents = get_nearby_agents(
+        nuscenes=nuscenes,
+        sample_token=sample_token,
+        radius_m=max_agent_distance_m,
+    )
+    if trajectory.points:
+        final_point = trajectory.points[-1]
+        forward_displacement_m = final_point.x_m
+        lateral_displacement_m = final_point.y_m
+    else:
+        forward_displacement_m = 0.0
+        lateral_displacement_m = 0.0
+
+    return ReviewCandidate(
+        sample_token=sample_token,
+        scene_token=str(sample["scene_token"]),
+        timestamp=int(sample["timestamp"]),
+        cam_front_path=Path(camera_data["filename"]).as_posix(),
+        forward_displacement_m=forward_displacement_m,
+        lateral_displacement_m=lateral_displacement_m,
+        total_displacement_m=math.hypot(
+            forward_displacement_m,
+            lateral_displacement_m,
+        ),
+        nearby_agent_count=len(nearby_agents.agents),
+    )
+
+
+def build_review_candidate_pool(
+    nuscenes: NuScenes,
+    sample_count: int,
+    camera: str,
+    horizon_sec: float,
+    sample_interval_sec: float,
+    max_agent_distance_m: float,
+) -> tuple[ReviewCandidate, ...]:
+    return tuple(
+        build_review_candidate(
+            nuscenes=nuscenes,
+            sample_token=sample_token,
+            camera=camera,
+            horizon_sec=horizon_sec,
+            sample_interval_sec=sample_interval_sec,
+            max_agent_distance_m=max_agent_distance_m,
+        )
+        for sample_token in collect_review_sample_tokens(
+            nuscenes=nuscenes,
+            sample_count=sample_count,
+        )
+    )
+
+
+def initialize_review_batch(
+    nuscenes: NuScenes,
+    dataroot: Path,
+    output_dir: Path,
+    sample_count: int,
+    camera: str,
+    horizon_sec: float,
+    sample_interval_sec: float,
+    max_agent_distance_m: float,
+    label_rule_version: str,
+    safety_rule_version: str,
+    preview: bool,
+) -> tuple[ReviewRecord, ...]:
+    candidates = build_review_candidate_pool(
+        nuscenes=nuscenes,
+        sample_count=sample_count,
+        camera=camera,
+        horizon_sec=horizon_sec,
+        sample_interval_sec=sample_interval_sec,
+        max_agent_distance_m=max_agent_distance_m,
+    )
+    selections = select_review_candidates(
+        candidates=candidates,
+        sample_count=sample_count,
+    )
+    records = create_review_records(
+        selections=selections,
+        label_rule_version=label_rule_version,
+        safety_rule_version=safety_rule_version,
+    )
+    if preview:
+        for record in records:
+            print(json.dumps(asdict(record), ensure_ascii=False))
+        return records
+
+    for record in records:
+        payload, image = load_sample_visualization_payload(
+            nuscenes=nuscenes,
+            dataroot=dataroot,
+            sample_token=record.sample_token,
+            camera=camera,
+            horizon_sec=horizon_sec,
+            sample_interval_sec=sample_interval_sec,
+            max_agent_distance_m=max_agent_distance_m,
+        )
+        payload = replace(
+            payload,
+            meta_action=record.derived_action,
+            label_rule_version=label_rule_version,
+            safety_rule_version=safety_rule_version,
+        )
+        figure = render_one_page_visualization(payload, image)
+        save_one_page_visualization(
+            figure=figure,
+            output_path=output_dir / record.visualization_path,
+            show=False,
+        )
+
+    manifest_path = output_dir / "review_manifest.jsonl"
+    template_path = output_dir / "review_template.csv"
+    write_review_outputs(
+        records=records,
+        manifest_path=manifest_path,
+        template_path=template_path,
+    )
+    print(f"review manifest: {manifest_path}")
+    print(f"review template: {template_path}")
+    print(f"selected samples: {len(records)}")
+    return records
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render one-page nuScenes sample alignment visualization."
+        description=(
+            "Render one-page alignment visualization or initialize a "
+            "Phase -1.5 review batch."
+        )
     )
     parser.add_argument("--sample-token")
     parser.add_argument("--output", type=Path)
@@ -605,7 +804,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-agent-distance-m", type=float)
     parser.add_argument("--horizon-sec", type=float)
     parser.add_argument("--sample-interval-sec", type=float)
-    return parser.parse_args()
+    parser.add_argument(
+        "--init-review",
+        action="store_true",
+        help="Initialize a Phase -1.5 review batch.",
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=12,
+        help="Number of samples in a review batch (default: 12).",
+    )
+    parser.add_argument(
+        "--label-rule-version",
+        default="unavailable",
+        help="Label rule version recorded in review outputs.",
+    )
+    parser.add_argument(
+        "--safety-rule-version",
+        default="unavailable",
+        help="Safety rule version recorded in review outputs.",
+    )
+    parser.add_argument(
+        "--preview",
+        "--dry-run",
+        dest="preview",
+        action="store_true",
+        help="Preview review selection without writing outputs.",
+    )
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -636,6 +863,22 @@ def main() -> None:
         dataroot=str(dataroot),
         verbose=False,
     )
+    if arguments.init_review or arguments.preview:
+        initialize_review_batch(
+            nuscenes=nuscenes,
+            dataroot=dataroot,
+            output_dir=arguments.output_dir,
+            sample_count=arguments.sample_count,
+            camera=arguments.camera,
+            horizon_sec=horizon_sec,
+            sample_interval_sec=sample_interval_sec,
+            max_agent_distance_m=max_agent_distance_m,
+            label_rule_version=arguments.label_rule_version,
+            safety_rule_version=arguments.safety_rule_version,
+            preview=arguments.preview,
+        )
+        return
+
     sample_token = arguments.sample_token
     if sample_token is None:
         sample_token = str(nuscenes.scene[0]["first_sample_token"])
