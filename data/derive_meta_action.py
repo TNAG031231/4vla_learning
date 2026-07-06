@@ -8,11 +8,16 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 
 from nuscenes.nuscenes import NuScenes
 import yaml
 
-from action_schema import (
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.actions.schema import (
     ACCELERATE,
     DECELERATE,
     KEEP,
@@ -390,13 +395,31 @@ def _load_data_config(
 
 
 def read_review_sample_tokens(review_manifest: Path) -> tuple[str, ...]:
-    sample_tokens = []
+    records = []
     for line in review_manifest.read_text().splitlines():
         record: object = json.loads(line)
         if not isinstance(record, Mapping):
             raise ValueError("Each review manifest row must be a mapping")
-        sample_tokens.append(_string_value(record, "sample_token"))
-    return tuple(sample_tokens)
+        records.append(record)
+
+    if not any("overall_pass" in record for record in records):
+        print(
+            "review manifest has no overall_pass field; "
+            "using all sample tokens"
+        )
+        return tuple(
+            _string_value(record, "sample_token") for record in records
+        )
+
+    sample_tokens = tuple(
+        _string_value(record, "sample_token")
+        for record in records
+        if "overall_pass" in record
+        and _string_value(record, "overall_pass").strip().lower() == "yes"
+    )
+    if not sample_tokens:
+        raise ValueError("review manifest has no overall_pass=yes samples")
+    return sample_tokens
 
 
 def derive_sample_record(

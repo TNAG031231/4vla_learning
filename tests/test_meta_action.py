@@ -1,7 +1,11 @@
+import importlib
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import ModuleType
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +63,39 @@ def build_trajectory(
         )
         for index, (x_m, y_m) in enumerate(coordinates)
     )
+
+
+def load_schema_module() -> ModuleType:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    try:
+        return importlib.import_module("src.actions.schema")
+    finally:
+        sys.path.remove(str(PROJECT_ROOT))
+
+
+def test_canonical_schema_imports_from_src_actions() -> None:
+    schema = load_schema_module()
+
+    assert Path(schema.__file__).resolve() == (
+        PROJECT_ROOT / "src" / "actions" / "schema.py"
+    )
+
+
+def test_action_schema_contains_exactly_six_actions() -> None:
+    schema = load_schema_module()
+
+    assert schema.ACTION_SCHEMA == (
+        "keep",
+        "accelerate",
+        "decelerate",
+        "stop",
+        "left_lateral",
+        "right_lateral",
+    )
+    assert schema.ACTION_SET == frozenset(schema.ACTION_SCHEMA)
+    assert schema.is_valid_action("keep") is True
+    assert schema.is_valid_action("turn_left") is False
+    assert schema.normalize_action(" LEFT_LATERAL ") == "left_lateral"
 
 
 def test_positive_lateral_displacement_is_left_lateral() -> None:
@@ -211,3 +248,73 @@ def test_speed_proxy_accepts_complete_horizon_with_timestamp_tolerance() -> None
     assert result.rule_features.approx_speed_end_mps != "not_available"
     assert result.rule_features.approx_delta_speed_mps != "not_available"
     assert "speed_proxy_unavailable" not in result.boundary_flags
+
+
+def _write_review_manifest(
+    path: Path,
+    records: tuple[dict[str, str], ...],
+) -> Path:
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    return path
+
+
+def test_review_manifest_reads_only_overall_pass_yes(tmp_path: Path) -> None:
+    derivation = load_derivation_module()
+    manifest = _write_review_manifest(
+        tmp_path / "review_manifest.jsonl",
+        (
+            {"sample_token": "yes-lower", "overall_pass": "yes"},
+            {"sample_token": "yes-normalized", "overall_pass": " YES "},
+            {"sample_token": "no", "overall_pass": "no"},
+            {"sample_token": "uncertain", "overall_pass": "uncertain"},
+            {"sample_token": "missing"},
+        ),
+    )
+
+    assert derivation.read_review_sample_tokens(manifest) == (
+        "yes-lower",
+        "yes-normalized",
+    )
+
+
+def test_review_manifest_without_overall_pass_reads_all_and_warns(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    derivation = load_derivation_module()
+    manifest = _write_review_manifest(
+        tmp_path / "review_manifest.jsonl",
+        (
+            {"sample_token": "first"},
+            {"sample_token": "second"},
+        ),
+    )
+
+    sample_tokens = derivation.read_review_sample_tokens(manifest)
+
+    assert sample_tokens == ("first", "second")
+    assert (
+        "review manifest has no overall_pass field; using all sample tokens"
+        in capsys.readouterr().out
+    )
+
+
+def test_review_manifest_with_no_passing_samples_raises(
+    tmp_path: Path,
+) -> None:
+    derivation = load_derivation_module()
+    manifest = _write_review_manifest(
+        tmp_path / "review_manifest.jsonl",
+        (
+            {"sample_token": "no", "overall_pass": "no"},
+            {"sample_token": "uncertain", "overall_pass": "uncertain"},
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="review manifest has no overall_pass=yes samples",
+    ):
+        derivation.read_review_sample_tokens(manifest)
