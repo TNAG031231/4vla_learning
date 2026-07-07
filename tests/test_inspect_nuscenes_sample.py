@@ -63,6 +63,53 @@ class FakeNuScenes:
         return self.records[(table_name, token)]
 
 
+class FakeJitterNuScenes:
+    def __init__(self, future_times_sec: tuple[float, ...]) -> None:
+        current_timestamp = 1_000_000
+        tokens = ("current",) + tuple(
+            f"future-{index}" for index in range(len(future_times_sec))
+        )
+        self.scene = [{"first_sample_token": "current"}]
+        self.records = {
+            ("sample", "current"): {
+                "token": "current",
+                "scene_token": "scene",
+                "timestamp": current_timestamp,
+                "next": tokens[1] if len(tokens) > 1 else "",
+                "data": {"CAM_FRONT": "camera-current"},
+            },
+            ("sample_data", "camera-current"): {
+                "ego_pose_token": "pose-current",
+            },
+            ("ego_pose", "pose-current"): {
+                "translation": [0.0, 0.0, 0.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0],
+            },
+        }
+        for index, time_sec in enumerate(future_times_sec):
+            token = tokens[index + 1]
+            next_token = tokens[index + 2] if index + 2 < len(tokens) else ""
+            camera_token = f"camera-{index}"
+            pose_token = f"pose-{index}"
+            self.records[("sample", token)] = {
+                "token": token,
+                "scene_token": "scene",
+                "timestamp": current_timestamp + round(time_sec * 1_000_000),
+                "next": next_token,
+                "data": {"CAM_FRONT": camera_token},
+            }
+            self.records[("sample_data", camera_token)] = {
+                "ego_pose_token": pose_token,
+            }
+            self.records[("ego_pose", pose_token)] = {
+                "translation": [float(index + 1), 0.0, 0.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0],
+            }
+
+    def get(self, table_name: str, token: str) -> dict[str, object]:
+        return self.records[(table_name, token)]
+
+
 class FakeNearbyNuScenes:
     def __init__(self, annotation_tokens: list[str]) -> None:
         self.scene = [{"first_sample_token": "agents"}]
@@ -182,6 +229,7 @@ def test_config_expands_nuscenes_root_environment_variable(
                 "  horizon_sec: 3.0",
                 "  sample_interval_sec: 0.5",
                 "  max_agent_distance_m: 50.0",
+                "  trajectory_time_tolerance_sec: 0.075",
             )
         )
     )
@@ -194,6 +242,65 @@ def test_config_expands_nuscenes_root_environment_variable(
     assert config.horizon_sec == pytest.approx(3.0)
     assert config.sample_interval_sec == pytest.approx(0.5)
     assert config.nearby_radius_m == pytest.approx(50.0)
+    assert config.trajectory_time_tolerance_sec == pytest.approx(0.075)
+
+
+def test_jittered_keyframes_within_tolerance_cover_three_second_horizon(
+) -> None:
+    inspection = load_inspection_module()
+
+    trajectory = inspection.extract_future_ego_trajectory(
+        nuscenes=FakeJitterNuScenes(
+            (
+                0.550201,
+                1.049506,
+                1.54995,
+                2.004754,
+                2.500478,
+                3.050664,
+            )
+        ),
+        sample_token="current",
+        horizon_sec=3.0,
+        sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
+    )
+
+    assert len(trajectory.points) == 7
+    assert trajectory.is_truncated is False
+    assert [point.future_sample_token for point in trajectory.points] == [
+        "current",
+        "future-0",
+        "future-1",
+        "future-2",
+        "future-3",
+        "future-4",
+        "future-5",
+    ]
+    assert trajectory.points[-1].t_sec == pytest.approx(3.050664)
+
+
+def test_missing_three_second_keyframe_is_truncated() -> None:
+    inspection = load_inspection_module()
+
+    trajectory = inspection.extract_future_ego_trajectory(
+        nuscenes=FakeJitterNuScenes(
+            (
+                0.550201,
+                1.049506,
+                1.54995,
+                2.004754,
+                2.500478,
+            )
+        ),
+        sample_token="current",
+        horizon_sec=3.0,
+        sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
+    )
+
+    assert len(trajectory.points) == 6
+    assert trajectory.is_truncated is True
 
 
 def test_global_point_is_transformed_into_current_ego_frame() -> None:

@@ -517,6 +517,7 @@ def test_review_candidate_uses_existing_trajectory_and_agent_extractors(
         camera="CAM_FRONT",
         horizon_sec=1.0,
         sample_interval_sec=1.0,
+        time_tolerance_sec=0.075,
         max_agent_distance_m=50.0,
     )
 
@@ -576,6 +577,7 @@ def test_single_point_zero_displacement_trajectory_is_invalid(
         camera="CAM_FRONT",
         horizon_sec=3.0,
         sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
         max_agent_distance_m=50.0,
     )
 
@@ -637,6 +639,7 @@ def test_candidate_pool_filters_scene_tail_with_insufficient_horizon(
         camera="CAM_FRONT",
         horizon_sec=3.0,
         sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
         max_agent_distance_m=50.0,
     )
 
@@ -737,6 +740,7 @@ def test_review_preview_returns_records_without_writing_outputs(
         camera="CAM_FRONT",
         horizon_sec=3.0,
         sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
         max_agent_distance_m=50.0,
         label_rule_version="unavailable",
         safety_rule_version="unavailable",

@@ -250,6 +250,31 @@ def test_speed_proxy_accepts_complete_horizon_with_timestamp_tolerance() -> None
     assert "speed_proxy_unavailable" not in result.boundary_flags
 
 
+def test_speed_proxy_uses_configured_trajectory_time_tolerance() -> None:
+    derivation = load_derivation_module()
+    trajectory = tuple(
+        derivation.TrajectoryPoint(
+            future_sample_token=f"sample-{index}",
+            t_sec=2.9505 if index == 6 else index * 0.5,
+            x_m=float(index),
+            y_m=0.0,
+            heading_delta_rad=0.0,
+        )
+        for index in range(7)
+    )
+
+    result = derivation.derive_meta_action(
+        trajectory,
+        build_rules(derivation),
+        time_tolerance_sec=0.075,
+    )
+
+    assert result.rule_features.approx_speed_start_mps != "not_available"
+    assert result.rule_features.approx_speed_end_mps != "not_available"
+    assert result.rule_features.approx_delta_speed_mps != "not_available"
+    assert "speed_proxy_unavailable" not in result.boundary_flags
+
+
 def _write_review_manifest(
     path: Path,
     records: tuple[dict[str, str], ...],

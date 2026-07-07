@@ -1,5 +1,5 @@
 meta_action_v0:
-  label_rule_version: "phase-1.6-meta-action-v0"
+  label_rule_version: "phase-1.6-meta-action-v0.1"
   horizon_sec: 3.0
   sample_interval_sec: 0.5
   stop_distance_threshold_m: 0.5

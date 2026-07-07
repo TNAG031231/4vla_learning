@@ -17,6 +17,7 @@ import yaml
 CAMERA_CHANNEL = "CAM_FRONT"
 MICROSECONDS_PER_SECOND = 1_000_000
 TIMESTAMP_TOLERANCE_SEC = 1e-3
+DEFAULT_TRAJECTORY_TIME_TOLERANCE_SEC = 0.075
 AGENT_SIZE_ORDER = ("width_m", "length_m", "height_m")
 VRU_CATEGORY_PREFIXES = (
     "human.pedestrian",
@@ -39,6 +40,7 @@ class TrajectoryConfig:
     horizon_sec: float
     sample_interval_sec: float
     nearby_radius_m: float
+    trajectory_time_tolerance_sec: float
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,10 @@ def load_trajectory_config(config_path: Path) -> TrajectoryConfig:
         nearby_radius_m=_number_value(
             phase1_config,
             "max_agent_distance_m",
+        ),
+        trajectory_time_tolerance_sec=_number_value(
+            phase1_config,
+            "trajectory_time_tolerance_sec",
         ),
     )
 
@@ -327,11 +333,14 @@ def extract_future_ego_trajectory(
     sample_token: str,
     horizon_sec: float,
     sample_interval_sec: float,
+    time_tolerance_sec: float = DEFAULT_TRAJECTORY_TIME_TOLERANCE_SEC,
 ) -> FutureEgoTrajectory:
     if horizon_sec < 0.0:
         raise ValueError("horizon_sec must be non-negative")
     if sample_interval_sec <= 0.0:
         raise ValueError("sample_interval_sec must be positive")
+    if time_tolerance_sec < 0.0:
+        raise ValueError("time_tolerance_sec must be non-negative")
 
     current_sample = nuscenes.get("sample", sample_token)
     current_timestamp = int(current_sample["timestamp"])
@@ -356,9 +365,13 @@ def extract_future_ego_trajectory(
         )
     ]
 
-    next_target_sec = sample_interval_sec
-    latest_time_sec = 0.0
-    horizon_covered = horizon_sec == 0.0
+    target_times = []
+    target_time_sec = sample_interval_sec
+    while target_time_sec <= horizon_sec + TIMESTAMP_TOLERANCE_SEC:
+        target_times.append(target_time_sec)
+        target_time_sec += sample_interval_sec
+
+    future_samples = []
     next_token = _string_value(current_sample, "next")
     while next_token:
         future_sample = nuscenes.get("sample", next_token)
@@ -366,40 +379,54 @@ def extract_future_ego_trajectory(
         time_sec = microseconds_to_seconds(
             future_timestamp - current_timestamp
         )
-        if time_sec > horizon_sec + TIMESTAMP_TOLERANCE_SEC:
-            horizon_covered = True
+        if time_sec > horizon_sec + time_tolerance_sec:
             break
 
-        latest_time_sec = time_sec
-        if time_sec + TIMESTAMP_TOLERANCE_SEC >= next_target_sec:
-            future_translation, future_rotation = get_ego_pose(
-                nuscenes,
-                future_sample,
-            )
-            pose = transform_pose_to_current_ego_frame(
-                current_translation=current_translation,
-                current_rotation=current_rotation,
-                future_translation=future_translation,
-                future_rotation=future_rotation,
-            )
-            points.append(
-                TrajectoryPoint(
-                    future_sample_token=_string_value(
-                        future_sample,
-                        "token",
-                    ),
-                    t_sec=time_sec,
-                    x_m=pose.x_m,
-                    y_m=pose.y_m,
-                    heading_delta_rad=pose.heading_delta_rad,
-                )
-            )
-            next_target_sec += sample_interval_sec
-
+        future_samples.append((future_sample, time_sec))
         next_token = _string_value(future_sample, "next")
 
-    if latest_time_sec + TIMESTAMP_TOLERANCE_SEC >= horizon_sec:
-        horizon_covered = True
+    search_start_index = 0
+    for target_time_sec in target_times:
+        selected_index = None
+        selected_error = None
+        upper_bound_sec = target_time_sec + time_tolerance_sec
+        for index in range(search_start_index, len(future_samples)):
+            future_sample, time_sec = future_samples[index]
+            if time_sec > upper_bound_sec:
+                break
+            error = abs(time_sec - target_time_sec)
+            if error <= time_tolerance_sec and (
+                selected_error is None or error < selected_error
+            ):
+                selected_index = index
+                selected_error = error
+
+        if selected_index is None:
+            break
+
+        future_sample, time_sec = future_samples[selected_index]
+        future_translation, future_rotation = get_ego_pose(
+            nuscenes,
+            future_sample,
+        )
+        pose = transform_pose_to_current_ego_frame(
+            current_translation=current_translation,
+            current_rotation=current_rotation,
+            future_translation=future_translation,
+            future_rotation=future_rotation,
+        )
+        points.append(
+            TrajectoryPoint(
+                future_sample_token=_string_value(future_sample, "token"),
+                t_sec=time_sec,
+                x_m=pose.x_m,
+                y_m=pose.y_m,
+                heading_delta_rad=pose.heading_delta_rad,
+            )
+        )
+        search_start_index = selected_index + 1
+
+    horizon_covered = len(points) == len(target_times) + 1
 
     return FutureEgoTrajectory(
         sample_token=sample_token,
@@ -424,6 +451,7 @@ def parse_args() -> argparse.Namespace:
         "--sample-token",
         help="Sample token to inspect (default: first sample of first scene).",
     )
+    parser.add_argument("--trajectory-time-tolerance-sec", type=float)
     return parser.parse_args()
 
 
@@ -438,12 +466,18 @@ def main() -> None:
     sample_token = arguments.sample_token
     if sample_token is None:
         sample_token = str(nuscenes.scene[0]["first_sample_token"])
+    time_tolerance_sec = (
+        config.trajectory_time_tolerance_sec
+        if arguments.trajectory_time_tolerance_sec is None
+        else arguments.trajectory_time_tolerance_sec
+    )
 
     trajectory = extract_future_ego_trajectory(
         nuscenes=nuscenes,
         sample_token=sample_token,
         horizon_sec=config.horizon_sec,
         sample_interval_sec=config.sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
     )
     nearby_agents = get_nearby_agents(
         nuscenes=nuscenes,

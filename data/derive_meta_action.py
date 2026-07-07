@@ -206,10 +206,11 @@ def _expected_trajectory_points(rules: MetaActionRules) -> int:
 def _speed_proxy(
     trajectory: tuple[TrajectoryPoint, ...],
     rules: MetaActionRules,
+    time_tolerance_sec: float,
 ) -> tuple[float | str, float | str, float | str]:
     complete_horizon = (
         len(trajectory) >= _expected_trajectory_points(rules)
-        and trajectory[-1].t_sec + TIMESTAMP_TOLERANCE_SEC
+        and trajectory[-1].t_sec + time_tolerance_sec
         >= rules.horizon_sec
     )
     if not complete_horizon:
@@ -231,6 +232,7 @@ def _is_threshold_boundary(
 def derive_meta_action(
     trajectory: tuple[TrajectoryPoint, ...],
     rules: MetaActionRules,
+    time_tolerance_sec: float = TIMESTAMP_TOLERANCE_SEC,
 ) -> MetaActionResult:
     if trajectory:
         first_x_m = trajectory[0].x_m
@@ -272,7 +274,7 @@ def derive_meta_action(
         approx_speed_start_mps,
         approx_speed_end_mps,
         approx_delta_speed_mps,
-    ) = _speed_proxy(trajectory, rules)
+    ) = _speed_proxy(trajectory, rules, time_tolerance_sec)
     speed_proxy_available = isinstance(approx_delta_speed_mps, float)
     is_speed_boundary = (
         speed_proxy_available
@@ -427,6 +429,7 @@ def derive_sample_record(
     sample_token: str,
     camera: str,
     rules: MetaActionRules,
+    time_tolerance_sec: float,
 ) -> SampleLabelRecord:
     sample = nuscenes.get("sample", sample_token)
     scene = nuscenes.get("scene", sample["scene_token"])
@@ -439,8 +442,13 @@ def derive_sample_record(
         sample_token=sample_token,
         horizon_sec=rules.horizon_sec,
         sample_interval_sec=rules.sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
     )
-    result = derive_meta_action(trajectory.points, rules)
+    result = derive_meta_action(
+        trajectory.points,
+        rules,
+        time_tolerance_sec=time_tolerance_sec,
+    )
     features = result.rule_features
     return SampleLabelRecord(
         sample_token=sample_token,
@@ -551,6 +559,7 @@ def main() -> None:
             sample_token=sample_token,
             camera=arguments.camera,
             rules=rules,
+            time_tolerance_sec=data_config.trajectory_time_tolerance_sec,
         )
         for sample_token in read_review_sample_tokens(
             arguments.review_manifest

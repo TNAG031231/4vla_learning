@@ -512,6 +512,7 @@ def load_sample_visualization_payload(
     camera: str,
     horizon_sec: float,
     sample_interval_sec: float,
+    time_tolerance_sec: float,
     max_agent_distance_m: float,
 ) -> tuple[VisualizationPayload, Image.Image]:
     sample = nuscenes.get("sample", sample_token)
@@ -528,6 +529,7 @@ def load_sample_visualization_payload(
         sample_token=sample_token,
         horizon_sec=horizon_sec,
         sample_interval_sec=sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
     )
     nearby_agents = get_nearby_agents(
         nuscenes=nuscenes,
@@ -623,6 +625,7 @@ def build_review_candidate(
     camera: str,
     horizon_sec: float,
     sample_interval_sec: float,
+    time_tolerance_sec: float,
     max_agent_distance_m: float,
 ) -> ReviewCandidate:
     sample = nuscenes.get("sample", sample_token)
@@ -633,6 +636,7 @@ def build_review_candidate(
         sample_token=sample_token,
         horizon_sec=horizon_sec,
         sample_interval_sec=sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
     )
     nearby_agents = get_nearby_agents(
         nuscenes=nuscenes,
@@ -699,6 +703,7 @@ def build_review_candidate_pool(
     camera: str,
     horizon_sec: float,
     sample_interval_sec: float,
+    time_tolerance_sec: float,
     max_agent_distance_m: float,
 ) -> tuple[ReviewCandidate, ...]:
     all_candidates = tuple(
@@ -708,6 +713,7 @@ def build_review_candidate_pool(
             camera=camera,
             horizon_sec=horizon_sec,
             sample_interval_sec=sample_interval_sec,
+            time_tolerance_sec=time_tolerance_sec,
             max_agent_distance_m=max_agent_distance_m,
         )
         for sample_token in collect_review_sample_tokens(
@@ -750,6 +756,7 @@ def initialize_review_batch(
     camera: str,
     horizon_sec: float,
     sample_interval_sec: float,
+    time_tolerance_sec: float,
     max_agent_distance_m: float,
     label_rule_version: str,
     safety_rule_version: str,
@@ -761,6 +768,7 @@ def initialize_review_batch(
         camera=camera,
         horizon_sec=horizon_sec,
         sample_interval_sec=sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
         max_agent_distance_m=max_agent_distance_m,
     )
     selections = select_review_candidates(
@@ -793,6 +801,7 @@ def initialize_review_batch(
             camera=camera,
             horizon_sec=horizon_sec,
             sample_interval_sec=sample_interval_sec,
+            time_tolerance_sec=time_tolerance_sec,
             max_agent_distance_m=max_agent_distance_m,
         )
         payload = replace(
@@ -846,6 +855,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-agent-distance-m", type=float)
     parser.add_argument("--horizon-sec", type=float)
     parser.add_argument("--sample-interval-sec", type=float)
+    parser.add_argument("--trajectory-time-tolerance-sec", type=float)
     parser.add_argument(
         "--init-review",
         action="store_true",
@@ -900,6 +910,11 @@ def main() -> None:
         if arguments.max_agent_distance_m is None
         else arguments.max_agent_distance_m
     )
+    time_tolerance_sec = (
+        config.trajectory_time_tolerance_sec
+        if arguments.trajectory_time_tolerance_sec is None
+        else arguments.trajectory_time_tolerance_sec
+    )
     nuscenes = NuScenes(
         version=version,
         dataroot=str(dataroot),
@@ -914,6 +929,7 @@ def main() -> None:
             camera=arguments.camera,
             horizon_sec=horizon_sec,
             sample_interval_sec=sample_interval_sec,
+            time_tolerance_sec=time_tolerance_sec,
             max_agent_distance_m=max_agent_distance_m,
             label_rule_version=arguments.label_rule_version,
             safety_rule_version=arguments.safety_rule_version,
@@ -932,6 +948,7 @@ def main() -> None:
         camera=arguments.camera,
         horizon_sec=horizon_sec,
         sample_interval_sec=sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
         max_agent_distance_m=max_agent_distance_m,
     )
     output_path = resolve_output_path(

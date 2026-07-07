@@ -7,4 +7,5 @@ data:
 phase1:
   horizon_sec: 3.0
   sample_interval_sec: 0.5
+  trajectory_time_tolerance_sec: 0.075
   max_agent_distance_m: 50.0
