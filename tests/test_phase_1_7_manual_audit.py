@@ -40,6 +40,17 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(csv_file))
 
 
+def test_selector_defaults_to_phase_1_7_mini_inputs() -> None:
+    selector = load_module(SELECT_SCRIPT, "select_manual_review_samples")
+
+    assert selector.DEFAULT_DERIVED_LABELS == Path(
+        "data/outputs/phase_1_7_meta_action_mini/derived_meta_action.jsonl"
+    )
+    assert selector.DEFAULT_REVIEW_MANIFEST == Path(
+        "data/outputs/phase_1_7_manual_audit_mini/review_manifest.jsonl"
+    )
+
+
 def test_selection_warns_when_target_exceeds_available_records(
     tmp_path: Path,
 ) -> None:
@@ -85,6 +96,65 @@ def test_selection_warns_when_target_exceeds_available_records(
     assert any(
         warning.startswith("missing derived_action coverage:")
         for warning in result.warnings
+    )
+
+
+def test_selection_tops_up_rare_action_classes(tmp_path: Path) -> None:
+    selector = load_module(SELECT_SCRIPT, "select_manual_review_samples")
+    action_counts = {
+        "keep": 10,
+        "accelerate": 7,
+        "decelerate": 6,
+        "stop": 5,
+        "left_lateral": 3,
+        "right_lateral": 1,
+    }
+    rows = []
+    for action, count in action_counts.items():
+        for index in range(count):
+            rows.append(
+                {
+                    "sample_token": f"{action}-{index:02d}",
+                    "timestamp_us": index,
+                    "cam_front_path": f"samples/CAM_FRONT/{action}.jpg",
+                    "derived_action": action,
+                    "label_rule_version": "phase-1.6-meta-action-v0",
+                    "boundary_flags": [],
+                    "rule_features": {
+                        "delta_x_m": float(index + 1),
+                        "delta_y_m": 0.0,
+                    },
+                }
+            )
+    derived_path = write_jsonl(tmp_path / "derived.jsonl", tuple(rows))
+
+    candidates = selector.load_candidates(
+        derived_path=derived_path,
+        review_manifest_path=None,
+        visualization_dir=tmp_path / "visualizations",
+    )
+    result = selector.select_manual_review_samples(
+        candidates=candidates,
+        target_count=30,
+    )
+    selected_counts: dict[str, int] = {}
+    for record in result.records:
+        selected_counts[record.derived_action] = (
+            selected_counts.get(record.derived_action, 0) + 1
+        )
+
+    assert result.candidate_action_counts == action_counts
+    assert selected_counts["keep"] >= 5
+    assert selected_counts["accelerate"] >= 5
+    assert selected_counts["decelerate"] >= 5
+    assert selected_counts["stop"] >= 5
+    assert selected_counts["left_lateral"] == 3
+    assert selected_counts["right_lateral"] == 1
+    assert "candidate_count < 5 for derived_action left_lateral: 3" in (
+        result.warnings
+    )
+    assert "candidate_count < 5 for derived_action right_lateral: 1" in (
+        result.warnings
     )
 
 
@@ -216,6 +286,7 @@ def test_missing_optional_safety_fields_do_not_crash(tmp_path: Path) -> None:
 
     assert result.records[0].safety_score_reasonable == "not_available"
     assert result.records[0].safety_status == "not_available"
+    assert result.records[0].split == "phase-1.7-mini-audit"
 
 
 def test_summary_does_not_count_uncertain_as_correct_and_groups_errors(

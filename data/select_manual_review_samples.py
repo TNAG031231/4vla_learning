@@ -17,12 +17,13 @@ from src.actions.schema import ACTION_SCHEMA
 
 
 DEFAULT_DERIVED_LABELS = Path(
-    "data/outputs/phase_1_6_meta_action_v0/derived_meta_action.jsonl"
+    "data/outputs/phase_1_7_meta_action_mini/derived_meta_action.jsonl"
 )
 DEFAULT_REVIEW_MANIFEST = Path(
-    "data/outputs/phase_1_5_manual_review_smoke_v2/review_manifest.jsonl"
+    "data/outputs/phase_1_7_manual_audit_mini/review_manifest.jsonl"
 )
 DEFAULT_OUTPUT = Path("data/phase_1_7_manual_audit.csv")
+DEFAULT_SPLIT = "phase-1.7-mini-audit"
 NOT_AVAILABLE = "not_available"
 NO_UNCERTAINTY = "none"
 
@@ -123,6 +124,7 @@ class AuditRecord:
 @dataclass(frozen=True)
 class SelectionResult:
     records: tuple[AuditRecord, ...]
+    candidate_action_counts: dict[str, int]
     warnings: tuple[str, ...]
 
 
@@ -282,6 +284,7 @@ def _candidate_from_rows(
     manifest_row: Mapping[str, object],
     manifest_path: Path | None,
     visualization_dir: Path | None,
+    default_split: str,
 ) -> AuditCandidate:
     sample_token = _value_as_string(derived_row, ("sample_token",))
     rule_features = _mapping_value(derived_row, "rule_features")
@@ -326,7 +329,7 @@ def _candidate_from_rows(
         split=_value_as_string(
             derived_row,
             ("split",),
-            _value_as_string(manifest_row, ("split",)),
+            _value_as_string(manifest_row, ("split",), default_split),
         ),
         action_confidence=_value_as_string(
             derived_row,
@@ -382,6 +385,7 @@ def load_candidates(
     derived_path: Path,
     review_manifest_path: Path | None,
     visualization_dir: Path | None,
+    default_split: str = DEFAULT_SPLIT,
 ) -> tuple[AuditCandidate, ...]:
     manifest_rows = _manifest_index(review_manifest_path)
     return tuple(
@@ -393,6 +397,7 @@ def load_candidates(
             ),
             manifest_path=review_manifest_path,
             visualization_dir=visualization_dir,
+            default_split=default_split,
         )
         for row in read_jsonl(derived_path)
     )
@@ -464,6 +469,7 @@ def _coverage_warnings(
     candidates: tuple[AuditCandidate, ...],
     records: tuple[AuditRecord, ...],
     target_count: int,
+    candidate_action_counts: Mapping[str, int],
 ) -> tuple[str, ...]:
     warnings = []
     if len(candidates) < target_count:
@@ -480,6 +486,12 @@ def _coverage_warnings(
             "missing derived_action coverage: "
             f"{', '.join(missing_actions)}"
         )
+    for action in ACTION_SCHEMA:
+        count = candidate_action_counts.get(action, 0)
+        if count < 5:
+            warnings.append(
+                f"candidate_count < 5 for derived_action {action}: {count}"
+            )
     selected_vru = {record.has_vru for record in records}
     if "yes" not in selected_vru or "no" not in selected_vru:
         warnings.append("selected set does not cover both has_vru=yes and has_vru=no")
@@ -501,17 +513,21 @@ def select_manual_review_samples(
     ordered_candidates = tuple(
         sorted(candidates, key=lambda candidate: candidate.sample_token)
     )
+    candidate_action_counts = dict(
+        sorted(Counter(candidate.derived_action for candidate in candidates).items())
+    )
     selected: dict[str, AuditRecord] = {}
     for action in ACTION_SCHEMA:
-        _add_candidate(
-            selected,
-            _first_candidate(
-                ordered_candidates,
-                lambda candidate, action=action: candidate.derived_action
-                == action,
-            ),
-            f"action_coverage_{action}",
+        action_candidates = tuple(
+            candidate
+            for candidate in ordered_candidates
+            if candidate.derived_action == action
         )
+        quota = min(5, len(action_candidates))
+        for candidate in action_candidates[:quota]:
+            _add_candidate(selected, candidate, f"action_top_up_{action}")
+            if len(selected) >= target_count:
+                break
         if len(selected) >= target_count:
             break
 
@@ -556,14 +572,24 @@ def select_manual_review_samples(
     records = tuple(selected.values())
     return SelectionResult(
         records=records,
-        warnings=_coverage_warnings(candidates, records, target_count),
+        candidate_action_counts=candidate_action_counts,
+        warnings=_coverage_warnings(
+            candidates,
+            records,
+            target_count,
+            candidate_action_counts,
+        ),
     )
 
 
 def write_review_csv(records: tuple[AuditRecord, ...], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=REVIEW_FIELDS)
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=REVIEW_FIELDS,
+            lineterminator="\n",
+        )
         writer.writeheader()
         for record in records:
             writer.writerow(asdict(record))
@@ -576,6 +602,7 @@ def print_summary(result: SelectionResult, output_path: Path) -> None:
     reason_counts = Counter(record.selection_reason for record in result.records)
     print(f"output: {output_path}")
     print(f"selected samples: {len(result.records)}")
+    print(f"candidate derived_action distribution: {result.candidate_action_counts}")
     print(f"derived_action coverage: {dict(sorted(action_counts.items()))}")
     print(f"has_vru coverage: {dict(sorted(vru_counts.items()))}")
     print(f"safety_status coverage: {dict(sorted(safety_counts.items()))}")
@@ -607,6 +634,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--visualization-dir", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--target-count", type=int, default=100)
+    parser.add_argument("--default-split", default=DEFAULT_SPLIT)
     return parser.parse_args(argv)
 
 
@@ -614,7 +642,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
     if not arguments.derived_labels.exists():
         print(
-            f"missing derived label input: {arguments.derived_labels}",
+            "missing derived label input: "
+            f"{arguments.derived_labels}. "
+            "Generate Phase -1.7 mini labels or pass --derived-labels.",
             file=sys.stderr,
         )
         return 1
@@ -630,6 +660,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         derived_path=arguments.derived_labels,
         review_manifest_path=review_manifest,
         visualization_dir=visualization_dir,
+        default_split=arguments.default_split,
     )
     result = select_manual_review_samples(
         candidates=candidates,
