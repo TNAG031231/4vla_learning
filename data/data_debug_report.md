@@ -2,7 +2,7 @@
 
 ## Phase -1.7 Manual Meta-Action Audit
 
-- 状态：final confirmed local human audit completed for Phase -1.7；本节仅记录最终人工审核统计，不提交本地 CSV、`data/outputs/` 或 PNG。
+- 状态：final confirmed local human audit completed for Phase -1.7；本 PR 提交 `data/phase_1_7_manual_audit.csv`、`data/phase_1_7_lateral_supplement_audit.csv` 和最终统计报告；不提交 `data/outputs`、PNG 或 backup CSV。
 - base audit CSV：`data/phase_1_7_manual_audit.csv`，100 samples。
 - supplement audit CSV：`data/phase_1_7_lateral_supplement_audit.csv`，8 samples。
 - combined samples：108。
