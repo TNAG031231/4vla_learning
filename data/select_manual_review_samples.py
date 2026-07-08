@@ -403,6 +403,31 @@ def load_candidates(
     )
 
 
+def _read_review_csv(path: Path) -> tuple[Mapping[str, str], ...]:
+    with path.open(encoding="utf-8", newline="") as csv_file:
+        return tuple(dict(row) for row in csv.DictReader(csv_file))
+
+
+def read_existing_sample_tokens(path: Path) -> set[str]:
+    return {
+        row.get("sample_token", "").strip()
+        for row in _read_review_csv(path)
+        if row.get("sample_token", "").strip()
+    }
+
+
+def read_existing_action_counts(path: Path) -> dict[str, int]:
+    return dict(
+        sorted(
+            Counter(
+                row.get("derived_action", "").strip()
+                for row in _read_review_csv(path)
+                if row.get("derived_action", "").strip()
+            ).items()
+        )
+    )
+
+
 def _record_from_candidate(
     candidate: AuditCandidate,
     selection_reason: str,
@@ -582,6 +607,59 @@ def select_manual_review_samples(
     )
 
 
+def select_supplement_samples(
+    candidates: tuple[AuditCandidate, ...],
+    excluded_sample_tokens: set[str],
+    base_action_counts: Mapping[str, int],
+    min_per_action: int,
+) -> SelectionResult:
+    if min_per_action <= 0:
+        raise ValueError("min_per_action must be positive")
+
+    ordered_candidates = tuple(
+        sorted(candidates, key=lambda candidate: candidate.sample_token)
+    )
+    candidate_action_counts = dict(
+        sorted(Counter(candidate.derived_action for candidate in candidates).items())
+    )
+    selected: dict[str, AuditRecord] = {}
+    for action in ACTION_SCHEMA:
+        full_count = candidate_action_counts.get(action, 0)
+        desired_count = min(min_per_action, full_count)
+        needed_count = max(
+            0,
+            desired_count - base_action_counts.get(action, 0),
+        )
+        if needed_count == 0:
+            continue
+        action_candidates = tuple(
+            candidate
+            for candidate in ordered_candidates
+            if candidate.derived_action == action
+            and candidate.sample_token not in excluded_sample_tokens
+        )
+        for candidate in action_candidates[:needed_count]:
+            if candidate.sample_token not in selected:
+                selected[candidate.sample_token] = _record_from_candidate(
+                    candidate,
+                    f"supplement_top_up_{action}",
+                )
+
+    warnings = []
+    for action in ACTION_SCHEMA:
+        full_count = candidate_action_counts.get(action, 0)
+        if 0 < full_count < min_per_action:
+            warnings.append(
+                f"full_pool_count < {min_per_action} for "
+                f"derived_action {action}: {full_count}"
+            )
+    return SelectionResult(
+        records=tuple(selected.values()),
+        candidate_action_counts=candidate_action_counts,
+        warnings=tuple(warnings),
+    )
+
+
 def write_review_csv(records: tuple[AuditRecord, ...], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
@@ -635,6 +713,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--target-count", type=int, default=100)
     parser.add_argument("--default-split", default=DEFAULT_SPLIT)
+    parser.add_argument("--exclude-review-csv", type=Path)
+    parser.add_argument("--supplement-rare", action="store_true")
+    parser.add_argument("--min-per-action", type=int, default=5)
     return parser.parse_args(argv)
 
 
@@ -662,10 +743,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         visualization_dir=visualization_dir,
         default_split=arguments.default_split,
     )
-    result = select_manual_review_samples(
-        candidates=candidates,
-        target_count=arguments.target_count,
-    )
+    if arguments.supplement_rare:
+        if arguments.exclude_review_csv is None:
+            print(
+                "--supplement-rare requires --exclude-review-csv",
+                file=sys.stderr,
+            )
+            return 1
+        result = select_supplement_samples(
+            candidates=candidates,
+            excluded_sample_tokens=read_existing_sample_tokens(
+                arguments.exclude_review_csv,
+            ),
+            base_action_counts=read_existing_action_counts(
+                arguments.exclude_review_csv,
+            ),
+            min_per_action=arguments.min_per_action,
+        )
+    else:
+        result = select_manual_review_samples(
+            candidates=candidates,
+            target_count=arguments.target_count,
+        )
     write_review_csv(result.records, arguments.output)
     print_summary(result, arguments.output)
     return 0

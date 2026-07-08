@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 from types import ModuleType
+from types import SimpleNamespace
 
 import pytest
 
@@ -343,3 +344,52 @@ def test_review_manifest_with_no_passing_samples_raises(
         match="review manifest has no overall_pass=yes samples",
     ):
         derivation.read_review_sample_tokens(manifest)
+
+
+def test_collect_valid_future_tokens_filters_before_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    derivation = load_derivation_module()
+    rules = build_rules(derivation)
+
+    class FakeNuScenes:
+        scene = (
+            {"first_sample_token": "a"},
+            {"first_sample_token": "c"},
+        )
+        samples = {
+            "a": {"next": "b"},
+            "b": {"next": ""},
+            "c": {"next": ""},
+        }
+
+        def get(self, table_name: str, token: str) -> dict[str, str]:
+            assert table_name == "sample"
+            return self.samples[token]
+
+    complete = SimpleNamespace(
+        points=build_trajectory(
+            derivation,
+            tuple((float(index), 0.0) for index in range(7)),
+        ),
+        is_truncated=False,
+    )
+    short = SimpleNamespace(
+        points=build_trajectory(derivation, ((0.0, 0.0), (1.0, 0.0))),
+        is_truncated=False,
+    )
+    truncated = SimpleNamespace(points=complete.points, is_truncated=True)
+    trajectories = {"a": complete, "b": short, "c": truncated}
+    monkeypatch.setattr(
+        derivation,
+        "extract_future_ego_trajectory",
+        lambda sample_token, **_: trajectories[sample_token],
+    )
+
+    sample_tokens = derivation.collect_valid_future_sample_tokens(
+        nuscenes=FakeNuScenes(),
+        rules=rules,
+        time_tolerance_sec=0.075,
+    )
+
+    assert sample_tokens == ("a",)

@@ -158,6 +158,91 @@ def test_selection_tops_up_rare_action_classes(tmp_path: Path) -> None:
     )
 
 
+def test_supplement_selection_excludes_existing_tokens_and_tops_up_lateral(
+    tmp_path: Path,
+) -> None:
+    selector = load_module(SELECT_SCRIPT, "select_manual_review_samples")
+    rows = []
+    for index in range(6):
+        rows.append(
+            {
+                "sample_token": f"left-{index}",
+                "timestamp_us": index,
+                "cam_front_path": "samples/CAM_FRONT/left.jpg",
+                "derived_action": "left_lateral",
+                "label_rule_version": "phase-1.6-meta-action-v0",
+                "boundary_flags": [],
+                "rule_features": {
+                    "delta_x_m": 8.0,
+                    "delta_y_m": 2.0,
+                },
+            }
+        )
+    for index in range(3):
+        rows.append(
+            {
+                "sample_token": f"right-{index}",
+                "timestamp_us": index,
+                "cam_front_path": "samples/CAM_FRONT/right.jpg",
+                "derived_action": "right_lateral",
+                "label_rule_version": "phase-1.6-meta-action-v0",
+                "boundary_flags": [],
+                "rule_features": {
+                    "delta_x_m": 8.0,
+                    "delta_y_m": -2.0,
+                },
+            }
+        )
+    derived_path = write_jsonl(tmp_path / "derived.jsonl", tuple(rows))
+    base_csv = tmp_path / "base.csv"
+    with base_csv.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=selector.REVIEW_FIELDS)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "sample_token": "left-0",
+                "derived_action": "left_lateral",
+                "reviewed_action": "left_lateral",
+                "label_correct": "yes",
+            }
+        )
+        writer.writerow(
+            {
+                "sample_token": "right-0",
+                "derived_action": "right_lateral",
+                "reviewed_action": "right_lateral",
+                "label_correct": "yes",
+            }
+        )
+
+    candidates = selector.load_candidates(
+        derived_path=derived_path,
+        review_manifest_path=None,
+        visualization_dir=tmp_path / "visualizations",
+    )
+    excluded_tokens = selector.read_existing_sample_tokens(base_csv)
+    base_action_counts = selector.read_existing_action_counts(base_csv)
+    result = selector.select_supplement_samples(
+        candidates=candidates,
+        excluded_sample_tokens=excluded_tokens,
+        base_action_counts=base_action_counts,
+        min_per_action=5,
+    )
+
+    assert {record.sample_token for record in result.records} == {
+        "left-1",
+        "left-2",
+        "left-3",
+        "left-4",
+        "right-1",
+        "right-2",
+    }
+    assert all(
+        record.selection_reason.startswith("supplement_top_up_")
+        for record in result.records
+    )
+
+
 def test_selection_covers_actions_vru_safety_and_boundary_samples(
     tmp_path: Path,
 ) -> None:

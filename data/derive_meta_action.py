@@ -96,6 +96,7 @@ class MetaActionResult:
 @dataclass(frozen=True)
 class SampleLabelRecord:
     sample_token: str
+    scene_token: str
     scene_name: str
     timestamp_us: int
     cam_front_path: str
@@ -424,6 +425,55 @@ def read_review_sample_tokens(review_manifest: Path) -> tuple[str, ...]:
     return sample_tokens
 
 
+def collect_sample_tokens(nuscenes: NuScenes) -> tuple[str, ...]:
+    sample_tokens = []
+    for scene in nuscenes.scene:
+        token = str(scene["first_sample_token"])
+        while token:
+            sample_tokens.append(token)
+            sample = nuscenes.get("sample", token)
+            token = str(sample["next"])
+    return tuple(sample_tokens)
+
+
+def has_valid_future_trajectory(
+    nuscenes: NuScenes,
+    sample_token: str,
+    rules: MetaActionRules,
+    time_tolerance_sec: float,
+) -> bool:
+    trajectory = extract_future_ego_trajectory(
+        nuscenes=nuscenes,
+        sample_token=sample_token,
+        horizon_sec=rules.horizon_sec,
+        sample_interval_sec=rules.sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
+    )
+    return (
+        len(trajectory.points) >= _expected_trajectory_points(rules)
+        and not trajectory.is_truncated
+        and trajectory.points[-1].t_sec + time_tolerance_sec
+        >= rules.horizon_sec
+    )
+
+
+def collect_valid_future_sample_tokens(
+    nuscenes: NuScenes,
+    rules: MetaActionRules,
+    time_tolerance_sec: float,
+) -> tuple[str, ...]:
+    return tuple(
+        sample_token
+        for sample_token in collect_sample_tokens(nuscenes)
+        if has_valid_future_trajectory(
+            nuscenes=nuscenes,
+            sample_token=sample_token,
+            rules=rules,
+            time_tolerance_sec=time_tolerance_sec,
+        )
+    )
+
+
 def derive_sample_record(
     nuscenes: NuScenes,
     sample_token: str,
@@ -452,6 +502,7 @@ def derive_sample_record(
     features = result.rule_features
     return SampleLabelRecord(
         sample_token=sample_token,
+        scene_token=str(sample["scene_token"]),
         scene_name=str(scene["name"]),
         timestamp_us=int(sample["timestamp"]),
         cam_front_path=Path(camera_data["filename"]).as_posix(),
@@ -538,6 +589,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataroot", type=Path)
     parser.add_argument("--camera", default=CAMERA_CHANNEL)
+    parser.add_argument(
+        "--all-valid-samples",
+        action="store_true",
+        help=(
+            "Derive labels for every sample with a complete configured "
+            "future trajectory instead of reading --review-manifest."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -553,6 +612,19 @@ def main() -> None:
         dataroot=str(data_config.nuscenes_root),
         verbose=False,
     )
+    if arguments.all_valid_samples:
+        sample_tokens = collect_valid_future_sample_tokens(
+            nuscenes=nuscenes,
+            rules=rules,
+            time_tolerance_sec=data_config.trajectory_time_tolerance_sec,
+        )
+        print(
+            "valid_3s_future_trajectory_samples: "
+            f"{len(sample_tokens)}"
+        )
+    else:
+        sample_tokens = read_review_sample_tokens(arguments.review_manifest)
+
     records = tuple(
         derive_sample_record(
             nuscenes=nuscenes,
@@ -561,9 +633,7 @@ def main() -> None:
             rules=rules,
             time_tolerance_sec=data_config.trajectory_time_tolerance_sec,
         )
-        for sample_token in read_review_sample_tokens(
-            arguments.review_manifest
-        )
+        for sample_token in sample_tokens
     )
     write_jsonl(records, arguments.output)
     print(f"output: {arguments.output}")
