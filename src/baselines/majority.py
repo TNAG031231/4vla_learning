@@ -13,7 +13,7 @@ from src.phase0.protocol import (
     ClassificationMetrics,
     ManifestSample,
     evaluate_classification,
-    validate_scene_split_isolation,
+    read_manifest_samples,
 )
 
 
@@ -78,33 +78,6 @@ def write_predictions(
     with output_path.open("w", encoding="utf-8") as output_file:
         for prediction in predictions:
             output_file.write(json.dumps(asdict(prediction)) + "\n")
-
-
-def _required_string(mapping: Mapping[str, object], key: str) -> str:
-    value = mapping.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"manifest row missing {key}")
-    return value
-
-
-def read_manifest_samples(path: Path) -> tuple[ManifestSample, ...]:
-    samples = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        row = json.loads(line)
-        if not isinstance(row, Mapping):
-            raise ValueError(f"{path}:{line_number}: manifest row must be an object")
-        samples.append(
-            ManifestSample(
-                sample_token=_required_string(row, "sample_token"),
-                scene_token=_required_string(row, "scene_token"),
-                meta_action=normalize_action(_required_string(row, "meta_action")),
-                split=_required_string(row, "split"),
-                label_rule_version=_required_string(row, "label_rule_version"),
-            )
-        )
-    result = tuple(samples)
-    validate_scene_split_isolation(result)
-    return result
 
 
 def _load_config(config_path: Path) -> tuple[Path, Path]:

@@ -1,11 +1,63 @@
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from data import build_phase0_manifest as manifest_builder
+
+
+class FakeNuScenes:
+    def __init__(self) -> None:
+        self.tables: dict[str, dict[str, dict[str, object]]] = {
+            "sample": {},
+            "sample_data": {},
+            "ego_pose": {},
+        }
+
+    def get(self, table_name: str, token: str) -> dict[str, object]:
+        return self.tables[table_name][token]
+
+
+def rotation_from_yaw(yaw_rad: float) -> list[float]:
+    return [math.cos(yaw_rad / 2.0), 0.0, 0.0, math.sin(yaw_rad / 2.0)]
+
+
+def build_motion_reader(
+    previous_scene_token: str = "scene-a",
+    previous_yaw_rad: float = 0.0,
+    current_yaw_rad: float = 0.0,
+) -> FakeNuScenes:
+    reader = FakeNuScenes()
+    sample_specs = (
+        ("start", "", "scene-a", 0, 0.0, 0.0),
+        ("previous", "start", previous_scene_token, 1_000_000, 1.0, previous_yaw_rad),
+        ("current", "previous", "scene-a", 2_000_000, 2.0, current_yaw_rad),
+        ("future", "current", "scene-a", 3_000_000, 3.0, 0.0),
+    )
+    for token, previous_token, scene_token, timestamp, x_m, yaw_rad in sample_specs:
+        camera_token = f"camera-{token}"
+        pose_token = f"pose-{token}"
+        reader.tables["sample"][token] = {
+            "token": token,
+            "scene_token": scene_token,
+            "timestamp": timestamp,
+            "prev": previous_token,
+            "next": "future" if token == "current" else "",
+            "data": {"CAM_FRONT": camera_token},
+        }
+        reader.tables["sample_data"][camera_token] = {
+            "ego_pose_token": pose_token,
+        }
+        reader.tables["ego_pose"][pose_token] = {
+            "translation": [x_m, 0.0, 0.0],
+            "rotation": rotation_from_yaw(yaw_rad),
+        }
+    return reader
 
 
 def test_manifest_record_preserves_phase_minus_one_source_and_required_fields() -> None:
@@ -36,7 +88,20 @@ def test_manifest_record_preserves_phase_minus_one_source_and_required_fields() 
     record = manifest_builder.build_manifest_record(
         audit_row=audit_row,
         derived_record=derived,
-        current_ego_state={"frame": "global"},
+        current_ego_pose={
+            "frame": "nuScenes_global",
+            "translation_m": [1.0, 2.0, 3.0],
+            "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+        },
+        current_ego_motion={
+            "speed_mps": None,
+            "longitudinal_acceleration_mps2": None,
+            "yaw_rate_radps": None,
+            "source": "ego_pose_past_difference",
+            "availability": "unavailable",
+            "history_interval_sec": None,
+            "unavailable_reason": "insufficient_past_history",
+        },
         trajectory=trajectory,
         nearby_agents=agents,
         split="train",
@@ -49,7 +114,8 @@ def test_manifest_record_preserves_phase_minus_one_source_and_required_fields() 
         "scene_token",
         "timestamp",
         "cam_front_path",
-        "current_ego_state",
+        "current_ego_pose",
+        "current_ego_motion",
         "future_ego_trajectory",
         "nearby_agents",
         "meta_action",
@@ -58,7 +124,9 @@ def test_manifest_record_preserves_phase_minus_one_source_and_required_fields() 
         "split",
         "source_audit_record",
         "coordinate_metadata",
+        "manifest_schema_version",
     }
+    assert "current_ego_state" not in payload
     assert payload["meta_action"] == "keep"
     assert payload["source_audit_record"]["source_audit"] == "base"
     assert payload["source_audit_record"]["sample_token"] == "sample-a"
@@ -73,6 +141,7 @@ def test_manifest_record_preserves_phase_minus_one_source_and_required_fields() 
         "unit": "meter",
         "transform": "subtract_current_ego_translation_then_apply_inverse_current_ego_rotation",
     }
+    assert payload["manifest_schema_version"] == "phase0_audited_seed_subset_v1"
 
 
 def test_manifest_reader_rejects_unknown_action(tmp_path: Path) -> None:
@@ -88,3 +157,84 @@ def test_manifest_reader_rejects_unknown_action(tmp_path: Path) -> None:
         assert "Unsupported action" in str(error)
     else:
         raise AssertionError("unknown meta_action must be rejected")
+
+
+def test_current_ego_pose_and_motion_use_past_samples_only() -> None:
+    reader = build_motion_reader()
+
+    pose = manifest_builder.current_ego_pose(reader, "current")
+    motion = manifest_builder.current_ego_motion(reader, "current")
+
+    assert pose == {
+        "frame": "nuScenes_global",
+        "translation_m": [2.0, 0.0, 0.0],
+        "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+    }
+    assert motion == {
+        "speed_mps": pytest.approx(1.0),
+        "longitudinal_acceleration_mps2": pytest.approx(0.0),
+        "yaw_rate_radps": pytest.approx(0.0),
+        "source": "ego_pose_past_difference",
+        "availability": "full",
+        "history_interval_sec": pytest.approx(1.0),
+        "unavailable_reason": None,
+    }
+
+
+def test_current_ego_motion_normalizes_yaw_wraparound() -> None:
+    reader = build_motion_reader(
+        previous_yaw_rad=3.13,
+        current_yaw_rad=-3.13,
+    )
+
+    motion = manifest_builder.current_ego_motion(reader, "current")
+
+    assert motion["yaw_rate_radps"] == pytest.approx(math.tau - 6.26)
+
+
+def test_scene_start_motion_is_unavailable_without_future_pose() -> None:
+    reader = build_motion_reader()
+
+    motion = manifest_builder.current_ego_motion(reader, "start")
+
+    assert motion == {
+        "speed_mps": None,
+        "longitudinal_acceleration_mps2": None,
+        "yaw_rate_radps": None,
+        "source": "ego_pose_past_difference",
+        "availability": "unavailable",
+        "history_interval_sec": None,
+        "unavailable_reason": "insufficient_past_history",
+    }
+
+
+def test_motion_without_two_past_intervals_is_partial() -> None:
+    reader = build_motion_reader()
+
+    motion = manifest_builder.current_ego_motion(reader, "previous")
+
+    assert motion["speed_mps"] == pytest.approx(1.0)
+    assert motion["longitudinal_acceleration_mps2"] is None
+    assert motion["yaw_rate_radps"] == pytest.approx(0.0)
+    assert motion["availability"] == "partial"
+    assert motion["unavailable_reason"] == "insufficient_past_history_for_acceleration"
+
+
+def test_motion_does_not_cross_scenes() -> None:
+    reader = build_motion_reader(previous_scene_token="scene-b")
+
+    motion = manifest_builder.current_ego_motion(reader, "current")
+
+    assert motion["availability"] == "unavailable"
+    assert motion["unavailable_reason"] == "previous_sample_scene_mismatch"
+
+
+def test_future_pose_change_does_not_affect_current_motion() -> None:
+    reader = build_motion_reader()
+
+    before_future_change = manifest_builder.current_ego_motion(reader, "current")
+    reader.tables["ego_pose"]["pose-future"]["translation"] = [999.0, 0.0, 0.0]
+    after_future_change = manifest_builder.current_ego_motion(reader, "current")
+
+    assert before_future_change == after_future_change
+    assert before_future_change["availability"] == "full"

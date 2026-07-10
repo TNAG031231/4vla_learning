@@ -10,10 +10,9 @@ from src.baselines.majority import (
     BASELINE_NAME,
     fit_majority_action,
     predict_split,
-    read_manifest_samples,
     write_predictions,
 )
-from src.phase0.protocol import ManifestSample
+from src.phase0.protocol import ManifestSample, read_manifest_samples
 
 
 def build_samples() -> tuple[ManifestSample, ...]:
@@ -88,3 +87,21 @@ def test_manifest_reader_rejects_scene_leakage(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="scene_token spans splits"):
         read_manifest_samples(manifest_path)
+
+
+def test_majority_ignores_global_pose_fields_in_manifest(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        "\n".join(
+            (
+                '{"sample_token": "train", "scene_token": "scene-train", "meta_action": "keep", "split": "train", "label_rule_version": "v0", "current_ego_pose": {"translation_m": [1, 2, 3], "rotation_wxyz": [1, 0, 0, 0]}}',
+                '{"sample_token": "validation", "scene_token": "scene-validation", "meta_action": "stop", "split": "validation", "label_rule_version": "v0", "current_ego_pose": {"translation_m": [999, 999, 999], "rotation_wxyz": [0, 1, 0, 0]}}',
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    samples = read_manifest_samples(manifest_path)
+
+    assert fit_majority_action(samples) == "keep"

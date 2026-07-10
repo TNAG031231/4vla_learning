@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 import json
+import math
 from pathlib import Path
 import sys
 
 from nuscenes.nuscenes import NuScenes
+from pyquaternion import Quaternion
 import yaml
 
 
@@ -32,6 +35,7 @@ from inspect_nuscenes_sample import (
     get_ego_pose,
     get_nearby_agents,
     extract_future_ego_trajectory,
+    normalize_angle,
 )
 from validate_label_freeze import (
     EXPECTED_LABEL_RULE_VERSION,
@@ -45,16 +49,25 @@ from src.phase0.protocol import (
     ManifestSample,
     assign_scene_splits,
     complete_action_distribution,
+    read_manifest_samples,
     validate_scene_split_isolation,
 )
 
 
 SAFETY_RULE_VERSION = "not_available"
+MANIFEST_SCHEMA_VERSION = "phase0_audited_seed_subset_v1"
+MOTION_SOURCE = "ego_pose_past_difference"
 COORDINATE_METADATA = {
-    "current_ego_state": {
+    "current_ego_pose": {
         "frame": "nuScenes_global",
         "translation_unit": "meter",
         "rotation_order": "wxyz",
+    },
+    "current_ego_motion": {
+        "speed_unit": "meter_per_second",
+        "longitudinal_acceleration_unit": "meter_per_second_squared",
+        "yaw_rate_unit": "radian_per_second",
+        "source": MOTION_SOURCE,
     },
     "future_ego_trajectory": {
         "source_frame": "nuScenes_global",
@@ -100,13 +113,15 @@ class Phase0ManifestRecord:
     scene_token: str
     timestamp: int
     cam_front_path: str
-    current_ego_state: dict[str, object]
+    current_ego_pose: dict[str, object]
+    current_ego_motion: dict[str, object]
     coordinate_metadata: dict[str, dict[str, str]]
     future_ego_trajectory: tuple[object, ...]
     nearby_agents: tuple[object, ...]
     meta_action: str
     label_rule_version: str
     safety_rule_version: str
+    manifest_schema_version: str
     split: str
     source_audit_record: SourceAuditRecord
 
@@ -132,7 +147,8 @@ def _json_compatible(value: object) -> object:
 def build_manifest_record(
     audit_row: HistoricalAuditRow,
     derived_record: object,
-    current_ego_state: dict[str, object],
+    current_ego_pose: dict[str, object],
+    current_ego_motion: dict[str, object],
     trajectory: FutureEgoTrajectory,
     nearby_agents: NearbyAgents,
     split: str,
@@ -160,13 +176,15 @@ def build_manifest_record(
         scene_token=scene_token,
         timestamp=timestamp,
         cam_front_path=cam_front_path,
-        current_ego_state=current_ego_state,
+        current_ego_pose=current_ego_pose,
+        current_ego_motion=current_ego_motion,
         coordinate_metadata=COORDINATE_METADATA,
         future_ego_trajectory=tuple(trajectory.points),
         nearby_agents=tuple(nearby_agents.agents),
         meta_action=meta_action,
         label_rule_version=label_rule_version,
         safety_rule_version=SAFETY_RULE_VERSION,
+        manifest_schema_version=MANIFEST_SCHEMA_VERSION,
         split=split,
         source_audit_record=SourceAuditRecord(
             source_audit=audit_row.source_audit,
@@ -186,13 +204,144 @@ def to_json_record(record: Phase0ManifestRecord) -> dict[str, object]:
     return payload
 
 
-def current_ego_state(nuscenes: NuScenes, sample_token: str) -> dict[str, object]:
+def current_ego_pose(nuscenes: NuScenes, sample_token: str) -> dict[str, object]:
     sample = nuscenes.get("sample", sample_token)
     translation, rotation = get_ego_pose(nuscenes, sample)
     return {
         "frame": "nuScenes_global",
         "translation_m": list(translation),
         "rotation_wxyz": list(rotation),
+    }
+
+
+def _unavailable_motion(reason: str) -> dict[str, object]:
+    return {
+        "speed_mps": None,
+        "longitudinal_acceleration_mps2": None,
+        "yaw_rate_radps": None,
+        "source": MOTION_SOURCE,
+        "availability": "unavailable",
+        "history_interval_sec": None,
+        "unavailable_reason": reason,
+    }
+
+
+def _previous_sample(
+    nuscenes: NuScenes,
+    sample: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    previous_token = sample.get("prev")
+    if not isinstance(previous_token, str) or not previous_token:
+        return None
+    previous_sample = nuscenes.get("sample", previous_token)
+    scene_token = sample.get("scene_token")
+    if previous_sample.get("scene_token") != scene_token:
+        return None
+    return previous_sample
+
+
+def _history_interval_sec(
+    newer_sample: Mapping[str, object],
+    older_sample: Mapping[str, object],
+) -> float | None:
+    newer_timestamp = newer_sample.get("timestamp")
+    older_timestamp = older_sample.get("timestamp")
+    if not isinstance(newer_timestamp, int) or not isinstance(older_timestamp, int):
+        return None
+    delta_us = newer_timestamp - older_timestamp
+    if delta_us <= 0:
+        return None
+    return delta_us / 1_000_000.0
+
+
+def _speed_mps(
+    newer_translation: tuple[float, ...],
+    older_translation: tuple[float, ...],
+    interval_sec: float,
+) -> float:
+    return math.hypot(
+        newer_translation[0] - older_translation[0],
+        newer_translation[1] - older_translation[1],
+    ) / interval_sec
+
+
+def current_ego_motion(
+    nuscenes: NuScenes,
+    sample_token: str,
+) -> dict[str, object]:
+    current_sample = nuscenes.get("sample", sample_token)
+    previous_sample = _previous_sample(nuscenes, current_sample)
+    if previous_sample is None:
+        previous_token = current_sample.get("prev")
+        if isinstance(previous_token, str) and previous_token:
+            return _unavailable_motion("previous_sample_scene_mismatch")
+        return _unavailable_motion("insufficient_past_history")
+
+    interval_sec = _history_interval_sec(current_sample, previous_sample)
+    if interval_sec is None:
+        return _unavailable_motion("non_monotonic_timestamp")
+
+    current_translation, current_rotation = get_ego_pose(
+        nuscenes,
+        current_sample,
+    )
+    previous_translation, previous_rotation = get_ego_pose(
+        nuscenes,
+        previous_sample,
+    )
+    speed_mps = _speed_mps(
+        current_translation,
+        previous_translation,
+        interval_sec,
+    )
+    current_yaw = Quaternion(current_rotation).yaw_pitch_roll[0]
+    previous_yaw = Quaternion(previous_rotation).yaw_pitch_roll[0]
+    yaw_rate_radps = normalize_angle(current_yaw - previous_yaw) / interval_sec
+
+    previous_previous_sample = _previous_sample(nuscenes, previous_sample)
+    if previous_previous_sample is None:
+        return {
+            "speed_mps": speed_mps,
+            "longitudinal_acceleration_mps2": None,
+            "yaw_rate_radps": yaw_rate_radps,
+            "source": MOTION_SOURCE,
+            "availability": "partial",
+            "history_interval_sec": interval_sec,
+            "unavailable_reason": "insufficient_past_history_for_acceleration",
+        }
+    previous_interval_sec = _history_interval_sec(
+        previous_sample,
+        previous_previous_sample,
+    )
+    if previous_interval_sec is None:
+        return {
+            "speed_mps": speed_mps,
+            "longitudinal_acceleration_mps2": None,
+            "yaw_rate_radps": yaw_rate_radps,
+            "source": MOTION_SOURCE,
+            "availability": "partial",
+            "history_interval_sec": interval_sec,
+            "unavailable_reason": "insufficient_past_history_for_acceleration",
+        }
+    previous_previous_translation, _ = get_ego_pose(
+        nuscenes,
+        previous_previous_sample,
+    )
+    previous_speed_mps = _speed_mps(
+        previous_translation,
+        previous_previous_translation,
+        previous_interval_sec,
+    )
+    return {
+        "speed_mps": speed_mps,
+        "longitudinal_acceleration_mps2": (
+            speed_mps - previous_speed_mps
+        ) / interval_sec,
+        "yaw_rate_radps": yaw_rate_radps,
+        "source": MOTION_SOURCE,
+        "availability": "full",
+        "history_interval_sec": interval_sec,
+        "unavailable_reason": None,
     }
 
 
@@ -235,7 +384,11 @@ def build_manifest_records(
             build_manifest_record(
                 audit_row=audit_row,
                 derived_record=derived_record,
-                current_ego_state=current_ego_state(
+                current_ego_pose=current_ego_pose(
+                    nuscenes,
+                    audit_row.sample_token,
+                ),
+                current_ego_motion=current_ego_motion(
                     nuscenes,
                     audit_row.sample_token,
                 ),
@@ -245,12 +398,6 @@ def build_manifest_records(
             )
         )
     return tuple(records)
-
-
-def read_manifest_samples(path: Path) -> tuple[ManifestSample, ...]:
-    from src.baselines.majority import read_manifest_samples as read_samples
-
-    return read_samples(path)
 
 
 def write_manifest(
@@ -297,6 +444,18 @@ def _print_audit(records: Sequence[Phase0ManifestRecord]) -> None:
     )
     validate_scene_split_isolation(samples)
     print(f"audited Phase 0 seed subset samples: {len(samples)}")
+    print(
+        "motion availability: "
+        f"{dict(Counter(record.current_ego_motion['availability'] for record in records))}"
+    )
+    print(
+        "label_rule_versions: "
+        f"{sorted({record.label_rule_version for record in records})}"
+    )
+    print(
+        "manifest_schema_versions: "
+        f"{sorted({record.manifest_schema_version for record in records})}"
+    )
     for split in ("train", "validation", "test"):
         split_samples = tuple(sample for sample in samples if sample.split == split)
         print(f"{split} scenes: {len({sample.scene_token for sample in split_samples})}")
@@ -352,6 +511,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     _print_audit(records)
     output_path = Path(_required_config_string(config, "manifest_path"))
     write_manifest(records, output_path)
+    written_samples = read_manifest_samples(output_path)
+    if len(written_samples) != len(records):
+        raise ValueError("written manifest sample count does not match records")
     print(f"manifest: {output_path}")
     return 0
 

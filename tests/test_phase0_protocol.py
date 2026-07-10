@@ -13,6 +13,7 @@ from src.phase0.protocol import (
     assign_scene_splits,
     complete_action_distribution,
     evaluate_classification,
+    read_manifest_samples,
     validate_scene_split_isolation,
 )
 
@@ -87,3 +88,64 @@ def test_complete_action_distribution_retains_zero_count_classes() -> None:
         "left_lateral": 0,
         "right_lateral": 0,
     }
+
+
+def test_invalid_prediction_counts_as_ground_truth_false_negative() -> None:
+    metrics = evaluate_classification(
+        ground_truth=("keep", "keep"),
+        predictions=("keep", "INVALID"),
+    )
+
+    assert metrics.sample_count == 2
+    assert metrics.correct_count == 1
+    assert metrics.valid_prediction_count == 1
+    assert metrics.invalid_label_count == 1
+    assert metrics.invalid_output_rate == pytest.approx(0.5)
+    assert metrics.action_parsing_success_rate == pytest.approx(0.5)
+    assert (
+        metrics.invalid_output_rate + metrics.action_parsing_success_rate
+    ) == pytest.approx(1.0)
+    assert metrics.accuracy == pytest.approx(0.5)
+    assert metrics.per_class_precision["keep"] == pytest.approx(1.0)
+    assert metrics.per_class_recall["keep"] == pytest.approx(0.5)
+    assert metrics.per_class_f1["keep"] == pytest.approx(2 / 3)
+    assert sum(sum(row) for row in metrics.confusion_matrix) == 1
+
+
+def test_all_invalid_predictions_keep_ground_truth_support() -> None:
+    metrics = evaluate_classification(
+        ground_truth=("keep", "accelerate"),
+        predictions=("INVALID", "INVALID"),
+    )
+
+    assert metrics.accuracy == 0.0
+    assert metrics.valid_prediction_count == 0
+    assert metrics.invalid_label_count == 2
+    assert metrics.invalid_output_rate == 1.0
+    assert metrics.action_parsing_success_rate == 0.0
+    assert all(sum(row) == 0 for row in metrics.confusion_matrix)
+    assert metrics.per_class_recall["keep"] == 0.0
+    assert metrics.per_class_recall["accelerate"] == 0.0
+
+
+def test_ground_truth_invalid_action_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Unsupported action"):
+        evaluate_classification(
+            ground_truth=("INVALID",),
+            predictions=("keep",),
+        )
+
+
+def test_protocol_owns_manifest_reader_without_baseline_dependency(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        '{"sample_token": "sample", "scene_token": "scene", "meta_action": "keep", "split": "train", "label_rule_version": "v0"}\n',
+        encoding="utf-8",
+    )
+
+    samples = read_manifest_samples(manifest_path)
+
+    assert samples == (ManifestSample("sample", "scene", "keep", "train", "v0"),)
+    assert "src.baselines" not in (PROJECT_ROOT / "src/phase0/protocol.py").read_text()
