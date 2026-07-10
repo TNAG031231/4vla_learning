@@ -64,26 +64,23 @@ timestamp
 cam_front_path
 current_ego_pose
 current_ego_motion
+coordinate_metadata
 future_ego_trajectory
 nearby_agents
 split
+manifest_schema_version
 ```
 
-动作、轨迹和其他监督信号是可版本化的派生 targets：
+当前 audited seed-subset schema 的派生与追溯字段为：
 
-```yaml
-targets:
-  meta_action_coarse: canonical coarse target role; formal manifest v1 field pending PR #11 review fixes
-  meta_action_rule_version: canonical coarse rule-version role; formal manifest v1 field pending PR #11 review fixes
-  future_waypoints: planned
-  trajectory_valid_mask: planned
-  longitudinal_action: planned
-  lateral_direction: planned
-  maneuver_type: planned
-  fine_action_rule_version: planned
+```text
+meta_action
+label_rule_version
+safety_rule_version
+source_audit_record
 ```
 
-基础字段不因 action 规则扩展而重写；当前冻结产物的 `meta_action` / `label_rule_version` 分别承载上述 coarse target 与 rule-version 角色。Draft PR #11 当前提供 `current_ego_state`（global pose）以及历史 `meta_action` / `label_rule_version` 字段，尚未正式冻结包含 `current_ego_pose`、`current_ego_motion` 和 `targets` 的 manifest v1；最终 schema 依赖 PR #11 review fixes。动作规则变化必须提升对应 rule version，不同 label version、coarse 与 fine 标签不得静默混用。新增输出 head 时优先扩展 `targets`，并继续使用固定的 scene-level train/validation/test split；test split 不因标签、prompt 或模型结果反复调整。安全评估、rollout 或 preference 产物还必须记录 `raster_config_version`、坐标系/单位/transform 顺序、候选 action 或 trajectory、时间步、`motion_assumption`（如有）、分项 safety cost 与触发对象。
+当前 schema version 为 `phase0_audited_seed_subset_v1`，`label_rule_version=phase-1.6-meta-action-v0.2`。`current_ego_pose` 至少包含 `frame`、`translation_m`、`rotation_wxyz`、`timestamp_us` 与 `timestamp_source`；`current_ego_motion` 至少包含 `speed_mps`、`longitudinal_acceleration_mps2`、`yaw_rate_radps`、`source`、`timestamp_source`、`availability`、`history_interval_sec`、`acceleration_interval_sec` 与 `unavailable_reason`。两者 timestamp source 均为 `CAM_FRONT_sample_data`，motion 只使用当前和历史 pose，不使用 future pose 或 future trajectory。当前 `meta_action` / `label_rule_version` 分别承担 coarse action 与其 rule version 角色；不得提前重命名为 `meta_action_coarse` / `meta_action_rule_version`。该 schema 是 audited seed-subset schema，不是正式 trainval manifest v1；Phase 0.1b 才生成后者。动作规则变化必须提升对应 rule version，不同 label version、coarse 与 fine 标签不得静默混用。新增输出 head 时优先扩展 targets，并继续使用固定的 scene-level train/validation/test split；test split 不因标签、prompt 或模型结果反复调整。安全评估、rollout 或 preference 产物还必须记录 `raster_config_version`、坐标系/单位/transform 顺序、候选 action 或 trajectory、时间步、`motion_assumption`（如有）、分项 safety cost 与触发对象。
 
 ## 2. 为什么保留 coarse meta-action
 
@@ -151,19 +148,19 @@ Phase 0.5a 不训练 BEVFormer、OccNet、SurroundOcc 或完整 occupancy networ
 
 已确认事实：`CAM_FRONT`、future ego trajectory 与 nearby agents 已可读取并可视化；已派生 6 类 coarse meta-action；108 个样本已人工审核，且 6 类 action 已有审核覆盖。VRU presence 是本阶段 gate 的必需覆盖维度，需与规则冻结一并核验。当前 `safety_rule_version=not_available`，因此本阶段不把 collision、near miss、safe/unsafe 或 `safety_score_reasonable` 作为审核完成条件。
 
-**Gate：** 图像、future trajectory 与 nearby agents 对齐；6 类 coarse meta-action、VRU presence 和 action boundary cases 已覆盖；`meta_action_rule_version` 已修订并冻结；manifest audit 前置检查可核验。未通过前不进入 Phase 0.1，也不训练模型。
+**Gate：** 图像、future trajectory 与 nearby agents 对齐；6 类 coarse meta-action、VRU presence 和 action boundary cases 已覆盖；`label_rule_version=phase-1.6-meta-action-v0.2` 已冻结；manifest audit 前置检查可核验。该 gate 已通过。
 
-## 5. Phase 0.1：manifest 协议、scene-level split 与 Majority Baseline（Draft PR #11 review 中）
+## 5. Phase 0.1：manifest 协议、scene-level split 与 Majority Baseline（completed）
 
 | 项目 | 定义 |
 |---|---|
-| 输入 | 冻结后的 coarse label、PR #11 当前 manifest 字段、scene-level split |
-| 输出 | sample-level predictions、macro-F1、per-class F1、confusion matrix、class distribution、invalid output rate、failure cases |
-| 核心脚本/测试 | Draft PR #11：manifest builder、Majority Baseline、action parser、split-leakage test 与 baseline metric test |
+| 输入 | 冻结后的 coarse label、audited seed-subset manifest、固定 seed 的 scene-level split |
+| 输出 | sample-level predictions、macro-F1、per-class F1、confusion matrix、class distribution、invalid prediction 指标、failure cases |
+| 核心脚本/测试 | `data/build_phase0_manifest.py`、`src/phase0/protocol.py`、`src/baselines/majority.py` 与对应 manifest/protocol/majority tests |
 
-严格顺序：冻结数据版本与 coarse rule version → scene-level train/val/test split → manifest audit（image / trajectory / agents / meta-action / review status）→ Majority Baseline。所有方案共享同一固定 test split 与 action vocabulary；few-shot examples 不得来自 test scene。PR #11 未合并前，本阶段是 under review / implementation，不得写作 completed，也不得写作完全未开始。
+Phase 0.1 已完成：冻结数据版本与 coarse rule version → 固定 seed 的 scene-level train/val/test split → 完整 manifest contract validation → 六类统一指标与 invalid prediction 处理 → Majority Baseline。所有方案共享同一固定 test split 与 action vocabulary；few-shot examples 不得来自 test scene。
 
-**Gate：** PR #11 review fixes 合并后，manifest 与 sample-level 输出可追溯，scene split 无泄漏，Majority Baseline 在统一协议下可复现。majority accuracy 高但 macro-F1 低时先诊断类别失衡。PR #12 在此之前保持 draft；PR #11 合并后，PR #12 必须 rebase 最新 `main` 并再次更新 Current Status，才能合并。
+**Gate：** Phase -1 freeze gate 已通过；manifest 与 sample-level 输出可追溯，scene split 无泄漏，Majority Baseline 在统一协议下可复现。majority accuracy 高但 macro-F1 低时先诊断类别失衡。
 
 ## 6. Phase 0.1b：nuScenes mini → trainval scale-up（planned）
 
@@ -285,4 +282,4 @@ multi-camera、预训练 BEVFormer/OccNet/SurroundOcc 的受控复现均为 opti
 
 ## 16. 当前下一步
 
-当前已通过 Phase -1 label freeze gate。Phase 0.1 正在 Draft PR #11 中实现与评审；其合并与 manifest v1 review fixes 完成后，才可进入 Phase 0.1b trainval scale-up。随后才可进入正式 rule-based、VLM、LoRA、Phase 0.5a scorer、Phase 0.5b reranker 或 Phase 0.6 可选 DPO 阶段。PR #12 保持 draft，并在 PR #11 合并后 rebase 最新 `main`、更新 Current Status 后再评估合并。本计划修订不授权 trainval scale-up 实施、训练、DPO、完整 occupancy network 或 trajectory-level 模型实施。
+Phase -1 freeze gate 与 Phase 0.1 均已完成。下一步是 Phase 0.1b trainval scale-up；之后才可进入 Phase 0.2 rule-based、Phase 0.3 Qwen3-VL、Phase 0.4 LoRA/action adapter、Phase 0.5a scorer、Phase 0.5b reranker 或 Phase 0.6 optional DPO。本计划修订不授权 trainval scale-up 实施、训练、DPO、完整 occupancy network 或 trajectory-level 模型实施。

@@ -10,18 +10,16 @@
 - 6 类 meta-action v0.2 derivation 与冻结；
 - 108 个样本的人工审核、6 类 action 覆盖和 real-data freeze audit（108/108）；
 - 现有数据检查、审核、环境检查与 workspace cleanup 脚本及对应测试。
+- Phase 0.1 audited seed-subset manifest、固定 seed 的 scene-level split、Majority Baseline、六类统一评测协议、invalid prediction 指标处理和完整 manifest contract validator。
 
 ### Planned
 
-- Phase 0.1 manifest 协议、scene-level split 与 Majority Baseline（正在 Draft PR #11 中实现与评审）；
-- Phase 0.1b 从 nuScenes mini 扩展至 trainval，并生成正式 dataset manifest v1；
+- Phase 0.1b 从 nuScenes mini 扩展至 trainval，并生成正式 dataset manifest v1（next）；
 - coarse action 的 rule-based、zero-shot / few-shot 与 LoRA / action adapter baselines；
 - GT-derived BEV/OCC-aware temporal safety evaluator、offline reranker 与可选 coarse-action DPO；
 - short temporal input、map / route、fine-grained maneuver、continuous waypoint、optional BEV/OCC auxiliary 与闭环或 quasi-closed-loop evaluation。
 
-Phase -1 label freeze gate 已通过，meta-action v0.2 已 frozen。当前已实现 coarse label/data protocol 的基础：标签派生与冻结、人工审核和数据对齐；Phase 0.1 正在 Draft PR #11 中实现与评审，尚未完成。coarse neural action head、LoRA 与 action adapter 仍是 Phase 0.4 planned。
-
-PR #11 合并前，PR #12 保持 draft；PR #11 合并后，PR #12 必须 rebase 最新 `main` 并再次更新 Current Status，才能进入合并评审。
+Phase -1 freeze gate 与 Phase 0.1 均已完成并合并。当前已实现 coarse meta-action label/data protocol、audited manifest/split/evaluation infrastructure 与 Majority Baseline；coarse neural action head、Qwen3-VL、rule-based baseline、LoRA、action adapter、安全 scorer、reranker、DPO、fine maneuver、waypoint 与 predicted BEV/OCC 均为 planned。
 
 ## Inference and Safety Boundaries
 
@@ -52,6 +50,12 @@ flowchart LR
 
 长期模型采用共享多模态 backbone 加多任务 head：coarse meta-action、longitudinal action、lateral direction、maneuver type、continuous waypoint，以及 optional BEV / occupancy auxiliary。当前已实现的是 coarse label/data protocol；coarse neural action head、LoRA 和 action adapter 仍是 planned，其他 head 也均为 planned。真实驾驶行为可组合（如左转+减速），因此长期路线采用层级/多头表示，不把 6 类直接硬改成更多互斥类别。
 
+## Current Phase 0.1 Manifest Schema
+
+当前已实现的 `phase0_audited_seed_subset_v1` 是 audited seed-subset schema，不是正式 trainval manifest v1。稳定字段为 `sample_token`、`scene_token`、`timestamp`、`cam_front_path`、`current_ego_pose`、`current_ego_motion`、`coordinate_metadata`、`future_ego_trajectory`、`nearby_agents`、`split` 与 `manifest_schema_version`；派生/追溯字段为 `meta_action`、`label_rule_version`、`safety_rule_version` 与 `source_audit_record`。当前 `label_rule_version=phase-1.6-meta-action-v0.2`。
+
+`current_ego_pose` 记录 `frame`、`translation_m`、`rotation_wxyz`、`timestamp_us`、`timestamp_source`；`current_ego_motion` 记录 `speed_mps`、`longitudinal_acceleration_mps2`、`yaw_rate_radps`、`source`、`timestamp_source`、`availability`、`history_interval_sec`、`acceleration_interval_sec` 与 `unavailable_reason`。timestamp source 固定为 `CAM_FRONT_sample_data`，motion 仅使用当前和历史 pose，绝不使用 future pose 或 future trajectory。正式 trainval dataset manifest v1 仅在 Phase 0.1b 生成。
+
 ## Quickstart: Existing Commands
 
 以下均为当前仓库已有命令；验证时使用 `codex4vla_env`：
@@ -74,7 +78,7 @@ conda run -n codex4vla_env python scripts/clean_workspace.py
 
 ## Roadmap and Scope
 
-当前顺序为：Phase -1 数据闭环与 coarse 标签冻结 → Phase 0.1 manifest 协议、scene-level split 与 Majority Baseline（PR #11 review 中）→ Phase 0.1b trainval scale-up → Phase 0.2 ego-motion rule baseline → Phase 0.3 Qwen3-VL zero-shot / few-shot → Phase 0.4 coarse LoRA / action adapter → Phase 0.5a geometric safety scorer → Phase 0.5b offline safety reranker → Phase 0.6 preference pair audit 与可选 coarse-action DPO。mini 只用于数据链路 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须基于 trainval manifest，mini 上仅允许 smoke run。
+当前顺序为：Phase -1 数据闭环与 coarse 标签冻结（completed）→ Phase 0.1 manifest 协议、scene-level split、统一 metrics 与 Majority Baseline（completed）→ Phase 0.1b trainval scale-up（next）→ Phase 0.2 ego-motion rule baseline → Phase 0.3 Qwen3-VL zero-shot / few-shot → Phase 0.4 coarse LoRA / action adapter → Phase 0.5a geometric safety scorer → Phase 0.5b offline safety reranker → Phase 0.6 preference pair audit 与可选 coarse-action DPO。mini 只用于数据链路 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须基于 trainval manifest，mini 上仅允许 smoke run。
 
 后续扩展为：short temporal input → map / route / lane topology → hierarchical fine-grained maneuver → continuous waypoint head → BEV / occupancy auxiliary supervision → closed-loop or quasi-closed-loop evaluation。Phase 0 的 action experiments 仍须报告 macro-F1、per-class F1、confusion matrix、class distribution、invalid output rate 与 failure cases；safety 结果同时监控 collision/near-miss、VRU、`unnecessary_stop` 与 macro-F1。
 

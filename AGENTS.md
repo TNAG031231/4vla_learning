@@ -88,7 +88,7 @@ right_lateral
 必须按以下顺序推进：
 
 1. **Phase -1:** 数据对齐、6 类 coarse 标签、人工审核、规则冻结与 manifest audit 前置检查；不训练。
-2. **Phase 0.1:** manifest 协议、scene-level split、统一评测和 Majority Baseline；当前在 Draft PR #11 中实现与评审，合并前不得写为 completed。
+2. **Phase 0.1:** audited seed-subset manifest、固定 seed 的 scene-level split、六类统一评测协议、invalid prediction 指标处理、完整 manifest contract validator 与 Majority Baseline；已完成并合并。
 3. **Phase 0.1b:** 从 nuScenes mini 扩展至 trainval，生成正式 dataset manifest v1，重统计类别分布并抽检边界样本；正式 LoRA、action adapter 与 DPO 前必须完成。
 4. **Phase 0.2:** inference-time current/past ego-motion rule baseline。
 5. **Phase 0.3:** Qwen3-VL zero-shot / few-shot baseline。
@@ -127,12 +127,15 @@ timestamp
 cam_front_path
 current_ego_pose
 current_ego_motion
+coordinate_metadata
 future_ego_trajectory
 nearby_agents
 split
+manifest_schema_version
 ```
 
-- 当前 coarse implementation 对应 `meta_action_coarse` 与 `meta_action_rule_version` 两个派生 target 角色；现有冻结产物中的 `meta_action` / `label_rule_version` 是其历史字段名。Draft PR #11 当前仍使用 `current_ego_state`、`meta_action` 与 `label_rule_version`；最终 manifest v1 schema 依赖 PR #11 review fixes，合并前不得称为正式冻结。`future_waypoints`、`trajectory_valid_mask`、`longitudinal_action`、`lateral_direction`、`maneuver_type` 与 `fine_action_rule_version` 均为 planned；新增 head 时优先扩展 targets，不重写基础数据管线。
+- 当前 `phase0_audited_seed_subset_v1` 是 audited seed-subset schema，不是正式 trainval manifest v1。稳定字段必须包括 `sample_token`、`scene_token`、`timestamp`、`cam_front_path`、`current_ego_pose`、`current_ego_motion`、`coordinate_metadata`、`future_ego_trajectory`、`nearby_agents`、`split` 与 `manifest_schema_version`；当前派生/追溯字段为 `meta_action`、`label_rule_version`、`safety_rule_version` 与 `source_audit_record`。`label_rule_version=phase-1.6-meta-action-v0.2`；不得提前重命名为 `meta_action_coarse` / `meta_action_rule_version`。`future_waypoints`、`trajectory_valid_mask`、`longitudinal_action`、`lateral_direction`、`maneuver_type` 与 `fine_action_rule_version` 均为 planned；新增 head 时优先扩展 targets，不重写基础数据管线。
+- `current_ego_pose` 与 `current_ego_motion` 的 `timestamp_source` 必须为 `CAM_FRONT_sample_data`；motion 仅可由当前和历史 pose 推导，禁止使用 future pose 或 future trajectory。Phase 0.1b 才生成正式 trainval dataset manifest v1。
 - action / safety / fine-action rule 变化必须提升对应 rule version 并重新生成受影响 targets；coarse 与 fine 标签、不同 label version 均不得静默混用。扩展动作空间时必须新增 schema version，不得覆盖旧 schema。
 - `safety_rule_version` 必须进入所有安全派生产物。
 - mini 只用于 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须使用 trainval manifest，mini 上仅允许 smoke run。
