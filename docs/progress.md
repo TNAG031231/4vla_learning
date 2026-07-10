@@ -7,7 +7,6 @@
 
 ## Confirmed Milestones
 
-- 已定义 single-camera、open-loop、6-class meta-action 的 VLA 起步范围，并记录后续 BEV/OCC-aware spatial evaluation 与 waypoint-level trajectory VLA 路线。
 - 已建立 `sample_token` 对应的 `CAM_FRONT`、future ego trajectory 与 nearby 3D agents 读取能力。
 - 已实现单样本 one-page alignment visualization，并有对应单元测试。
 - 已完成 Phase -1.7 人工 meta-action 审核：108 个样本中 `trajectory_alignment_correct=yes` 为 108，`agent_alignment_correct=yes` 为 108；6 类 action 均有审核覆盖。
@@ -15,8 +14,6 @@
 
 ## Active Source Files
 
-- `configs/data.yaml`：定义 nuScenes mini 数据入口及 Phase -1 时间窗口、采样间隔和 agent 距离阈值。
-- `configs/action_rules.yaml`：定义当前 meta-action v0 阈值、坐标约定和 `label_rule_version`。
 - `src/actions/schema.py`：定义唯一的 6 类 action schema。
 - `data/inspect_nuscenes_sample.py`：读取 sample、future ego trajectory 和 ego-frame nearby agents。
 - `data/derive_meta_action.py`：派生版本化 meta-action 标签。
@@ -59,11 +56,11 @@ split
 ## Open Questions / Pending Verification
 
 - 根据已审核错误完成 meta-action 规则修订，并重新核验受影响样本。
-- 冻结可训练数据版本、`label_rule_version` 和 scene-level split 前，完成 manifest audit。
-- Phase -1 gate 通过前，不启动 Phase 0 baseline、LoRA、DPO、GRPO、完整 occupancy network 或 trajectory-level 训练。
+- 完成 manifest audit 前置检查，并冻结可训练数据版本、`label_rule_version` 和 scene-level split。
+- Phase -1 gate 通过前，不启动 Phase 0 baseline、LoRA、DPO、GRPO、完整 occupancy network 或 trajectory-level 训练；当前 `safety_rule_version=not_available`，不把 safety-score 审核列为此 gate。
 
 ## Next Gate
 
 - 保持 `sample_token → CAM_FRONT image → future ego trajectory → nearby 3D agents → one-page visualization` 的可复现核验。
-- 完成剩余标签边界规则的修订、审核和版本冻结；保留 6 类 action、有/无 VRU、safe/unsafe 与规则边界的审核覆盖。
+- 完成剩余标签边界规则的修订、审核和版本冻结；保留 6 类 action、VRU presence 与 action boundary cases 的审核覆盖。
 - 仅在数据、审核与规则版本均冻结后，按 [project_mvp_plan.md](../project_mvp_plan.md) 的 Phase 0 顺序决定是否开始 baseline。

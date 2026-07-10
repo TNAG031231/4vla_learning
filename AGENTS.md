@@ -39,19 +39,7 @@
   
 ## 1. Project Mission
 
-本仓库服务于 **Safety-Aware VLA for Autonomous Driving with BEV/OCC-aware Spatial Evaluation**（融合 BEV 占用式空间评估的安全感知自动驾驶 VLA 项目）。目标不是泛泛编写学习代码，而是按阶段完成一个可复现、可审计、可评测的 open-loop 自动驾驶 VLA：
-
-```text
-nuScenes CAM_FRONT
-→ 6-class meta-action
-→ GT-derived BEV/OCC-aware spatial safety evaluation
-→ offline reranking
-→ auditable preference construction
-→ conditional DPO
-→ waypoint-level trajectory VLA（后续阶段）
-```
-
-当前 MVP 从 open-loop、single-camera、6-class meta-action 起步；BEV/OCC-aware layer 是由 nuScenes GT 派生的空间评估层，不是完整 occupancy prediction 网络。只有前置 gate 通过，才可扩展到 reranking、条件式 DPO 或 waypoint-level trajectory head。项目计划以 [`project_mvp_plan.md`](project_mvp_plan.md) 为准。
+本仓库服务于 **Safety-Aware VLA for Autonomous Driving with BEV/OCC-aware Spatial Evaluation**。当前路线为 single-camera、open-loop、6-class meta-action；BEV/OCC-aware layer 仅是后续 GT-derived 离线评估层，不是完整 occupancy prediction 网络。项目计划以 [`project_mvp_plan.md`](project_mvp_plan.md) 为准。
 
 固定 action schema：
 
@@ -78,6 +66,9 @@ right_lateral
 - 不得声称 closed-loop、real-time、CARLA、实车、连续轨迹规划或部署能力，除非仓库已有对应代码、配置和可核查实验结果。
 - 不得把论文、官方模型卡或外部宣传结果写成本项目实验结果。
 - 不得用 `turn_left` / `turn_right` 替换首版 lateral schema，除非任务已明确引入 map、lane topology 或 route command 并更新项目规格。
+- 推理路径不得使用 future ego trajectory、GT meta-action、GT BEV/OCC raster、未来 GT agents 或 test labels。
+- rule-based baseline 不得使用 future ego trajectory、derived meta-action 或 test labels；仅可使用 inference-time current/past ego state。
+- 未实现 differentiable soft occupancy 或 distance-field surrogate 时，不得把 safety cost 写成可反向传播的训练 loss。
 
 ### MUST
 
@@ -91,30 +82,12 @@ right_lateral
 
 必须按以下顺序推进：
 
-1. **Phase -1: data alignment and label verification**
-   - `sample_token → CAM_FRONT image`；
-   - future ego trajectory / CAN bus；
-   - nearby 3D agents；
-   - one-page visualization；
-   - 100 样本人工抽检、规则修订与版本冻结。
-2. **Phase 0: VLA-L0 meta-action baseline**
-   - 冻结数据版本和 `label_rule_version`；
-   - scene-level split 与 manifest audit；
-   - majority、rule-based、zero-shot、few-shot、LoRA / action adapter；
-   - macro-F1、per-class F1、confusion matrix 与 failure case analysis。
-3. **Phase 1: BEV/OCC-aware spatial safety layer**
-   - 从 GT 3D boxes、ego pose 和 future trajectory 派生 ego-frame occupancy-style BEV raster；
-   - collision / near miss、VRU、可选 off-road、infeasibility、unnecessary stop、harsh action / jerk；
-   - 用于 trajectory/action safety evaluation、reranker、pair construction 和可视化。
-4. **Phase 2: offline reranker and conditional preference learning**
-   - 在固定 candidate set 上比较 rerank 前后指标；
-   - 仅保留满足 margin 与审计规则的 chosen/rejected pairs；
-   - 仅在 reranker gate 和 pair audit 通过后评估 DPO，不预设 GRPO 或闭环 RL。
-5. **Phase 3: waypoint-level / trajectory-level VLA**
-   - 共享 VLM backbone，同时预测 6-class action 与 K future waypoints；
-   - action 为辅助监督和可解释语义，不是固定轨迹模板的硬前置。
-6. **Phase 4: optional enhancements**
-   - multi-camera、map / lane topology、temporal context 与受控的预训练 BEV/OCC 模型复现实验。
+1. **Phase -1:** 数据对齐、6 类标签、人工审核、规则冻结与 manifest audit 前置检查；不训练。
+2. **Phase 0:** scene-level split、manifest audit、majority / current ego-state rule / image-only VLM / image+ego VLM / LoRA baselines。
+3. **Phase 1:** GT-derived temporal BEV/OCC evaluator、candidate rollout、安全审核与分项 metrics。
+4. **Phase 2:** 固定 candidate set 的 offline reranker、pair audit 与 conditional DPO。
+5. **Phase 3:** 共享 backbone 的 action head + K-waypoint trajectory head。
+6. **Phase 4:** multi-camera、map、temporal context 与预训练 BEV/OCC 受控复现（optional）。
 
 前一阶段验收条件未满足时，不得推进下一阶段。失败时优先修复数据、标签、scorer 或评测协议，不得通过增加训练规模掩盖问题。
 
