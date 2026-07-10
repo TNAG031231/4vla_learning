@@ -40,6 +40,23 @@ EXPECTED_ACTION_DISTRIBUTION = Counter(
         "stop": 21,
     }
 )
+EXPECTED_TRANSITION_DISTRIBUTION = Counter(
+    {
+        ("accelerate", "accelerate"): 5,
+        ("decelerate", "decelerate"): 13,
+        ("keep", "keep"): 55,
+        ("keep", "accelerate"): 1,
+        ("keep", "decelerate"): 3,
+        ("keep", "stop"): 1,
+        ("left_lateral", "left_lateral"): 5,
+        ("right_lateral", "right_lateral"): 5,
+        ("stop", "stop"): 20,
+    }
+)
+EXPECTED_HISTORICAL_LABEL_RULE_VERSION = "phase-1.6-meta-action-v0.1"
+EXPECTED_HISTORICAL_LABEL_CORRECT_DISTRIBUTION = Counter(
+    {"yes": 103, "no": 5}
+)
 NO_UNCERTAINTY_VALUES = {"", "none", "not_available"}
 AUDIT_OUTPUT_FIELDS = (
     "source_audit",
@@ -71,8 +88,13 @@ class HistoricalAuditRow:
     sample_token: str
     scene_token: str
     timestamp: str
+    cam_front_path: str
     historical_derived_action: str
     reviewed_action: str
+    label_correct: str
+    trajectory_alignment_correct: str
+    agent_alignment_correct: str
+    label_rule_version: str
 
 
 @dataclass(frozen=True)
@@ -106,8 +128,10 @@ class FreezeSummary:
     action_match_count: int
     action_distribution: Counter[str]
     vru_distribution: Counter[str]
-    boundary_case_count: int
+    boundary_flag_case_count: int
+    diagnostic_case_count: int
     boundary_flag_distribution: Counter[str]
+    uncertainty_reason_distribution: Counter[str]
     trajectory_complete_count: int
     cam_front_exists_count: int
     transition_distribution: Counter[tuple[str, str]]
@@ -137,14 +161,53 @@ def _read_audit(path: Path, source_audit: str) -> tuple[HistoricalAuditRow, ...]
             raise ValueError(
                 f"{path}: unsupported derived_action {historical_action!r}"
             )
+        label_correct = _required_value(row, "label_correct", path).lower()
+        if label_correct not in {"yes", "no"}:
+            raise ValueError(
+                f"{path}: label_correct must be yes or no, got "
+                f"{label_correct!r}"
+            )
+        trajectory_alignment_correct = _required_value(
+            row,
+            "trajectory_alignment_correct",
+            path,
+        ).lower()
+        if trajectory_alignment_correct != "yes":
+            raise ValueError(
+                f"{path}: trajectory_alignment_correct must be yes"
+            )
+        agent_alignment_correct = _required_value(
+            row,
+            "agent_alignment_correct",
+            path,
+        ).lower()
+        if agent_alignment_correct != "yes":
+            raise ValueError(
+                f"{path}: agent_alignment_correct must be yes"
+            )
+        label_rule_version = _required_value(
+            row,
+            "label_rule_version",
+            path,
+        )
+        if label_rule_version != EXPECTED_HISTORICAL_LABEL_RULE_VERSION:
+            raise ValueError(
+                f"{path}: historical label_rule_version must be "
+                f"{EXPECTED_HISTORICAL_LABEL_RULE_VERSION}"
+            )
         audit_rows.append(
             HistoricalAuditRow(
                 source_audit=source_audit,
                 sample_token=_required_value(row, "sample_token", path),
                 scene_token=_required_value(row, "scene_token", path),
                 timestamp=_required_value(row, "timestamp", path),
+                cam_front_path=_required_value(row, "cam_front_path", path),
                 historical_derived_action=historical_action,
                 reviewed_action=reviewed_action,
+                label_correct=label_correct,
+                trajectory_alignment_correct=trajectory_alignment_correct,
+                agent_alignment_correct=agent_alignment_correct,
+                label_rule_version=label_rule_version,
             )
         )
     return tuple(audit_rows)
@@ -172,9 +235,46 @@ def read_and_merge_audits(
     return rows
 
 
+def validate_historical_audit_integrity(
+    rows: tuple[HistoricalAuditRow, ...],
+) -> None:
+    label_correct_distribution = Counter(
+        row.label_correct for row in rows
+    )
+    if label_correct_distribution != EXPECTED_HISTORICAL_LABEL_CORRECT_DISTRIBUTION:
+        raise ValueError(
+            "historical label_correct distribution must be "
+            f"{dict(sorted(EXPECTED_HISTORICAL_LABEL_CORRECT_DISTRIBUTION.items()))}: "
+            f"{dict(sorted(label_correct_distribution.items()))}"
+        )
+    inconsistent_rows = tuple(
+        row.sample_token
+        for row in rows
+        if row.label_correct
+        != (
+            "yes"
+            if row.historical_derived_action == row.reviewed_action
+            else "no"
+        )
+    )
+    if inconsistent_rows:
+        raise ValueError(
+            "historical label_correct does not match derived/reviewed action: "
+            + ", ".join(inconsistent_rows)
+        )
+
+
 def validate_cam_front_path(cam_front_path: str, dataroot: Path) -> bool:
     path = Path(cam_front_path)
-    return not path.is_absolute() and (dataroot / path).is_file()
+    if path.is_absolute():
+        return False
+    resolved_root = dataroot.resolve()
+    resolved_candidate = (dataroot / path).resolve()
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError:
+        return False
+    return resolved_candidate.is_file()
 
 
 def _trajectory_complete(
@@ -246,6 +346,12 @@ def build_freeze_records(
             failures.append(
                 f"{row.sample_token}: nuScenes sample timestamp mismatch"
             )
+        if row.cam_front_path != derived_record.cam_front_path:
+            failures.append(
+                f"{row.sample_token}: historical CAM_FRONT path mismatch\n"
+                f"  historical path: {row.cam_front_path}\n"
+                f"  current derived path: {derived_record.cam_front_path}"
+            )
 
         last_t_sec = trajectory.points[-1].t_sec if trajectory.points else 0.0
         trajectory_complete = _trajectory_complete(
@@ -306,7 +412,10 @@ def summarize_freeze_records(
 ) -> FreezeSummary:
     action_distribution = Counter(record.frozen_action for record in records)
     vru_distribution = Counter(record.has_vru for record in records)
-    boundary_records = tuple(
+    boundary_flag_records = tuple(
+        record for record in records if record.boundary_flags
+    )
+    diagnostic_records = tuple(
         record
         for record in records
         if record.boundary_flags
@@ -314,7 +423,12 @@ def summarize_freeze_records(
         not in NO_UNCERTAINTY_VALUES
     )
     boundary_flag_distribution = Counter(
-        flag for record in boundary_records for flag in record.boundary_flags
+        flag
+        for record in boundary_flag_records
+        for flag in record.boundary_flags
+    )
+    uncertainty_reason_distribution = Counter(
+        record.uncertainty_reason for record in records
     )
     transition_distribution = Counter(
         (record.historical_derived_action, record.frozen_action)
@@ -357,6 +471,11 @@ def summarize_freeze_records(
             "frozen action distribution does not match expected: "
             f"{dict(sorted(action_distribution.items()))}"
         )
+    if transition_distribution != EXPECTED_TRANSITION_DISTRIBUTION:
+        failures.append(
+            "transition distribution does not match expected: "
+            f"{dict(sorted(transition_distribution.items()))}"
+        )
     label_versions = {record.label_rule_version for record in records}
     if label_versions != {EXPECTED_LABEL_RULE_VERSION}:
         failures.append(
@@ -367,14 +486,14 @@ def summarize_freeze_records(
         failures.append("has_vru contains unsupported values")
     if not vru_distribution.get("yes") or not vru_distribution.get("no"):
         failures.append("has_vru requires both yes and no coverage")
-    if not boundary_records:
-        failures.append("boundary_case_count=0")
+    if not boundary_flag_records:
+        failures.append("boundary_flag_case_count=0")
     elif not any(
         any(
             keyword in flag
             for keyword in ("speed", "stop", "lateral")
         )
-        for record in boundary_records
+        for record in boundary_flag_records
         for flag in record.boundary_flags
     ):
         failures.append("boundary coverage has no speed, stop, or lateral flag")
@@ -394,8 +513,10 @@ def summarize_freeze_records(
         action_match_count=action_match_count,
         action_distribution=action_distribution,
         vru_distribution=vru_distribution,
-        boundary_case_count=len(boundary_records),
+        boundary_flag_case_count=len(boundary_flag_records),
+        diagnostic_case_count=len(diagnostic_records),
         boundary_flag_distribution=boundary_flag_distribution,
+        uncertainty_reason_distribution=uncertainty_reason_distribution,
         trajectory_complete_count=trajectory_complete_count,
         cam_front_exists_count=cam_front_exists_count,
         transition_distribution=transition_distribution,
@@ -434,10 +555,18 @@ def _print_summary(summary: FreezeSummary) -> None:
         f"{dict(sorted(summary.action_distribution.items()))}"
     )
     print(f"has_vru distribution: {dict(sorted(summary.vru_distribution.items()))}")
-    print(f"boundary_case_count: {summary.boundary_case_count}")
+    print(
+        "strict boundary-flag case count: "
+        f"{summary.boundary_flag_case_count}"
+    )
+    print(f"diagnostic case count: {summary.diagnostic_case_count}")
     print(
         "boundary flag distribution: "
         f"{dict(sorted(summary.boundary_flag_distribution.items()))}"
+    )
+    print(
+        "uncertainty reason distribution: "
+        f"{dict(sorted(summary.uncertainty_reason_distribution.items()))}"
     )
     print(
         "trajectory_complete: "
@@ -494,6 +623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.base_audit,
             arguments.supplement_audit,
         )
+        validate_historical_audit_integrity(historical_rows)
         rules = load_meta_action_rules(arguments.action_config)
         data_config = _load_data_config(
             arguments.data_config,
