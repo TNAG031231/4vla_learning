@@ -38,6 +38,7 @@ sample_token
 scene_token
 timestamp
 cam_front_path
+current_ego_state
 future_ego_trajectory
 nearby_agents
 meta_action

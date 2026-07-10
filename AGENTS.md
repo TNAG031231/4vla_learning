@@ -97,7 +97,7 @@ right_lateral
 - 遵循 SOLID 原则；每个模块保持单一职责，避免训练、数据解析、评测和可视化混在同一文件。
 - 配置参数进入 YAML；action 阈值、safety 阈值、时间窗口、坐标约定和路径不得散落硬编码。
 - 所有项目路径使用相对路径或配置文件，不写入个人机器绝对路径。
-- 保留 `sample_token`、`scene_token`、`label_rule_version`、`safety_rule_version` 和 `split` 等追溯字段。
+- 保留 `sample_token`、`scene_token`、`current_ego_state`、`label_rule_version`、`safety_rule_version` 和 `split` 等追溯字段。
 - 坐标系必须注明 source frame、target frame、轴方向、单位和 transform 顺序。
 - 时间相关逻辑必须注明 timestamp 单位、采样间隔、future horizon 和缺帧策略。
 - Action schema 必须由单一模块定义，禁止在多个脚本重复维护字符串列表。
@@ -116,9 +116,10 @@ sample_token
 scene_token
 timestamp
 cam_front_path
+current_ego_state
 future_ego_trajectory
-meta_action
 nearby_agents
+meta_action
 label_rule_version
 safety_rule_version
 split
@@ -128,7 +129,8 @@ split
 - 修改 action 或 safety 阈值后，必须提升规则版本并重新生成受影响 manifest；不同版本不得静默混用。
 - `uncertain` 样本不能强行算作正确标签，必须单独记录并排除出高置信度训练/偏好数据。
 - Phase -1 / Week 2 必须完成至少 100 个样本的人工抽检记录。
-- 抽检必须覆盖 6 类 action、有/无 VRU、safe/unsafe 和规则边界样本。
+- Phase -1 抽检必须覆盖 6 类 action、有/无 VRU、VRU presence 和 action boundary cases。
+- collision、near-miss、safe/unsafe、`safety_score_reasonable` 和 scorer reasonableness 从 Phase 1 开始审核。
 - 原始数据、处理后数据和生成媒体默认不纳入 Git；只提交 schema、脚本、配置、允许公开的小型测试 fixture 和质检报告。
 
 ## 6. Evaluation Rules

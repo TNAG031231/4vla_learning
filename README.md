@@ -16,7 +16,7 @@
 - Phase 0 action baselines；
 - GT-derived BEV/OCC-aware temporal safety evaluator；
 - offline reranker、preference pairs 与 conditional DPO；
-- shared action/trajectory head、occupancy prediction 与其他增强项。
+- shared action/trajectory head、optional pretrained BEV/OCC reproduction and other Phase 4 enhancements。
 
 当前仍在 Phase -1 gate：`keep` / speed-change 与 `stop` / `keep` 的标签边界需要修订并冻结；未进入 Phase 0，未训练模型。
 
