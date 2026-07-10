@@ -15,6 +15,6 @@ meta_action_v0:
     y_axis: "left"
     unit: "meter"
 
-# Phase -1.6 prototype thresholds. boundary_margin is a dimensionless
-# fraction of each threshold. These values are pending sample review and are
-# not dataset ground truth or an industry standard.
+# Meta-action v0.2 passed the Phase -1.8 108-sample regression and Phase -1.9
+# freeze gate; it is frozen for Phase 0. These project data rules are not
+# nuScenes ground truth or an industry standard.

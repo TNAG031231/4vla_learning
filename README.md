@@ -7,8 +7,8 @@
 ### Completed
 
 - `CAM_FRONT`、future ego trajectory 与 nearby 3D agents 对齐和单样本 one-page visualization；
-- 6 类 meta-action derivation；
-- 108 个样本的人工审核与 6 类 action 覆盖；
+- 6 类 meta-action v0.2 derivation 与冻结；
+- 108 个样本的人工审核、6 类 action 覆盖和 real-data freeze audit（108/108）；
 - 现有数据检查、审核、环境检查与 workspace cleanup 脚本及对应测试。
 
 ### Planned
@@ -18,7 +18,7 @@
 - offline reranker、preference pairs 与 conditional DPO；
 - shared action/trajectory head、optional pretrained BEV/OCC reproduction and other Phase 4 enhancements。
 
-当前仍在 Phase -1 gate：`keep` / speed-change 与 `stop` / `keep` 的标签边界需要修订并冻结；未进入 Phase 0，未训练模型。
+Phase -1 label freeze gate 已通过，meta-action v0.2 已 frozen；Phase 0 ready but not started，尚未实现 baseline 或训练模型。
 
 ## Inference and Safety Boundaries
 
@@ -50,6 +50,7 @@ flowchart LR
 ```bash
 conda run -n codex4vla_env python scripts/check_env.py
 conda run -n codex4vla_env pytest tests/test_check_env.py tests/test_clean_workspace.py tests/test_inspect_nuscenes_sample.py tests/test_verify_labels.py tests/test_meta_action.py tests/test_phase_1_7_manual_audit.py
+conda run -n codex4vla_env python data/validate_label_freeze.py --dataroot data/nuscenes
 conda run -n codex4vla_env python scripts/clean_workspace.py
 ```
 
