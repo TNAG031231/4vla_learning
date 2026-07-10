@@ -92,9 +92,32 @@ def test_phase_1_8_108_sample_audit_regression() -> None:
     }
 
     new_distribution = Counter(new_actions.values())
+    expected_distribution = Counter(
+        {
+            "accelerate": 6,
+            "decelerate": 16,
+            "keep": 55,
+            "left_lateral": 5,
+            "right_lateral": 5,
+            "stop": 21,
+        }
+    )
     transitions = Counter(
         (row["derived_action"], new_actions[row["sample_token"]])
         for row in rows
+    )
+    expected_transitions = Counter(
+        {
+            ("accelerate", "accelerate"): 5,
+            ("decelerate", "decelerate"): 13,
+            ("keep", "keep"): 55,
+            ("keep", "accelerate"): 1,
+            ("keep", "decelerate"): 3,
+            ("keep", "stop"): 1,
+            ("left_lateral", "left_lateral"): 5,
+            ("right_lateral", "right_lateral"): 5,
+            ("stop", "stop"): 20,
+        }
     )
     new_correct_count = sum(
         new_actions[row["sample_token"]] == row["reviewed_action"]
@@ -105,26 +128,14 @@ def test_phase_1_8_108_sample_audit_regression() -> None:
     print(f"new_correct_count: {new_correct_count}")
     _print_transition_matrix(transitions)
 
-    assert set(new_distribution) == set(ACTION_SCHEMA)
-    assert new_distribution["left_lateral"] == 5
-    assert new_distribution["right_lateral"] == 5
-    assert new_distribution["accelerate"] >= 5
-    assert new_distribution["decelerate"] >= 13
-    assert new_distribution["stop"] >= 20
-    assert 45 <= new_distribution["keep"] <= 65
+    assert new_distribution == expected_distribution
     assert all(
         new_actions[sample_token] == action
         for sample_token, action in EXPECTED_CORRECTIONS.items()
     )
-    assert new_correct_count >= 103
-    assert not any(
-        old_action in {"left_lateral", "right_lateral"}
-        and new_action != old_action
-        for old_action, new_action in transitions
-    )
-    assert not any(
-        row["derived_action"] == row["reviewed_action"]
-        and row["derived_action"] in {"accelerate", "decelerate", "stop"}
-        and new_actions[row["sample_token"]] == "keep"
+    assert new_correct_count == 108
+    assert all(
+        new_actions[row["sample_token"]] == row["reviewed_action"]
         for row in rows
     )
+    assert transitions == expected_transitions
