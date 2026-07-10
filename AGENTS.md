@@ -52,7 +52,7 @@ left_lateral
 right_lateral
 ```
 
-当前 6 类仅是 coarse action schema：`left_lateral` / `right_lateral` 只表示稳定左右横向运动，不能解释为 lane change 或 turn。它们继续作为 coarse target、可解释输出、辅助监督和长期 baseline，不是最终固定动作空间。
+当前 6 类仅是 coarse action schema：`left_lateral` / `right_lateral` 只表示稳定左右横向运动，不能解释为 lane change 或 turn。它们继续作为 coarse target、可解释输出、辅助监督和长期 baseline，不是最终固定动作空间。当前已完成的是 coarse 标签派生、冻结、审核与数据基础；coarse neural action head、LoRA、action adapter、fine maneuver、waypoint 与 BEV/OCC auxiliary 均为 planned。
 
 ## 2. Non-Negotiable Rules
 
@@ -71,6 +71,7 @@ right_lateral
 - 未接入 map、lane topology、intersection topology、route command 或 short temporal context 的至少一部分前，不得仅根据横向位移派生 `left_turn` / `right_turn`、lane-change 或其他 fine-grained maneuver 标签。
 - 不得将 6 类扁平分类直接硬改为更多互斥类别；新增动作空间或输出 head 前，必须更新项目规格、数据 contract、评测协议与验收 gate。
 - 推理路径不得使用 future ego trajectory、GT meta-action、GT BEV/OCC raster、未来 GT agents 或 test labels。
+- 不得将 GT boxes、future GT agents 或 GT occupancy 作为模型 test-time inference input；GT geometry / occupancy 只可作为 oracle offline scorer backend。不得删除 candidate rollout 与 geometric scorer 而将 occupancy 直接当作 safety score。
 - rule-based baseline 不得使用 future ego trajectory、derived meta-action 或 test labels；仅可使用 inference-time current/past ego state。
 - 未实现 differentiable soft occupancy 或 distance-field surrogate 时，不得把 safety cost 写成可反向传播的训练 loss。
 
@@ -87,14 +88,15 @@ right_lateral
 必须按以下顺序推进：
 
 1. **Phase -1:** 数据对齐、6 类 coarse 标签、人工审核、规则冻结与 manifest audit 前置检查；不训练。
-2. **Phase 0.1:** manifest 协议、scene-level split、统一评测和 Majority Baseline。
+2. **Phase 0.1:** manifest 协议、scene-level split、统一评测和 Majority Baseline；当前在 Draft PR #11 中实现与评审，合并前不得写为 completed。
 3. **Phase 0.1b:** 从 nuScenes mini 扩展至 trainval，生成正式 dataset manifest v1，重统计类别分布并抽检边界样本；正式 LoRA、action adapter 与 DPO 前必须完成。
 4. **Phase 0.2:** inference-time current/past ego-motion rule baseline。
 5. **Phase 0.3:** Qwen3-VL zero-shot / few-shot baseline。
 6. **Phase 0.4:** coarse meta-action LoRA / action adapter。
-7. **Phase 0.5:** GT-derived temporal BEV/OCC geometric safety scorer、candidate rollout、offline reranker 与安全审核。
-8. **Phase 0.6:** 仅在输出协议稳定、trainval 数据完成、reranker gate 与 pair audit 通过后，执行可选 coarse-action DPO。
-9. **后续扩展:** short temporal input、map / route / lane topology、hierarchical fine-grained maneuver、continuous waypoint head、optional BEV / occupancy auxiliary 与闭环或 quasi-closed-loop evaluation。
+7. **Phase 0.5a:** GT-derived geometric safety scorer、candidate action rollout、scorer synthetic tests 与 scorer audit。
+8. **Phase 0.5b:** 固定 candidate set 的 offline safety reranker；仅在 Phase 0.5a scorer gate 通过后进入。
+9. **Phase 0.6:** preference pair audit 与可选 coarse-action DPO；仅在 reranker 已证明风险改善且不过度增加 stop 后构造 pairs，DPO 不优于 reranker 时保留 reranker 作为 MVP 结果。
+10. **后续扩展:** short temporal input、map / route / lane topology、hierarchical fine-grained maneuver、continuous waypoint head、optional BEV / occupancy auxiliary 与闭环或 quasi-closed-loop evaluation。
 
 前一阶段验收条件未满足时，不得推进下一阶段。失败时优先修复数据、标签、scorer 或评测协议，不得通过增加训练规模掩盖问题。
 
@@ -130,14 +132,15 @@ nearby_agents
 split
 ```
 
-- 当前 coarse implementation 对应 `meta_action_coarse` 与 `meta_action_rule_version` 两个派生 target 角色；现有冻结产物中的 `meta_action` / `label_rule_version` 是其历史字段名，正式 manifest v1 不得静默改变语义。`future_waypoints`、`trajectory_valid_mask`、`longitudinal_action`、`lateral_direction`、`maneuver_type` 与 `fine_action_rule_version` 均为 planned；新增 head 时优先扩展 targets，不重写基础数据管线。
+- 当前 coarse implementation 对应 `meta_action_coarse` 与 `meta_action_rule_version` 两个派生 target 角色；现有冻结产物中的 `meta_action` / `label_rule_version` 是其历史字段名。Draft PR #11 当前仍使用 `current_ego_state`、`meta_action` 与 `label_rule_version`；最终 manifest v1 schema 依赖 PR #11 review fixes，合并前不得称为正式冻结。`future_waypoints`、`trajectory_valid_mask`、`longitudinal_action`、`lateral_direction`、`maneuver_type` 与 `fine_action_rule_version` 均为 planned；新增 head 时优先扩展 targets，不重写基础数据管线。
 - action / safety / fine-action rule 变化必须提升对应 rule version 并重新生成受影响 targets；coarse 与 fine 标签、不同 label version 均不得静默混用。扩展动作空间时必须新增 schema version，不得覆盖旧 schema。
 - `safety_rule_version` 必须进入所有安全派生产物。
 - mini 只用于 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须使用 trainval manifest，mini 上仅允许 smoke run。
 - `uncertain` 样本不能强行算作正确标签，必须单独记录并排除出高置信度训练/偏好数据。
 - Phase -1 / Week 2 必须完成至少 100 个样本的人工抽检记录。
 - Phase -1 抽检必须覆盖 6 类 action、有/无 VRU、VRU presence 和 action boundary cases。
-- collision、near-miss、safe/unsafe、`safety_score_reasonable` 和 scorer reasonableness 从 Phase 0.5 开始审核。
+- Phase 0.5a scorer 必须报告 collision / near-miss、VRU distance violation、infeasibility、unnecessary stop、harsh action / jerk，并通过 synthetic tests 与 scorer audit；未通过不得进入 Phase 0.5b。
+- Phase 0.5b reranker 必须在固定 candidate set 上比较 rerank 前后 macro-F1、VRU / near-collision、unnecessary stop 与 scorer failure cases；未证明风险改善且不过度增加 stop，不得构造 DPO pairs。
 - 原始数据、处理后数据和生成媒体默认不纳入 Git；只提交 schema、脚本、配置、允许公开的小型测试 fixture 和质检报告。
 
 ## 6. Evaluation Rules

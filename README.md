@@ -13,29 +13,33 @@
 
 ### Planned
 
-- Phase 0.1 manifest 协议、scene-level split 与 Majority Baseline；
+- Phase 0.1 manifest 协议、scene-level split 与 Majority Baseline（正在 Draft PR #11 中实现与评审）；
 - Phase 0.1b 从 nuScenes mini 扩展至 trainval，并生成正式 dataset manifest v1；
 - coarse action 的 rule-based、zero-shot / few-shot 与 LoRA / action adapter baselines；
 - GT-derived BEV/OCC-aware temporal safety evaluator、offline reranker 与可选 coarse-action DPO；
 - short temporal input、map / route、fine-grained maneuver、continuous waypoint、optional BEV/OCC auxiliary 与闭环或 quasi-closed-loop evaluation。
 
-Phase -1 label freeze gate 已通过，meta-action v0.2 已 frozen；Phase 0.1 ready but not started，尚未实现 baseline 或训练模型。
+Phase -1 label freeze gate 已通过，meta-action v0.2 已 frozen。当前已实现 coarse label/data protocol 的基础：标签派生与冻结、人工审核和数据对齐；Phase 0.1 正在 Draft PR #11 中实现与评审，尚未完成。coarse neural action head、LoRA 与 action adapter 仍是 Phase 0.4 planned。
+
+PR #11 合并前，PR #12 保持 draft；PR #11 合并后，PR #12 必须 rebase 最新 `main` 并再次更新 Current Status，才能进入合并评审。
 
 ## Inference and Safety Boundaries
 
 Inference inputs 仅为 `CAM_FRONT` image、driving instruction 与 current `ego_state`（当前速度、加速度、yaw rate 等）；future ego trajectory、GT meta-action、GT BEV/OCC raster 与未来 GT agents 不进入模型推理。
 
-GT meta-action 与 GT future trajectory 是训练 target；current/future GT agent boxes、ego pose 与 optional map 仅进入离线 BEV/OCC-aware evaluator。collision check 比较 candidate ego rollout 或 predicted trajectory 与 temporal occupancy，不能以 GT ego trajectory 替代预测候选行为。
+GT meta-action 与 GT future trajectory 是训练 target；current/future GT agent boxes、ego pose 与 optional map 仅进入 oracle offline evaluator。GT boxes、future GT agents 与 GT occupancy 均不得进入模型 test-time inference。collision check 比较 candidate ego rollout 或 predicted trajectory 与 scorer backend，不能以 GT ego trajectory 代替预测候选行为。
 
 ```mermaid
 flowchart LR
-    A["CAM_FRONT image + instruction + current ego_state"] --> B["VLA inference"]
-    B --> C["action candidates / predicted trajectory"]
-    C --> D["candidate rollout when action-based"]
-    E["current/future GT agents + ego pose + optional map"] --> F["offline BEV/OCC-aware evaluator"]
-    D --> F
-    C --> F
-    F --> G["metrics / reranking / failure analysis"]
+    A["CAM_FRONT / model"] --> B["candidate coarse actions"]
+    B --> C["short-horizon ego rollout"]
+    D["GT 3D boxes or GT-derived temporal BEV occupancy"] --> E["oracle geometry scorer backend v1"]
+    C --> E
+    E --> F["decomposed safety costs"]
+    F --> G["offline reranker"]
+    G --> H["audited preference pairs"]
+    H --> I["optional coarse-action DPO"]
+    J["predicted BEV / occupancy (planned)"] --> K["scorer backend v2 comparison"]
 ```
 
 完整信息合同、temporal `occupancy[T,C,H,W]`、阶段 gate 和 loss 边界见 [project_mvp_plan.md](project_mvp_plan.md)。
@@ -46,7 +50,7 @@ flowchart LR
 
 `left_lateral` / `right_lateral` 仅表示未来轨迹中稳定的左右横向运动；当前版本不区分 lane change、turn、follow-road-curve 或横向运动原因，因此不得解释为左/右变道或左/右转。只有接入 map、lane topology、intersection topology、route command 或 short temporal context 的至少一部分后，才会新增并重新审核 fine-grained maneuver labels。
 
-长期模型采用共享多模态 backbone 加多任务 head：coarse meta-action、longitudinal action、lateral direction、maneuver type、continuous waypoint，以及 optional BEV / occupancy auxiliary。当前只实现 coarse meta-action head；其他 head 均为 planned。真实驾驶行为可组合（如左转+减速），因此长期路线采用层级/多头表示，不把 6 类直接硬改成更多互斥类别。
+长期模型采用共享多模态 backbone 加多任务 head：coarse meta-action、longitudinal action、lateral direction、maneuver type、continuous waypoint，以及 optional BEV / occupancy auxiliary。当前已实现的是 coarse label/data protocol；coarse neural action head、LoRA 和 action adapter 仍是 planned，其他 head 也均为 planned。真实驾驶行为可组合（如左转+减速），因此长期路线采用层级/多头表示，不把 6 类直接硬改成更多互斥类别。
 
 ## Quickstart: Existing Commands
 
@@ -70,13 +74,13 @@ conda run -n codex4vla_env python scripts/clean_workspace.py
 
 ## Roadmap and Scope
 
-当前顺序为：Phase -1 数据闭环与 coarse 标签冻结 → Phase 0.1 manifest 协议、scene-level split 与 Majority Baseline → Phase 0.1b trainval scale-up → Phase 0.2 ego-motion rule baseline → Phase 0.3 Qwen3-VL zero-shot / few-shot → Phase 0.4 coarse LoRA / action adapter → Phase 0.5 geometric safety scorer 与 offline reranker → Phase 0.6 可选 coarse-action DPO。mini 只用于数据链路 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须基于 trainval manifest，mini 上仅允许 smoke run。
+当前顺序为：Phase -1 数据闭环与 coarse 标签冻结 → Phase 0.1 manifest 协议、scene-level split 与 Majority Baseline（PR #11 review 中）→ Phase 0.1b trainval scale-up → Phase 0.2 ego-motion rule baseline → Phase 0.3 Qwen3-VL zero-shot / few-shot → Phase 0.4 coarse LoRA / action adapter → Phase 0.5a geometric safety scorer → Phase 0.5b offline safety reranker → Phase 0.6 preference pair audit 与可选 coarse-action DPO。mini 只用于数据链路 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须基于 trainval manifest，mini 上仅允许 smoke run。
 
 后续扩展为：short temporal input → map / route / lane topology → hierarchical fine-grained maneuver → continuous waypoint head → BEV / occupancy auxiliary supervision → closed-loop or quasi-closed-loop evaluation。Phase 0 的 action experiments 仍须报告 macro-F1、per-class F1、confusion matrix、class distribution、invalid output rate 与 failure cases；safety 结果同时监控 collision/near-miss、VRU、`unnecessary_stop` 与 macro-F1。
 
-DPO 是第一版 MVP 的可选终点，而不是整个项目的最终终点：只有输出协议稳定、trainval 数据完成、scorer 与 reranker gate、preference pair audit 均通过后才进入。若动作空间扩展为 fine maneuver 或 continuous waypoint，preference pairs 需要重建；coarse checkpoint 可作为初始化或对照，旧分类 head 不保证直接适用于新 target。
+DPO 是第一版 MVP 的可选终点，而不是整个项目的最终终点：scorer gate 未通过不进入 reranker；reranker 未证明风险改善且不过度增加 `stop` 时不构造 DPO pairs；只有 preference pair audit 通过后才进入可选 DPO。若 DPO 不优于 reranker，保留 reranker 作为 MVP 结果。若动作空间扩展为 fine maneuver 或 continuous waypoint，preference pairs 需要重建；coarse checkpoint 可作为初始化或对照，旧分类 head 不保证直接适用于新 target。
 
-BEV/OCC-aware layer 是 planned GT-derived evaluator，不是已完成的 occupancy network；若 future occupancy 使用 static 或 constant-velocity fallback，必须记录 `motion_assumption`，且不得称为真实 future occupancy prediction。当前不声称 CARLA、实车、real-time、闭环驾驶或 trajectory-level 结果。
+BEV / occupancy 是场景空间表示，不直接等于安全决策，也不替代 candidate rollout 与 geometric scorer。Scorer backend v1 使用 nuScenes GT 3D boxes 或由 GT annotation 构造的 ego-centric temporal BEV occupancy，作为验证几何规则合理性的 oracle offline evaluator；它不代表 camera-only occupancy prediction。Scorer backend v2 的 predicted BEV / occupancy 仅为 planned，用于评估感知误差下 scorer 是否仍有效。当前不声称 CARLA、实车、real-time、闭环驾驶、trajectory-level 结果或 occupancy prediction 能力。
 
 ## Honest Portfolio Statement
 
