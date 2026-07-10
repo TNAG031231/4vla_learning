@@ -33,9 +33,10 @@
 
 - `label_rule_version=phase-1.6-meta-action-v0.2`；108 个样本全部使用同一规则版本。
 - Phase -1.9 real-data freeze gate：`samples=108`、`action_match=108/108`、`trajectory_complete=108`、`cam_front_exists=108`。
+- source audit integrity：108 条历史 `cam_front_path` 非空且均与重新派生路径一致；`label_correct=yes=103/no=5`，两个 alignment 字段均为 `yes`，历史 `label_rule_version=phase-1.6-meta-action-v0.1`。
 - frozen action distribution：`accelerate=6`、`decelerate=16`、`keep=55`、`left_lateral=5`、`right_lateral=5`、`stop=21`。
 - v0.1 → v0.2 transition：`keep→accelerate=1`、`keep→decelerate=3`、`keep→stop=1`，其余 103 个历史派生 action 保持不变；这与 Phase -1.7 的 `label_correct=yes=103/no=5` 历史事实一致。
 - 当前时刻、配置半径内的 VRU presence：`has_vru=yes=89`、`no=19`；它不是未来 VRU 风险、collision 标签或 safety score。
-- boundary cases：46；主要 flags 为 `all_zero_trajectory=9`、`insufficient_forward_displacement=4`、`lateral_threshold_boundary=2`、`speed_threshold_boundary=2`、`stop_threshold_boundary=1`。
+- strict boundary-flag cases：17；diagnostic cases：46。flags 为 `all_zero_trajectory=9`、`insufficient_forward_displacement=4`、`lateral_threshold_boundary=2`、`speed_threshold_boundary=2`、`stop_threshold_boundary=1`；uncertainty reasons 为 `none=74`、`stop_boundary_candidate=1`、`stop_threshold_candidate=11`、`trajectory_speed_proxy_only=22`。
 - 原 `data/phase_1_7_manual_audit.csv` 与 `data/phase_1_7_lateral_supplement_audit.csv` 保持历史不可变。`safety_rule_version=not_available`；safety score 不属于本次 gate。
 - 结论：`PHASE -1 LABEL FREEZE GATE: PASS`。Phase 0 的 scene-level split 和正式 manifest audit 尚未开始。
