@@ -47,27 +47,35 @@ from validate_label_freeze import (
 from src.actions.schema import normalize_action
 from src.phase0.protocol import (
     ManifestSample,
+    ACCELERATION_UNIT,
+    MANIFEST_SCHEMA_VERSION,
+    MOTION_SOURCE,
+    POSE_TIMESTAMP_SOURCE,
+    POSE_TIMESTAMP_UNIT,
+    SPEED_UNIT,
+    YAW_RATE_UNIT,
     assign_scene_splits,
     complete_action_distribution,
-    read_manifest_samples,
+    validate_manifest,
     validate_scene_split_isolation,
 )
 
 
 SAFETY_RULE_VERSION = "not_available"
-MANIFEST_SCHEMA_VERSION = "phase0_audited_seed_subset_v1"
-MOTION_SOURCE = "ego_pose_past_difference"
 COORDINATE_METADATA = {
     "current_ego_pose": {
         "frame": "nuScenes_global",
         "translation_unit": "meter",
         "rotation_order": "wxyz",
+        "timestamp_unit": POSE_TIMESTAMP_UNIT,
+        "timestamp_source": POSE_TIMESTAMP_SOURCE,
     },
     "current_ego_motion": {
-        "speed_unit": "meter_per_second",
-        "longitudinal_acceleration_unit": "meter_per_second_squared",
-        "yaw_rate_unit": "radian_per_second",
+        "speed_unit": SPEED_UNIT,
+        "longitudinal_acceleration_unit": ACCELERATION_UNIT,
+        "yaw_rate_unit": YAW_RATE_UNIT,
         "source": MOTION_SOURCE,
+        "timestamp_source": POSE_TIMESTAMP_SOURCE,
     },
     "future_ego_trajectory": {
         "source_frame": "nuScenes_global",
@@ -206,11 +214,13 @@ def to_json_record(record: Phase0ManifestRecord) -> dict[str, object]:
 
 def current_ego_pose(nuscenes: NuScenes, sample_token: str) -> dict[str, object]:
     sample = nuscenes.get("sample", sample_token)
-    translation, rotation = get_ego_pose(nuscenes, sample)
+    translation, rotation, timestamp_us = _sample_pose(nuscenes, sample)
     return {
         "frame": "nuScenes_global",
         "translation_m": list(translation),
         "rotation_wxyz": list(rotation),
+        "timestamp_us": timestamp_us,
+        "timestamp_source": POSE_TIMESTAMP_SOURCE,
     }
 
 
@@ -220,10 +230,30 @@ def _unavailable_motion(reason: str) -> dict[str, object]:
         "longitudinal_acceleration_mps2": None,
         "yaw_rate_radps": None,
         "source": MOTION_SOURCE,
+        "timestamp_source": POSE_TIMESTAMP_SOURCE,
         "availability": "unavailable",
         "history_interval_sec": None,
+        "acceleration_interval_sec": None,
         "unavailable_reason": reason,
     }
+
+
+def _sample_pose(
+    nuscenes: NuScenes,
+    sample: Mapping[str, object],
+) -> tuple[tuple[float, ...], tuple[float, ...], int]:
+    sample_data = sample.get("data")
+    if not isinstance(sample_data, Mapping):
+        raise ValueError("sample data must be a mapping")
+    camera_token = sample_data.get(CAMERA_CHANNEL)
+    if not isinstance(camera_token, str):
+        raise ValueError("sample is missing CAM_FRONT data")
+    camera_data = nuscenes.get("sample_data", camera_token)
+    timestamp_us = camera_data.get("timestamp")
+    if not isinstance(timestamp_us, int):
+        raise ValueError("CAM_FRONT sample_data timestamp must be an integer")
+    translation, rotation = get_ego_pose(nuscenes, sample)
+    return translation, rotation, timestamp_us
 
 
 def _previous_sample(
@@ -241,14 +271,10 @@ def _previous_sample(
 
 
 def _history_interval_sec(
-    newer_sample: Mapping[str, object],
-    older_sample: Mapping[str, object],
+    newer_timestamp_us: int,
+    older_timestamp_us: int,
 ) -> float | None:
-    newer_timestamp = newer_sample.get("timestamp")
-    older_timestamp = older_sample.get("timestamp")
-    if not isinstance(newer_timestamp, int) or not isinstance(older_timestamp, int):
-        return None
-    delta_us = newer_timestamp - older_timestamp
+    delta_us = newer_timestamp_us - older_timestamp_us
     if delta_us <= 0:
         return None
     return delta_us / 1_000_000.0
@@ -270,6 +296,10 @@ def current_ego_motion(
     sample_token: str,
 ) -> dict[str, object]:
     current_sample = nuscenes.get("sample", sample_token)
+    current_translation, current_rotation, current_timestamp_us = _sample_pose(
+        nuscenes,
+        current_sample,
+    )
     previous_sample = _previous_sample(nuscenes, current_sample)
     if previous_sample is None:
         previous_token = current_sample.get("prev")
@@ -277,18 +307,17 @@ def current_ego_motion(
             return _unavailable_motion("previous_sample_scene_mismatch")
         return _unavailable_motion("insufficient_past_history")
 
-    interval_sec = _history_interval_sec(current_sample, previous_sample)
-    if interval_sec is None:
-        return _unavailable_motion("non_monotonic_timestamp")
-
-    current_translation, current_rotation = get_ego_pose(
-        nuscenes,
-        current_sample,
-    )
-    previous_translation, previous_rotation = get_ego_pose(
+    previous_translation, previous_rotation, previous_timestamp_us = _sample_pose(
         nuscenes,
         previous_sample,
     )
+    interval_sec = _history_interval_sec(
+        current_timestamp_us,
+        previous_timestamp_us,
+    )
+    if interval_sec is None:
+        return _unavailable_motion("non_monotonic_timestamp")
+
     speed_mps = _speed_mps(
         current_translation,
         previous_translation,
@@ -305,13 +334,19 @@ def current_ego_motion(
             "longitudinal_acceleration_mps2": None,
             "yaw_rate_radps": yaw_rate_radps,
             "source": MOTION_SOURCE,
+            "timestamp_source": POSE_TIMESTAMP_SOURCE,
             "availability": "partial",
             "history_interval_sec": interval_sec,
+            "acceleration_interval_sec": None,
             "unavailable_reason": "insufficient_past_history_for_acceleration",
         }
-    previous_interval_sec = _history_interval_sec(
-        previous_sample,
+    previous_previous_translation, _, previous_previous_timestamp_us = _sample_pose(
+        nuscenes,
         previous_previous_sample,
+    )
+    previous_interval_sec = _history_interval_sec(
+        previous_timestamp_us,
+        previous_previous_timestamp_us,
     )
     if previous_interval_sec is None:
         return {
@@ -319,14 +354,12 @@ def current_ego_motion(
             "longitudinal_acceleration_mps2": None,
             "yaw_rate_radps": yaw_rate_radps,
             "source": MOTION_SOURCE,
+            "timestamp_source": POSE_TIMESTAMP_SOURCE,
             "availability": "partial",
             "history_interval_sec": interval_sec,
+            "acceleration_interval_sec": None,
             "unavailable_reason": "insufficient_past_history_for_acceleration",
         }
-    previous_previous_translation, _ = get_ego_pose(
-        nuscenes,
-        previous_previous_sample,
-    )
     previous_speed_mps = _speed_mps(
         previous_translation,
         previous_previous_translation,
@@ -336,11 +369,15 @@ def current_ego_motion(
         "speed_mps": speed_mps,
         "longitudinal_acceleration_mps2": (
             speed_mps - previous_speed_mps
-        ) / interval_sec,
+        ) / ((previous_interval_sec + interval_sec) / 2.0),
         "yaw_rate_radps": yaw_rate_radps,
         "source": MOTION_SOURCE,
+        "timestamp_source": POSE_TIMESTAMP_SOURCE,
         "availability": "full",
         "history_interval_sec": interval_sec,
+        "acceleration_interval_sec": (
+            previous_interval_sec + interval_sec
+        ) / 2.0,
         "unavailable_reason": None,
     }
 
@@ -511,8 +548,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _print_audit(records)
     output_path = Path(_required_config_string(config, "manifest_path"))
     write_manifest(records, output_path)
-    written_samples = read_manifest_samples(output_path)
-    if len(written_samples) != len(records):
+    validation = validate_manifest(output_path)
+    if validation.sample_count != len(records):
         raise ValueError("written manifest sample count does not match records")
     print(f"manifest: {output_path}")
     return 0

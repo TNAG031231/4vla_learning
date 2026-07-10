@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from data import build_phase0_manifest as manifest_builder
+from src.phase0.protocol import read_manifest_samples
 
 
 class FakeNuScenes:
@@ -31,31 +32,46 @@ def build_motion_reader(
     previous_scene_token: str = "scene-a",
     previous_yaw_rad: float = 0.0,
     current_yaw_rad: float = 0.0,
+    sample_timestamps: tuple[int, ...] = (
+        0,
+        1_000_000,
+        2_000_000,
+        3_000_000,
+    ),
+    camera_timestamps: tuple[int, ...] = (
+        0,
+        1_000_000,
+        2_000_000,
+        3_000_000,
+    ),
+    x_positions: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0),
 ) -> FakeNuScenes:
     reader = FakeNuScenes()
     sample_specs = (
         ("start", "", "scene-a", 0, 0.0, 0.0),
-        ("previous", "start", previous_scene_token, 1_000_000, 1.0, previous_yaw_rad),
-        ("current", "previous", "scene-a", 2_000_000, 2.0, current_yaw_rad),
-        ("future", "current", "scene-a", 3_000_000, 3.0, 0.0),
+        ("previous", "start", previous_scene_token, 1, 1.0, previous_yaw_rad),
+        ("current", "previous", "scene-a", 2, 2.0, current_yaw_rad),
+        ("future", "current", "scene-a", 3, 3.0, 0.0),
     )
-    for token, previous_token, scene_token, timestamp, x_m, yaw_rad in sample_specs:
+    for token, previous_token, scene_token, index, _, yaw_rad in sample_specs:
         camera_token = f"camera-{token}"
         pose_token = f"pose-{token}"
         reader.tables["sample"][token] = {
             "token": token,
             "scene_token": scene_token,
-            "timestamp": timestamp,
+            "timestamp": sample_timestamps[index],
             "prev": previous_token,
             "next": "future" if token == "current" else "",
             "data": {"CAM_FRONT": camera_token},
         }
         reader.tables["sample_data"][camera_token] = {
             "ego_pose_token": pose_token,
+            "timestamp": camera_timestamps[index],
         }
         reader.tables["ego_pose"][pose_token] = {
-            "translation": [x_m, 0.0, 0.0],
+            "translation": [x_positions[index], 0.0, 0.0],
             "rotation": rotation_from_yaw(yaw_rad),
+            "timestamp": camera_timestamps[index],
         }
     return reader
 
@@ -92,14 +108,18 @@ def test_manifest_record_preserves_phase_minus_one_source_and_required_fields() 
             "frame": "nuScenes_global",
             "translation_m": [1.0, 2.0, 3.0],
             "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "timestamp_us": 10,
+            "timestamp_source": "CAM_FRONT_sample_data",
         },
         current_ego_motion={
             "speed_mps": None,
             "longitudinal_acceleration_mps2": None,
             "yaw_rate_radps": None,
             "source": "ego_pose_past_difference",
+            "timestamp_source": "CAM_FRONT_sample_data",
             "availability": "unavailable",
             "history_interval_sec": None,
+            "acceleration_interval_sec": None,
             "unavailable_reason": "insufficient_past_history",
         },
         trajectory=trajectory,
@@ -152,7 +172,7 @@ def test_manifest_reader_rejects_unknown_action(tmp_path: Path) -> None:
     )
 
     try:
-        manifest_builder.read_manifest_samples(manifest_path)
+        read_manifest_samples(manifest_path)
     except ValueError as error:
         assert "Unsupported action" in str(error)
     else:
@@ -169,14 +189,18 @@ def test_current_ego_pose_and_motion_use_past_samples_only() -> None:
         "frame": "nuScenes_global",
         "translation_m": [2.0, 0.0, 0.0],
         "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "timestamp_us": 2_000_000,
+        "timestamp_source": "CAM_FRONT_sample_data",
     }
     assert motion == {
         "speed_mps": pytest.approx(1.0),
         "longitudinal_acceleration_mps2": pytest.approx(0.0),
         "yaw_rate_radps": pytest.approx(0.0),
         "source": "ego_pose_past_difference",
+        "timestamp_source": "CAM_FRONT_sample_data",
         "availability": "full",
         "history_interval_sec": pytest.approx(1.0),
+        "acceleration_interval_sec": pytest.approx(1.0),
         "unavailable_reason": None,
     }
 
@@ -202,8 +226,10 @@ def test_scene_start_motion_is_unavailable_without_future_pose() -> None:
         "longitudinal_acceleration_mps2": None,
         "yaw_rate_radps": None,
         "source": "ego_pose_past_difference",
+        "timestamp_source": "CAM_FRONT_sample_data",
         "availability": "unavailable",
         "history_interval_sec": None,
+        "acceleration_interval_sec": None,
         "unavailable_reason": "insufficient_past_history",
     }
 
@@ -217,6 +243,7 @@ def test_motion_without_two_past_intervals_is_partial() -> None:
     assert motion["longitudinal_acceleration_mps2"] is None
     assert motion["yaw_rate_radps"] == pytest.approx(0.0)
     assert motion["availability"] == "partial"
+    assert motion["acceleration_interval_sec"] is None
     assert motion["unavailable_reason"] == "insufficient_past_history_for_acceleration"
 
 
@@ -238,3 +265,30 @@ def test_future_pose_change_does_not_affect_current_motion() -> None:
 
     assert before_future_change == after_future_change
     assert before_future_change["availability"] == "full"
+
+
+def test_motion_uses_cam_front_timestamp_instead_of_sample_timestamp() -> None:
+    reader = build_motion_reader(
+        sample_timestamps=(0, 10_000_000, 30_000_000, 60_000_000),
+    )
+
+    pose = manifest_builder.current_ego_pose(reader, "current")
+    motion = manifest_builder.current_ego_motion(reader, "current")
+
+    assert pose["timestamp_us"] == 2_000_000
+    assert pose["timestamp_source"] == "CAM_FRONT_sample_data"
+    assert motion["history_interval_sec"] == pytest.approx(1.0)
+    assert motion["speed_mps"] == pytest.approx(1.0)
+
+
+def test_acceleration_uses_midpoint_interval_for_nonuniform_sampling() -> None:
+    reader = build_motion_reader(
+        camera_timestamps=(0, 1_000_000, 3_000_000, 6_000_000),
+        x_positions=(0.0, 1.0, 5.0, 11.0),
+    )
+
+    motion = manifest_builder.current_ego_motion(reader, "current")
+
+    assert motion["speed_mps"] == pytest.approx(2.0)
+    assert motion["acceleration_interval_sec"] == pytest.approx(1.5)
+    assert motion["longitudinal_acceleration_mps2"] == pytest.approx(2 / 3)
