@@ -53,6 +53,7 @@ class MetaActionRules:
     stop_distance_threshold_m: float
     lateral_displacement_threshold_m: float
     forward_displacement_threshold_m: float
+    speed_action_min_forward_displacement_m: float
     speed_change_threshold_mps: float
     boundary_margin: float
     all_zero_tolerance_m: float
@@ -160,6 +161,10 @@ def load_meta_action_rules(config_path: Path) -> MetaActionRules:
             rules,
             "forward_displacement_threshold_m",
         ),
+        speed_action_min_forward_displacement_m=_number_value(
+            rules,
+            "speed_action_min_forward_displacement_m",
+        ),
         speed_change_threshold_mps=_number_value(
             rules,
             "speed_change_threshold_mps",
@@ -261,10 +266,19 @@ def derive_meta_action(
         math.hypot(point.x_m, point.y_m) <= rules.all_zero_tolerance_m
         for point in trajectory
     )
+    stop_path_length_limit_m = rules.stop_distance_threshold_m * (
+        1.0 + rules.boundary_margin
+    )
     is_stop_candidate = is_all_zero_trajectory or (
         bool(trajectory)
-        and path_length_m <= rules.stop_distance_threshold_m
+        and path_length_m <= stop_path_length_limit_m
         and abs(delta_x_m) <= rules.stop_distance_threshold_m
+        and abs(delta_y_m) <= rules.stop_distance_threshold_m
+    )
+    is_stop_boundary_candidate = (
+        is_stop_candidate
+        and not is_all_zero_trajectory
+        and path_length_m > rules.stop_distance_threshold_m
     )
     is_lateral_boundary = _is_threshold_boundary(
         delta_y_m,
@@ -297,6 +311,8 @@ def derive_meta_action(
         boundary_flags.append("speed_proxy_unavailable")
     if is_speed_boundary:
         boundary_flags.append("speed_threshold_boundary")
+    if is_stop_boundary_candidate:
+        boundary_flags.append("stop_threshold_boundary")
 
     uncertainty_reason = NO_UNCERTAINTY
     action_confidence = "high"
@@ -308,7 +324,11 @@ def derive_meta_action(
         derived_action = STOP
         if not is_all_zero_trajectory:
             action_confidence = "medium"
-            uncertainty_reason = "stop_threshold_candidate"
+            uncertainty_reason = (
+                "stop_boundary_candidate"
+                if is_stop_boundary_candidate
+                else "stop_threshold_candidate"
+            )
     elif abs(delta_y_m) > rules.lateral_displacement_threshold_m:
         derived_action = (
             LEFT_LATERAL if delta_y_m > 0.0 else RIGHT_LATERAL
@@ -321,24 +341,25 @@ def derive_meta_action(
         derived_action = KEEP
         action_confidence = "low"
         uncertainty_reason = "speed_proxy_unavailable"
-    elif abs(delta_x_m) < rules.forward_displacement_threshold_m:
+    elif delta_x_m < rules.speed_action_min_forward_displacement_m:
         derived_action = KEEP
         action_confidence = "low"
-        if approx_delta_speed_mps > rules.speed_change_threshold_mps:
-            uncertainty_reason = "keep_vs_accelerate_ambiguity"
-        elif approx_delta_speed_mps < -rules.speed_change_threshold_mps:
-            uncertainty_reason = "keep_vs_decelerate_ambiguity"
-        else:
-            uncertainty_reason = "low_forward_displacement_speed_guard"
+        uncertainty_reason = "low_forward_displacement_speed_guard"
         boundary_flags.append("insufficient_forward_displacement")
-    elif is_speed_boundary:
-        derived_action = KEEP
-        action_confidence = "low"
-        uncertainty_reason = (
-            "keep_vs_accelerate_ambiguity"
-            if approx_delta_speed_mps >= 0.0
-            else "keep_vs_decelerate_ambiguity"
-        )
+    elif delta_x_m < rules.forward_displacement_threshold_m:
+        boundary_flags.append("insufficient_forward_displacement")
+        if approx_delta_speed_mps > rules.speed_change_threshold_mps:
+            derived_action = ACCELERATE
+            action_confidence = "medium"
+            uncertainty_reason = "trajectory_speed_proxy_only"
+        elif approx_delta_speed_mps < -rules.speed_change_threshold_mps:
+            derived_action = DECELERATE
+            action_confidence = "medium"
+            uncertainty_reason = "trajectory_speed_proxy_only"
+        else:
+            derived_action = KEEP
+            action_confidence = "low"
+            uncertainty_reason = "low_forward_displacement_speed_guard"
     elif approx_delta_speed_mps > rules.speed_change_threshold_mps:
         derived_action = ACCELERATE
         action_confidence = "medium"

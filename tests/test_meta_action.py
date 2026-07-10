@@ -34,12 +34,13 @@ def load_derivation_module() -> ModuleType:
 
 def build_rules(module: ModuleType):
     return module.MetaActionRules(
-        label_rule_version="phase-1.6-meta-action-v0",
+        label_rule_version="phase-1.6-meta-action-v0.2",
         horizon_sec=3.0,
         sample_interval_sec=0.5,
         stop_distance_threshold_m=0.5,
         lateral_displacement_threshold_m=1.0,
         forward_displacement_threshold_m=3.0,
+        speed_action_min_forward_displacement_m=1.0,
         speed_change_threshold_mps=1.0,
         boundary_margin=0.2,
         all_zero_tolerance_m=0.001,
@@ -97,6 +98,17 @@ def test_action_schema_contains_exactly_six_actions() -> None:
     assert schema.is_valid_action("keep") is True
     assert schema.is_valid_action("turn_left") is False
     assert schema.normalize_action(" LEFT_LATERAL ") == "left_lateral"
+
+
+def test_action_rule_config_loads_v0_2_speed_guard() -> None:
+    derivation = load_derivation_module()
+
+    rules = derivation.load_meta_action_rules(
+        PROJECT_ROOT / "configs" / "action_rules.yaml"
+    )
+
+    assert rules.label_rule_version == "phase-1.6-meta-action-v0.2"
+    assert rules.speed_action_min_forward_displacement_m == 1.0
 
 
 def test_positive_lateral_displacement_is_left_lateral() -> None:
@@ -225,6 +237,167 @@ def test_missing_speed_proxy_does_not_force_speed_action() -> None:
     assert result.rule_features.approx_delta_speed_mps == "not_available"
     assert result.uncertainty_reason == "speed_proxy_unavailable"
     assert "trajectory_too_short" in result.boundary_flags
+
+
+def test_low_forward_trajectory_with_positive_speed_change_accelerates() -> None:
+    derivation = load_derivation_module()
+    trajectory = build_trajectory(
+        derivation,
+        (
+            (0.0, 0.0),
+            (0.05, 0.0),
+            (0.10, 0.0),
+            (0.20, 0.0),
+            (0.40, 0.0),
+            (0.90, 0.0),
+            (1.50, 0.0),
+        ),
+    )
+
+    result = derivation.derive_meta_action(
+        trajectory,
+        build_rules(derivation),
+    )
+
+    assert result.derived_action == "accelerate"
+    assert "insufficient_forward_displacement" in result.boundary_flags
+
+
+def test_low_forward_trajectory_with_negative_speed_change_decelerates() -> None:
+    derivation = load_derivation_module()
+    trajectory = build_trajectory(
+        derivation,
+        (
+            (0.0, 0.0),
+            (0.75, 0.0),
+            (1.50, 0.0),
+            (1.90, 0.0),
+            (2.10, 0.0),
+            (2.15, 0.0),
+            (2.20, 0.0),
+        ),
+    )
+
+    result = derivation.derive_meta_action(
+        trajectory,
+        build_rules(derivation),
+    )
+
+    assert result.derived_action == "decelerate"
+    assert "insufficient_forward_displacement" in result.boundary_flags
+
+
+def test_stop_boundary_uses_path_length_margin() -> None:
+    derivation = load_derivation_module()
+    trajectory = build_trajectory(
+        derivation,
+        (
+            (0.0, 0.0),
+            (0.0807, 0.03),
+            (0.1614, 0.0),
+            (0.2421, 0.03),
+            (0.3228, 0.0),
+            (0.4035, 0.03),
+            (0.4843, 0.0117),
+        ),
+    )
+
+    result = derivation.derive_meta_action(
+        trajectory,
+        build_rules(derivation),
+    )
+
+    assert result.derived_action == "stop"
+    assert result.action_confidence == "medium"
+    assert result.uncertainty_reason == "stop_boundary_candidate"
+
+
+@pytest.mark.parametrize(
+    "coordinates",
+    (
+        tuple((index * 0.51 / 6.0, 0.0) for index in range(7)),
+        tuple((0.0, index * 0.51 / 6.0) for index in range(7)),
+        (
+            (0.0, 0.0),
+            (0.12, 0.0),
+            (0.24, 0.0),
+            (0.12, 0.0),
+            (0.24, 0.0),
+            (0.36, 0.0),
+            (0.48, 0.0),
+        ),
+    ),
+)
+def test_stop_candidate_rejects_distance_or_path_above_limit(
+    coordinates: tuple[tuple[float, float], ...],
+) -> None:
+    derivation = load_derivation_module()
+    trajectory = build_trajectory(derivation, coordinates)
+
+    result = derivation.derive_meta_action(
+        trajectory,
+        build_rules(derivation),
+    )
+
+    assert result.rule_features.is_stop_candidate is False
+    assert result.derived_action != "stop"
+
+
+@pytest.mark.parametrize(
+    ("lateral_direction", "expected_action"),
+    ((1.0, "left_lateral"), (-1.0, "right_lateral")),
+)
+def test_lateral_action_precedes_speed_change(
+    lateral_direction: float,
+    expected_action: str,
+) -> None:
+    derivation = load_derivation_module()
+    trajectory = build_trajectory(
+        derivation,
+        (
+            (x_m, lateral_direction * y_m)
+            for x_m, y_m in (
+                (0.0, 0.0),
+                (0.05, 0.20),
+                (0.10, 0.40),
+                (0.20, 0.60),
+                (0.40, 0.90),
+                (0.90, 1.20),
+                (1.50, 1.50),
+            )
+        ),
+    )
+
+    result = derivation.derive_meta_action(
+        trajectory,
+        build_rules(derivation),
+    )
+
+    assert result.derived_action == expected_action
+
+
+def test_speed_action_requires_minimum_forward_displacement() -> None:
+    derivation = load_derivation_module()
+    trajectory = build_trajectory(
+        derivation,
+        (
+            (0.0, 0.0),
+            (0.01, 0.0),
+            (0.02, 0.0),
+            (0.04, 0.0),
+            (0.08, 0.0),
+            (0.30, 0.0),
+            (0.95, 0.0),
+        ),
+    )
+
+    result = derivation.derive_meta_action(
+        trajectory,
+        build_rules(derivation),
+    )
+
+    assert result.derived_action == "keep"
+    assert "insufficient_forward_displacement" in result.boundary_flags
 
 
 def test_speed_proxy_accepts_complete_horizon_with_timestamp_tolerance() -> None:

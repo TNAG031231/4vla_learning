@@ -1,10 +1,11 @@
 meta_action_v0:
-  label_rule_version: "phase-1.6-meta-action-v0.1"
+  label_rule_version: "phase-1.6-meta-action-v0.2"
   horizon_sec: 3.0
   sample_interval_sec: 0.5
   stop_distance_threshold_m: 0.5
   lateral_displacement_threshold_m: 1.0
   forward_displacement_threshold_m: 3.0
+  speed_action_min_forward_displacement_m: 1.0
   speed_change_threshold_mps: 1.0
   boundary_margin: 0.2
   all_zero_tolerance_m: 0.001
