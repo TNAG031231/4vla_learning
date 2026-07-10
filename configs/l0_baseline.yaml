@@ -1,0 +1,11 @@
+seed: 20260710
+train_ratio: 0.6
+val_ratio: 0.2
+test_ratio: 0.2
+base_audit_path: data/phase_1_7_manual_audit.csv
+supplement_audit_path: data/phase_1_7_lateral_supplement_audit.csv
+data_config_path: configs/data.yaml
+action_config_path: configs/action_rules.yaml
+dataroot: data/nuscenes
+manifest_path: data/outputs/phase_0_1_audited_seed_subset/manifest.jsonl
+output_dir: data/outputs/phase_0_1_audited_seed_subset
