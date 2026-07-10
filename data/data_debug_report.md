@@ -28,3 +28,14 @@
 | `7ae00681137b40f5bd7bef3823a82ee2` | `keep` | `decelerate` | `keep_vs_decelerate_confusion` | 1.0294346082681272 | -0.023958488 | 1.057035712556549 | -1.087600437 | The forward distance is greater than 1 meter and approx_delta_speed_mps is less than -1. |
 | `8b6d496ed9d84469b75836ca1c56959f` | `keep` | `stop` | `stop_vs_keep_confusion` | 0.48431042404359476 | -0.011709045 | 0.5123994968448523 | -0.634145323 | The forward distance is less than 0.5 meters. |
 | `e6b0b282aa174a978272dc2d0a89d560` | `keep` | `accelerate` | `keep_vs_accelerate_confusion` | 2.5465279202146363 | -0.029450612 | 2.546760692079639 | 1.854919082888664 | approx_delta_speed_mps is greater than +1 |
+
+## Phase -1.8 / -1.9 Meta-Action v0.2 Freeze
+
+- `label_rule_version=phase-1.6-meta-action-v0.2`；108 个样本全部使用同一规则版本。
+- Phase -1.9 real-data freeze gate：`samples=108`、`action_match=108/108`、`trajectory_complete=108`、`cam_front_exists=108`。
+- frozen action distribution：`accelerate=6`、`decelerate=16`、`keep=55`、`left_lateral=5`、`right_lateral=5`、`stop=21`。
+- v0.1 → v0.2 transition：`keep→accelerate=1`、`keep→decelerate=3`、`keep→stop=1`，其余 103 个历史派生 action 保持不变；这与 Phase -1.7 的 `label_correct=yes=103/no=5` 历史事实一致。
+- 当前时刻、配置半径内的 VRU presence：`has_vru=yes=89`、`no=19`；它不是未来 VRU 风险、collision 标签或 safety score。
+- boundary cases：46；主要 flags 为 `all_zero_trajectory=9`、`insufficient_forward_displacement=4`、`lateral_threshold_boundary=2`、`speed_threshold_boundary=2`、`stop_threshold_boundary=1`。
+- 原 `data/phase_1_7_manual_audit.csv` 与 `data/phase_1_7_lateral_supplement_audit.csv` 保持历史不可变。`safety_rule_version=not_available`；safety score 不属于本次 gate。
+- 结论：`PHASE -1 LABEL FREEZE GATE: PASS`。Phase 0 的 scene-level split 和正式 manifest audit 尚未开始。
