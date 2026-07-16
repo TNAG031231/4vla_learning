@@ -205,7 +205,7 @@ def write_manifest(
     records: Sequence[Phase0ManifestRecord],
     output_path: Path,
 ) -> None:
-    write_jsonl_records(records, output_path)
+    write_jsonl_records(records, output_path, validator=validate_manifest)
 
 
 def _required_config_string(config: Mapping[str, object], key: str) -> str:

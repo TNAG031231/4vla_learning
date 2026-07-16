@@ -223,6 +223,24 @@ def manifest_row(sample_token: str = "sample") -> dict[str, object]:
     }
 
 
+def trainval_manifest_row(sample_token: str = "sample") -> dict[str, object]:
+    row = manifest_row(sample_token)
+    row.update(
+        {
+            "manifest_schema_version": "phase0_trainval_dataset_manifest_v1",
+            "audit_status": "unaudited",
+            "source_audit_record": None,
+            "official_split": "train",
+            "split_seed": 20260710,
+            "split_strategy_version": (
+                "official_train_scene_label_stratified_v1"
+            ),
+            "split_mapping_sha256": "a" * 64,
+        }
+    )
+    return row
+
+
 def test_complete_manifest_validator_accepts_contract(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.jsonl"
     manifest_path.write_text(
@@ -241,29 +259,53 @@ def test_complete_manifest_validator_accepts_contract(tmp_path: Path) -> None:
 def test_trainval_manifest_validator_accepts_unaudited_contract(
     tmp_path: Path,
 ) -> None:
-    row = manifest_row()
-    row["manifest_schema_version"] = "phase0_trainval_dataset_manifest_v1"
-    row["audit_status"] = "unaudited"
-    row["source_audit_record"] = None
-    row["official_split"] = "train"
-    row["split_seed"] = 20260710
-    row["split_strategy_version"] = (
-        "official_train_scene_label_stratified_v1"
-    )
+    row = trainval_manifest_row()
     manifest_path = tmp_path / "manifest.jsonl"
     manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
     summary = validate_manifest(manifest_path)
 
     assert summary.manifest_schema_version == "phase0_trainval_dataset_manifest_v1"
+    assert summary.split_mapping_sha256 == "a" * 64
+
+
+def test_trainval_manifest_validator_accepts_audited_provenance(
+    tmp_path: Path,
+) -> None:
+    row = trainval_manifest_row()
+    row["audit_status"] = "audited"
+    row["source_audit_record"] = {
+        "source_audit": "base",
+        "sample_token": "sample",
+        "historical_derived_action": "keep",
+        "reviewed_action": "keep",
+        "label_correct": "yes",
+        "historical_label_rule_version": "phase-1.6-meta-action-v0.1",
+    }
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    summary = validate_manifest(manifest_path)
+
+    assert summary.sample_count == 1
+
+
+def test_trainval_manifest_validator_rejects_missing_audited_provenance(
+    tmp_path: Path,
+) -> None:
+    row = trainval_manifest_row()
+    row["audit_status"] = "audited"
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a mapping"):
+        validate_manifest(manifest_path)
 
 
 def test_trainval_manifest_validator_rejects_audit_record(
     tmp_path: Path,
 ) -> None:
-    row = manifest_row()
-    row["manifest_schema_version"] = "phase0_trainval_dataset_manifest_v1"
-    row["audit_status"] = "unaudited"
+    row = trainval_manifest_row()
     row["source_audit_record"] = {"source_audit": "unexpected"}
     manifest_path = tmp_path / "manifest.jsonl"
     manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
@@ -272,15 +314,44 @@ def test_trainval_manifest_validator_rejects_audit_record(
         validate_manifest(manifest_path)
 
 
-def test_manifest_validator_rejects_absolute_cam_front_path(
+@pytest.mark.parametrize(
+    "cam_front_path",
+    (
+        "/private/data/image.jpg",
+        "C:/data/image.jpg",
+        "C:\\data\\image.jpg",
+        "\\\\server\\share\\image.jpg",
+        "samples/CAM_FRONT/../image.jpg",
+        "samples/CAM_BACK/image.jpg",
+        "other/samples/CAM_FRONT/image.jpg",
+    ),
+)
+def test_manifest_validator_rejects_nonportable_cam_front_path(
     tmp_path: Path,
+    cam_front_path: str,
 ) -> None:
     row = manifest_row()
-    row["cam_front_path"] = "/private/data/image.jpg"
+    row["cam_front_path"] = cam_front_path
     manifest_path = tmp_path / "manifest.jsonl"
     manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="relative to NUSCENES_ROOT"):
+        validate_manifest(manifest_path)
+
+
+def test_trainval_manifest_validator_requires_one_mapping_hash(
+    tmp_path: Path,
+) -> None:
+    first = trainval_manifest_row("sample-a")
+    second = trainval_manifest_row("sample-b")
+    second["split_mapping_sha256"] = "b" * 64
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(first) + "\n" + json.dumps(second) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be singular"):
         validate_manifest(manifest_path)
 
 

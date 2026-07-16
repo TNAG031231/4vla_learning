@@ -69,6 +69,16 @@ class FutureEgoTrajectory:
 
 
 @dataclass(frozen=True)
+class FutureSampleGrid:
+    sample_token: str
+    scene_token: str
+    selected_sample_tokens: tuple[str, ...]
+    selected_t_sec: tuple[float, ...]
+    horizon_covered: bool
+    exclusion_reason: str | None
+
+
+@dataclass(frozen=True)
 class NearbyAgent:
     annotation_token: str
     instance_token: str
@@ -328,13 +338,13 @@ def get_nearby_agents(
     )
 
 
-def extract_future_ego_trajectory(
+def select_future_sample_grid(
     nuscenes: NuScenesReader,
     sample_token: str,
     horizon_sec: float,
     sample_interval_sec: float,
     time_tolerance_sec: float = DEFAULT_TRAJECTORY_TIME_TOLERANCE_SEC,
-) -> FutureEgoTrajectory:
+) -> FutureSampleGrid:
     if horizon_sec < 0.0:
         raise ValueError("horizon_sec must be non-negative")
     if sample_interval_sec <= 0.0:
@@ -343,8 +353,184 @@ def extract_future_ego_trajectory(
         raise ValueError("time_tolerance_sec must be non-negative")
 
     current_sample = nuscenes.get("sample", sample_token)
+    current_timestamp_value = current_sample.get("timestamp")
+    if not isinstance(current_timestamp_value, int) or isinstance(
+        current_timestamp_value,
+        bool,
+    ):
+        return FutureSampleGrid(
+            sample_token=sample_token,
+            scene_token=str(current_sample.get("scene_token", "")),
+            selected_sample_tokens=(),
+            selected_t_sec=(),
+            horizon_covered=False,
+            exclusion_reason="broken_next_chain",
+        )
+    current_timestamp = current_timestamp_value
+    scene_token = _string_value(current_sample, "scene_token")
+    target_times = []
+    target_time_sec = sample_interval_sec
+    while target_time_sec <= horizon_sec + TIMESTAMP_TOLERANCE_SEC:
+        target_times.append(target_time_sec)
+        target_time_sec += sample_interval_sec
+
+    future_samples: list[tuple[str, float]] = []
+    current = current_sample
+    seen = {sample_token}
+    furthest_t_sec = 0.0
+    while True:
+        next_token = current.get("next")
+        if not isinstance(next_token, str):
+            return FutureSampleGrid(
+                sample_token,
+                scene_token,
+                (),
+                (),
+                False,
+                "broken_next_chain",
+            )
+        if not next_token:
+            break
+        if next_token in seen:
+            return FutureSampleGrid(
+                sample_token,
+                scene_token,
+                (),
+                (),
+                False,
+                "broken_next_chain",
+            )
+        seen.add(next_token)
+        try:
+            future_sample = nuscenes.get("sample", next_token)
+        except KeyError:
+            return FutureSampleGrid(
+                sample_token,
+                scene_token,
+                (),
+                (),
+                False,
+                "broken_next_chain",
+            )
+        if future_sample.get("prev") != current.get("token"):
+            return FutureSampleGrid(
+                sample_token,
+                scene_token,
+                (),
+                (),
+                False,
+                "broken_next_chain",
+            )
+        if future_sample.get("scene_token") != scene_token:
+            return FutureSampleGrid(
+                sample_token,
+                scene_token,
+                (),
+                (),
+                False,
+                "scene_mismatch",
+            )
+        future_timestamp = future_sample.get("timestamp")
+        current_sample_timestamp = current.get("timestamp")
+        if (
+            not isinstance(future_timestamp, int)
+            or isinstance(future_timestamp, bool)
+            or not isinstance(current_sample_timestamp, int)
+            or future_timestamp <= current_sample_timestamp
+        ):
+            return FutureSampleGrid(
+                sample_token,
+                scene_token,
+                (),
+                (),
+                False,
+                "broken_next_chain",
+            )
+        time_sec = microseconds_to_seconds(
+            future_timestamp - current_timestamp
+        )
+        furthest_t_sec = time_sec
+        if time_sec > horizon_sec + time_tolerance_sec:
+            break
+        future_samples.append((next_token, time_sec))
+        current = future_sample
+
+    horizon_insufficient = (
+        furthest_t_sec + time_tolerance_sec < horizon_sec
+    )
+
+    search_start_index = 0
+    selected_tokens = []
+    selected_times = []
+    for target_time_sec in target_times:
+        selected_index = None
+        selected_error = None
+        upper_bound_sec = target_time_sec + time_tolerance_sec
+        for index in range(search_start_index, len(future_samples)):
+            _, time_sec = future_samples[index]
+            if time_sec > upper_bound_sec:
+                break
+            error = abs(time_sec - target_time_sec)
+            if error <= time_tolerance_sec and (
+                selected_error is None or error < selected_error
+            ):
+                selected_index = index
+                selected_error = error
+
+        if selected_index is None:
+            return FutureSampleGrid(
+                sample_token,
+                scene_token,
+                tuple(selected_tokens),
+                tuple(selected_times),
+                False,
+                (
+                    "insufficient_remaining_horizon"
+                    if horizon_insufficient
+                    else "timestamp_out_of_tolerance"
+                ),
+            )
+        future_token, time_sec = future_samples[selected_index]
+        selected_tokens.append(future_token)
+        selected_times.append(time_sec)
+        search_start_index = selected_index + 1
+
+    return FutureSampleGrid(
+        sample_token=sample_token,
+        scene_token=scene_token,
+        selected_sample_tokens=tuple(selected_tokens),
+        selected_t_sec=tuple(selected_times),
+        horizon_covered=not horizon_insufficient,
+        exclusion_reason=(
+            "insufficient_remaining_horizon"
+            if horizon_insufficient
+            else None
+        ),
+    )
+
+
+def extract_future_ego_trajectory(
+    nuscenes: NuScenesReader,
+    sample_token: str,
+    horizon_sec: float,
+    sample_interval_sec: float,
+    time_tolerance_sec: float = DEFAULT_TRAJECTORY_TIME_TOLERANCE_SEC,
+    future_grid: FutureSampleGrid | None = None,
+) -> FutureEgoTrajectory:
+    grid = future_grid or select_future_sample_grid(
+        nuscenes=nuscenes,
+        sample_token=sample_token,
+        horizon_sec=horizon_sec,
+        sample_interval_sec=sample_interval_sec,
+        time_tolerance_sec=time_tolerance_sec,
+    )
+    if grid.sample_token != sample_token:
+        raise ValueError("future grid sample_token mismatch")
+    current_sample = nuscenes.get("sample", sample_token)
     current_timestamp = int(current_sample["timestamp"])
     scene_token = _string_value(current_sample, "scene_token")
+    if grid.scene_token != scene_token:
+        raise ValueError("future grid scene_token mismatch")
     current_translation, current_rotation = get_ego_pose(
         nuscenes,
         current_sample,
@@ -364,47 +550,12 @@ def extract_future_ego_trajectory(
             heading_delta_rad=current_pose.heading_delta_rad,
         )
     ]
-
-    target_times = []
-    target_time_sec = sample_interval_sec
-    while target_time_sec <= horizon_sec + TIMESTAMP_TOLERANCE_SEC:
-        target_times.append(target_time_sec)
-        target_time_sec += sample_interval_sec
-
-    future_samples = []
-    next_token = _string_value(current_sample, "next")
-    while next_token:
-        future_sample = nuscenes.get("sample", next_token)
-        future_timestamp = int(future_sample["timestamp"])
-        time_sec = microseconds_to_seconds(
-            future_timestamp - current_timestamp
-        )
-        if time_sec > horizon_sec + time_tolerance_sec:
-            break
-
-        future_samples.append((future_sample, time_sec))
-        next_token = _string_value(future_sample, "next")
-
-    search_start_index = 0
-    for target_time_sec in target_times:
-        selected_index = None
-        selected_error = None
-        upper_bound_sec = target_time_sec + time_tolerance_sec
-        for index in range(search_start_index, len(future_samples)):
-            future_sample, time_sec = future_samples[index]
-            if time_sec > upper_bound_sec:
-                break
-            error = abs(time_sec - target_time_sec)
-            if error <= time_tolerance_sec and (
-                selected_error is None or error < selected_error
-            ):
-                selected_index = index
-                selected_error = error
-
-        if selected_index is None:
-            break
-
-        future_sample, time_sec = future_samples[selected_index]
+    for future_token, time_sec in zip(
+        grid.selected_sample_tokens,
+        grid.selected_t_sec,
+        strict=True,
+    ):
+        future_sample = nuscenes.get("sample", future_token)
         future_translation, future_rotation = get_ego_pose(
             nuscenes,
             future_sample,
@@ -417,23 +568,20 @@ def extract_future_ego_trajectory(
         )
         points.append(
             TrajectoryPoint(
-                future_sample_token=_string_value(future_sample, "token"),
+                future_sample_token=future_token,
                 t_sec=time_sec,
                 x_m=pose.x_m,
                 y_m=pose.y_m,
                 heading_delta_rad=pose.heading_delta_rad,
             )
         )
-        search_start_index = selected_index + 1
-
-    horizon_covered = len(points) == len(target_times) + 1
 
     return FutureEgoTrajectory(
         sample_token=sample_token,
         scene_token=scene_token,
         current_timestamp=current_timestamp,
         points=tuple(points),
-        is_truncated=not horizon_covered,
+        is_truncated=not grid.horizon_covered,
     )
 
 

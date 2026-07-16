@@ -28,11 +28,18 @@ from derive_meta_action import (
     derive_meta_action,
     load_meta_action_rules,
 )
+from build_phase0_manifest import SourceAuditRecord
 from inspect_nuscenes_sample import (
     CAMERA_CHANNEL,
     extract_future_ego_trajectory,
     get_nearby_agents,
     load_trajectory_config,
+    select_future_sample_grid,
+)
+from validate_label_freeze import (
+    HistoricalAuditRow,
+    read_and_merge_audits,
+    validate_historical_audit_integrity,
 )
 from src.actions.schema import ACTION_SCHEMA, LABEL_RULE_VERSION
 from src.phase0.manifest import (
@@ -52,8 +59,14 @@ from src.phase0.protocol import (
     SPLITS,
     TRAINVAL_MANIFEST_SCHEMA_VERSION,
     complete_action_distribution,
+    is_valid_cam_front_path,
     select_pilot_scene_tokens,
     validate_manifest,
+)
+from src.phase0.scene_mapping import (
+    build_scene_mapping_payload,
+    ensure_scene_mapping,
+    hash_scene_histograms,
 )
 from src.phase0.stratified_split import (
     SPLIT_STRATEGY_VERSION,
@@ -75,6 +88,7 @@ EXCLUSION_REASONS = (
     "label_derivation_error",
     "other_error",
 )
+UNFROZEN_SPLIT_MAPPING_SHA256 = "unfrozen_scene_mapping"
 
 
 @dataclass(frozen=True)
@@ -86,8 +100,11 @@ class TrainvalManifestConfig:
     pilot_scene_count: int
     data_config_path: Path
     action_config_path: Path
+    base_audit_path: Path
+    supplement_audit_path: Path
     manifest_relative_path: Path
     pilot_manifest_relative_path: Path
+    scene_split_mapping_relative_path: Path
 
 
 @dataclass(frozen=True)
@@ -109,8 +126,9 @@ class TrainvalManifestRecord:
     official_split: str
     split_seed: int
     split_strategy_version: str
+    split_mapping_sha256: str
     audit_status: str
-    source_audit_record: None
+    source_audit_record: SourceAuditRecord | None
 
 
 @dataclass(frozen=True)
@@ -124,6 +142,7 @@ class BuildResult:
     records: tuple[TrainvalManifestRecord, ...]
     scanned_sample_count: int
     exclusion_counts: dict[str, int]
+    audit_outcomes: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -140,6 +159,7 @@ class SceneLabelStatistics:
     scanned_sample_count: int
     included_sample_count: int
     exclusion_counts: dict[str, int]
+    audit_outcomes: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -182,20 +202,66 @@ def load_config(config_path: Path) -> TrainvalManifestConfig:
         pilot_scene_count=_int_value(loaded, "pilot_scene_count"),
         data_config_path=Path(_string_value(loaded, "data_config_path")),
         action_config_path=Path(_string_value(loaded, "action_config_path")),
+        base_audit_path=Path(_string_value(loaded, "base_audit_path")),
+        supplement_audit_path=Path(
+            _string_value(loaded, "supplement_audit_path")
+        ),
         manifest_relative_path=Path(
             _string_value(loaded, "manifest_relative_path")
         ),
         pilot_manifest_relative_path=Path(
             _string_value(loaded, "pilot_manifest_relative_path")
         ),
+        scene_split_mapping_relative_path=Path(
+            _string_value(loaded, "scene_split_mapping_relative_path")
+        ),
     )
 
 
-def _environment_path(name: str) -> Path:
+def load_audit_index(
+    base_audit_path: Path,
+    supplement_audit_path: Path,
+) -> dict[str, HistoricalAuditRow]:
+    rows = read_and_merge_audits(base_audit_path, supplement_audit_path)
+    validate_historical_audit_integrity(rows)
+    return {row.sample_token: row for row in rows}
+
+
+def audit_token_summary(
+    result: FullSplitResult,
+    audit_index: Mapping[str, HistoricalAuditRow],
+) -> dict[str, object]:
+    outcomes = dict(result.train_statistics.audit_outcomes)
+    duplicate_tokens = set(outcomes) & set(result.test_statistics.audit_outcomes)
+    if duplicate_tokens:
+        raise ValueError("audit token appears in official train and val scans")
+    outcomes.update(result.test_statistics.audit_outcomes)
+    missing_tokens = sorted(set(audit_index) - set(outcomes))
+    filtered_reasons = Counter(
+        outcome for outcome in outcomes.values() if outcome != "included"
+    )
+    return {
+        "audit_token_count": len(audit_index),
+        "successfully_matched_count": sum(
+            outcome == "included" for outcome in outcomes.values()
+        ),
+        "filtered_count": sum(
+            outcome != "included" for outcome in outcomes.values()
+        ),
+        "filtered_reason_counts": dict(sorted(filtered_reasons.items())),
+        "missing_count": len(missing_tokens),
+        "missing_sample_tokens": missing_tokens,
+    }
+
+
+def _environment_path(name: str, *, require_absolute: bool = False) -> Path:
     value = os.environ.get(name)
     if not value:
         raise ValueError(f"{name} must be set")
-    return Path(value).expanduser()
+    path = Path(value).expanduser()
+    if require_absolute and not path.is_absolute():
+        raise ValueError(f"{name} must be an absolute path")
+    return path.resolve()
 
 
 def output_path(derived_root: Path, relative_path: Path) -> Path:
@@ -261,77 +327,6 @@ def compose_project_scene_splits(
     return scene_splits
 
 
-def future_exclusion_reason(
-    nuscenes: NuScenes,
-    sample: Mapping[str, object],
-    horizon_sec: float,
-    sample_interval_sec: float,
-    time_tolerance_sec: float,
-) -> str | None:
-    scene_token = sample.get("scene_token")
-    start_timestamp = sample.get("timestamp")
-    if not isinstance(scene_token, str):
-        return "scene_mismatch"
-    if not isinstance(start_timestamp, int) or isinstance(start_timestamp, bool):
-        return "broken_next_chain"
-
-    elapsed_times = [0.0]
-    current = sample
-    seen = {sample.get("token")}
-    while True:
-        next_token = current.get("next")
-        if not isinstance(next_token, str):
-            return "broken_next_chain"
-        if not next_token:
-            break
-        if next_token in seen:
-            return "broken_next_chain"
-        seen.add(next_token)
-        try:
-            next_sample = nuscenes.get("sample", next_token)
-        except KeyError:
-            return "broken_next_chain"
-        if next_sample.get("prev") != current.get("token"):
-            return "broken_next_chain"
-        if next_sample.get("scene_token") != scene_token:
-            return "scene_mismatch"
-        next_timestamp = next_sample.get("timestamp")
-        current_timestamp = current.get("timestamp")
-        if (
-            not isinstance(next_timestamp, int)
-            or isinstance(next_timestamp, bool)
-            or not isinstance(current_timestamp, int)
-            or next_timestamp <= current_timestamp
-        ):
-            return "broken_next_chain"
-        elapsed_sec = (next_timestamp - start_timestamp) / 1_000_000.0
-        elapsed_times.append(elapsed_sec)
-        current = next_sample
-        if elapsed_sec > horizon_sec + time_tolerance_sec:
-            break
-
-    if elapsed_times[-1] + time_tolerance_sec < horizon_sec:
-        return "insufficient_remaining_horizon"
-
-    search_start = 1
-    target_sec = sample_interval_sec
-    while target_sec <= horizon_sec + 1e-3:
-        candidates = tuple(
-            index
-            for index in range(search_start, len(elapsed_times))
-            if abs(elapsed_times[index] - target_sec) <= time_tolerance_sec
-        )
-        if not candidates:
-            return "timestamp_out_of_tolerance"
-        selected = min(
-            candidates,
-            key=lambda index: abs(elapsed_times[index] - target_sec),
-        )
-        search_start = selected + 1
-        target_sec += sample_interval_sec
-    return None
-
-
 def _cam_front_data(
     nuscenes: NuScenes,
     sample: Mapping[str, object],
@@ -359,6 +354,8 @@ def evaluate_sample(
     official_split: str,
     split_seed: int,
     split_strategy_version: str,
+    split_mapping_sha256: str,
+    audit_row: HistoricalAuditRow | None,
     dataroot: Path,
     rules: MetaActionRules,
     horizon_sec: float,
@@ -381,9 +378,9 @@ def evaluate_sample(
     filename = camera_data.get("filename")
     if not isinstance(filename, str) or not filename:
         return SampleDecision(None, "missing_cam_front")
-    portable_path = PurePosixPath(filename)
-    if portable_path.is_absolute() or ".." in portable_path.parts:
+    if not is_valid_cam_front_path(filename):
         return SampleDecision(None, "missing_cam_front_file")
+    portable_path = PurePosixPath(filename)
     if not (dataroot / Path(filename)).is_file():
         return SampleDecision(None, "missing_cam_front_file")
 
@@ -392,15 +389,15 @@ def evaluate_sample(
     except (KeyError, TypeError, ValueError):
         return SampleDecision(None, "missing_ego_pose")
 
-    future_error = future_exclusion_reason(
+    future_grid = select_future_sample_grid(
         nuscenes=nuscenes,
-        sample=sample,
+        sample_token=sample_token,
         horizon_sec=horizon_sec,
         sample_interval_sec=sample_interval_sec,
         time_tolerance_sec=time_tolerance_sec,
     )
-    if future_error is not None:
-        return SampleDecision(None, future_error)
+    if future_grid.exclusion_reason is not None:
+        return SampleDecision(None, future_grid.exclusion_reason)
 
     try:
         trajectory = extract_future_ego_trajectory(
@@ -409,6 +406,7 @@ def evaluate_sample(
             horizon_sec=horizon_sec,
             sample_interval_sec=sample_interval_sec,
             time_tolerance_sec=time_tolerance_sec,
+            future_grid=future_grid,
         )
         result = derive_meta_action(
             trajectory.points,
@@ -417,8 +415,8 @@ def evaluate_sample(
         )
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
         return SampleDecision(None, "label_derivation_error")
-    if trajectory.is_truncated:
-        return SampleDecision(None, "timestamp_out_of_tolerance")
+    if trajectory.is_truncated != (not future_grid.horizon_covered):
+        raise ValueError("future grid and trajectory truncation disagree")
 
     try:
         motion = current_ego_motion(nuscenes, sample_token, CAMERA_CHANNEL)
@@ -436,6 +434,28 @@ def evaluate_sample(
     timestamp = sample.get("timestamp")
     if not isinstance(timestamp, int) or isinstance(timestamp, bool):
         return SampleDecision(None, "other_error")
+    source_audit_record = None
+    audit_status = "unaudited"
+    if audit_row is not None:
+        if audit_row.scene_token != expected_scene_token:
+            raise ValueError(f"{sample_token}: audit scene_token mismatch")
+        if int(audit_row.timestamp) != timestamp:
+            raise ValueError(f"{sample_token}: audit timestamp mismatch")
+        if audit_row.cam_front_path != portable_path.as_posix():
+            raise ValueError(f"{sample_token}: audit CAM_FRONT path mismatch")
+        if audit_row.reviewed_action != result.derived_action:
+            raise ValueError(
+                f"{sample_token}: audit action does not match frozen action"
+            )
+        audit_status = "audited"
+        source_audit_record = SourceAuditRecord(
+            source_audit=audit_row.source_audit,
+            sample_token=audit_row.sample_token,
+            historical_derived_action=audit_row.historical_derived_action,
+            reviewed_action=audit_row.reviewed_action,
+            label_correct=audit_row.label_correct,
+            historical_label_rule_version=audit_row.label_rule_version,
+        )
     record = TrainvalManifestRecord(
         sample_token=sample_token,
         scene_token=expected_scene_token,
@@ -454,8 +474,9 @@ def evaluate_sample(
         official_split=official_split,
         split_seed=split_seed,
         split_strategy_version=split_strategy_version,
-        audit_status="unaudited",
-        source_audit_record=None,
+        split_mapping_sha256=split_mapping_sha256,
+        audit_status=audit_status,
+        source_audit_record=source_audit_record,
     )
     return SampleDecision(record, None)
 
@@ -490,6 +511,8 @@ def build_records(
     official_splits: Mapping[str, str],
     split_seed: int,
     split_strategy_version: str,
+    split_mapping_sha256: str,
+    audit_index: Mapping[str, HistoricalAuditRow],
     dataroot: Path,
     rules: MetaActionRules,
     horizon_sec: float,
@@ -499,6 +522,7 @@ def build_records(
 ) -> BuildResult:
     records = []
     exclusions = Counter[str]()
+    audit_outcomes = {}
     scanned_sample_count = 0
     for scene_token in scene_tokens:
         split = scene_splits[scene_token]
@@ -512,6 +536,8 @@ def build_records(
                 official_split=official_splits[scene_token],
                 split_seed=split_seed,
                 split_strategy_version=split_strategy_version,
+                split_mapping_sha256=split_mapping_sha256,
+                audit_row=audit_index.get(sample_token),
                 dataroot=dataroot,
                 rules=rules,
                 horizon_sec=horizon_sec,
@@ -523,10 +549,17 @@ def build_records(
                 records.append(decision.record)
             elif decision.exclusion_reason is not None:
                 exclusions[decision.exclusion_reason] += 1
+            if sample_token in audit_index:
+                audit_outcomes[sample_token] = (
+                    "included"
+                    if decision.record is not None
+                    else str(decision.exclusion_reason)
+                )
     return BuildResult(
         records=tuple(records),
         scanned_sample_count=scanned_sample_count,
         exclusion_counts={reason: exclusions[reason] for reason in EXCLUSION_REASONS},
+        audit_outcomes=audit_outcomes,
     )
 
 
@@ -537,6 +570,7 @@ def build_scene_label_statistics(
     official_splits: Mapping[str, str],
     split_seed: int,
     split_strategy_version: str,
+    audit_index: Mapping[str, HistoricalAuditRow],
     dataroot: Path,
     rules: MetaActionRules,
     horizon_sec: float,
@@ -549,6 +583,7 @@ def build_scene_label_statistics(
     exclusions = Counter[str]()
     scanned_sample_count = 0
     included_sample_count = 0
+    audit_outcomes = {}
     for scene_token in sorted(scene_tokens):
         result = build_records(
             nuscenes=nuscenes,
@@ -557,6 +592,8 @@ def build_scene_label_statistics(
             official_splits=official_splits,
             split_seed=split_seed,
             split_strategy_version=split_strategy_version,
+            split_mapping_sha256=UNFROZEN_SPLIT_MAPPING_SHA256,
+            audit_index=audit_index,
             dataroot=dataroot,
             rules=rules,
             horizon_sec=horizon_sec,
@@ -572,6 +609,10 @@ def build_scene_label_statistics(
         exclusions.update(result.exclusion_counts)
         scanned_sample_count += result.scanned_sample_count
         included_sample_count += len(result.records)
+        duplicate_audit_tokens = set(audit_outcomes) & set(result.audit_outcomes)
+        if duplicate_audit_tokens:
+            raise ValueError("audit token was scanned more than once")
+        audit_outcomes.update(result.audit_outcomes)
     scene_support = {
         action: sum(
             histogram[action] > 0 for histogram in histograms.values()
@@ -587,6 +628,7 @@ def build_scene_label_statistics(
         scanned_sample_count=scanned_sample_count,
         included_sample_count=included_sample_count,
         exclusion_counts={reason: exclusions[reason] for reason in EXCLUSION_REASONS},
+        audit_outcomes=audit_outcomes,
     )
 
 
@@ -594,6 +636,7 @@ def build_full_scene_splits(
     nuscenes: NuScenes,
     split_seed: int,
     split_strategy_version: str,
+    audit_index: Mapping[str, HistoricalAuditRow],
     dataroot: Path,
     rules: MetaActionRules,
     horizon_sec: float,
@@ -614,6 +657,7 @@ def build_full_scene_splits(
         official_splits=official_splits,
         split_seed=split_seed,
         split_strategy_version=split_strategy_version,
+        audit_index=audit_index,
         dataroot=dataroot,
         rules=rules,
         horizon_sec=horizon_sec,
@@ -629,6 +673,16 @@ def build_full_scene_splits(
         action_schema=ACTION_SCHEMA,
         split_strategy_version=split_strategy_version,
     )
+    if not stratified.quality.constraints_satisfied:
+        unsatisfied = [
+            asdict(status)
+            for status in stratified.quality.constraint_statuses
+            if not status.constraint_satisfied
+        ]
+        raise ValueError(
+            "stratified split constraints are not satisfied: "
+            + json.dumps(unsatisfied, sort_keys=True)
+        )
     random_assignments = assign_fixed_random_scene_splits(
         scene_tokens=official_tokens.train,
         seed=split_seed,
@@ -653,6 +707,7 @@ def build_full_scene_splits(
         official_splits=official_splits,
         split_seed=split_seed,
         split_strategy_version=split_strategy_version,
+        audit_index=audit_index,
         dataroot=dataroot,
         rules=rules,
         horizon_sec=horizon_sec,
@@ -774,6 +829,26 @@ def _scene_overlap_count(scene_splits: Mapping[str, str]) -> int:
     )
 
 
+def _record_has_absolute_path_leak(
+    record: TrainvalManifestRecord,
+    dataroot: Path,
+    derived_root: Path,
+) -> bool:
+    roots = (str(dataroot), str(derived_root))
+
+    def contains_root(value: object) -> bool:
+        if isinstance(value, Mapping):
+            return any(contains_root(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_root(item) for item in value)
+        return isinstance(value, str) and any(root in value for root in roots)
+
+    return (
+        not is_valid_cam_front_path(record.cam_front_path)
+        or contains_root(json_record(record))
+    )
+
+
 def pilot_summary(
     result: BuildResult,
     selected_scene_tokens: Sequence[str],
@@ -787,18 +862,13 @@ def pilot_summary(
         split: tuple(record for record in result.records if record.split == split)
         for split in SPLITS
     }
-    serialized_records = tuple(
-        json.dumps(json_record(record)) for record in result.records
-    )
     absolute_path_leaks = sum(
-        PurePosixPath(record.cam_front_path).is_absolute()
-        or str(dataroot) in serialized
-        or str(derived_root) in serialized
-        for record, serialized in zip(
-            result.records,
-            serialized_records,
-            strict=True,
+        _record_has_absolute_path_leak(
+            record,
+            dataroot,
+            derived_root,
         )
+        for record in result.records
     )
     return {
         "full_scene_count": len(scene_splits),
@@ -832,6 +902,15 @@ def pilot_summary(
         "label_rule_version": LABEL_RULE_VERSION,
         "split_seed": split_seed,
         "split_strategy_version": split_strategy_version,
+        "split_mapping_sha256": (
+            result.records[0].split_mapping_sha256 if result.records else None
+        ),
+        "audited_record_count": sum(
+            record.audit_status == "audited" for record in result.records
+        ),
+        "unaudited_record_count": sum(
+            record.audit_status == "unaudited" for record in result.records
+        ),
         "absolute_path_leak_count": absolute_path_leaks,
         "absolute_path_leak_check": (
             "pass" if absolute_path_leaks == 0 else "fail"
@@ -850,6 +929,8 @@ def diagnostic_results(
     official_splits: Mapping[str, str],
     split_seed: int,
     split_strategy_version: str,
+    split_mapping_sha256: str,
+    audit_index: Mapping[str, HistoricalAuditRow],
     dataroot: Path,
     rules: MetaActionRules,
     horizon_sec: float,
@@ -869,6 +950,8 @@ def diagnostic_results(
             official_split=official_splits[scene_token],
             split_seed=split_seed,
             split_strategy_version=split_strategy_version,
+            split_mapping_sha256=split_mapping_sha256,
+            audit_row=audit_index.get(sample_token),
             dataroot=dataroot,
             rules=rules,
             horizon_sec=horizon_sec,
@@ -904,9 +987,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
     config = load_config(arguments.config)
     dataroot = _environment_path("NUSCENES_ROOT")
-    derived_root = _environment_path("VLA_DERIVED_ROOT")
+    derived_root = _environment_path(
+        "VLA_DERIVED_ROOT",
+        require_absolute=True,
+    )
     trajectory_config = load_trajectory_config(config.data_config_path)
     rules = load_meta_action_rules(config.action_config_path)
+    audit_index = load_audit_index(
+        config.base_audit_path,
+        config.supplement_audit_path,
+    )
     if config.version != "v1.0-trainval":
         raise ValueError("trainval builder requires version v1.0-trainval")
     if config.split_seed != PHASE0_SPLIT_SEED:
@@ -930,6 +1020,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         nuscenes=nuscenes,
         split_seed=config.split_seed,
         split_strategy_version=config.split_strategy_version,
+        audit_index=audit_index,
         dataroot=dataroot,
         rules=rules,
         horizon_sec=trajectory_config.horizon_sec,
@@ -937,9 +1028,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         time_tolerance_sec=trajectory_config.trajectory_time_tolerance_sec,
         agent_radius_m=trajectory_config.nearby_radius_m,
     )
+    scene_histogram_sha256 = hash_scene_histograms(
+        full_split.train_statistics.scene_histograms
+    )
+    mapping_payload = build_scene_mapping_payload(
+        nuscenes_version=config.version,
+        official_splits=full_split.official_splits,
+        project_splits=full_split.scene_splits,
+        split_seed=config.split_seed,
+        split_strategy_version=config.split_strategy_version,
+        label_rule_version=LABEL_RULE_VERSION,
+        scene_histogram_sha256=scene_histogram_sha256,
+    )
+    mapping_path = output_path(
+        derived_root,
+        config.scene_split_mapping_relative_path,
+    )
+    split_mapping_sha256 = ensure_scene_mapping(
+        mapping_path,
+        mapping_payload,
+        allow_create=arguments.pilot,
+    )
+    split_summary = full_split_summary(full_split, config.split_seed)
+    split_summary.update(
+        {
+            "scene_histogram_sha256": scene_histogram_sha256,
+            "scene_split_mapping_sha256": split_mapping_sha256,
+            "audit_tokens": audit_token_summary(full_split, audit_index),
+        }
+    )
     print(
         json.dumps(
-            {"full_split_summary": full_split_summary(full_split, config.split_seed)},
+            {"full_split_summary": split_summary},
             indent=2,
             sort_keys=True,
         )
@@ -963,6 +1083,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         official_splits=full_split.official_splits,
         split_seed=config.split_seed,
         split_strategy_version=config.split_strategy_version,
+        split_mapping_sha256=split_mapping_sha256,
+        audit_index=audit_index,
         dataroot=dataroot,
         rules=rules,
         horizon_sec=trajectory_config.horizon_sec,
@@ -971,10 +1093,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         agent_radius_m=trajectory_config.nearby_radius_m,
     )
     manifest_path = output_path(derived_root, relative_output)
-    write_jsonl_records(result.records, manifest_path)
+    write_jsonl_records(
+        result.records,
+        manifest_path,
+        validator=validate_manifest,
+    )
     validation = validate_manifest(manifest_path)
     if validation.sample_count != len(result.records):
         raise ValueError("written manifest sample count does not match records")
+    if validation.split_mapping_sha256 != split_mapping_sha256:
+        raise ValueError("written manifest split mapping hash does not match sidecar")
 
     summary = pilot_summary(
         result=result,
@@ -994,6 +1122,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             official_splits=full_split.official_splits,
             split_seed=config.split_seed,
             split_strategy_version=config.split_strategy_version,
+            split_mapping_sha256=split_mapping_sha256,
+            audit_index=audit_index,
             dataroot=dataroot,
             rules=rules,
             horizon_sec=trajectory_config.horizon_sec,
@@ -1003,6 +1133,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(json.dumps({"diagnostics": diagnostics}, indent=2, sort_keys=True))
     print(f"manifest_relative_path: {relative_output.as_posix()}")
+    print(
+        "scene_split_mapping_relative_path: "
+        f"{config.scene_split_mapping_relative_path.as_posix()}"
+    )
     return 0
 
 

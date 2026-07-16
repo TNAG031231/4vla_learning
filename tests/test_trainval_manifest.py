@@ -2,6 +2,7 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,10 +12,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from data import build_trainval_manifest as trainval_builder
 from data.derive_meta_action import MetaActionRules, load_meta_action_rules
+from data.validate_label_freeze import HistoricalAuditRow
 from src.actions.schema import ACTION_SCHEMA, LABEL_RULE_VERSION
 from src.phase0.manifest import write_jsonl_records
 from src.phase0.protocol import read_manifest_samples, validate_manifest
-from src.phase0.stratified_split import assign_stratified_scene_splits
+from src.phase0.stratified_split import (
+    ActionConstraintStatus,
+    assign_stratified_scene_splits,
+    evaluate_scene_split,
+)
 
 
 class FakeNuScenes:
@@ -89,6 +95,7 @@ def evaluate(
     reader: FakeNuScenes,
     dataroot: Path,
     sample_token: str = "sample-0",
+    audit_row: HistoricalAuditRow | None = None,
 ) -> trainval_builder.SampleDecision:
     return trainval_builder.evaluate_sample(
         nuscenes=reader,
@@ -100,12 +107,34 @@ def evaluate(
         split_strategy_version=(
             "official_train_scene_label_stratified_v1"
         ),
+        split_mapping_sha256="a" * 64,
+        audit_row=audit_row,
         dataroot=dataroot,
         rules=rules(),
         horizon_sec=3.0,
         sample_interval_sec=0.5,
         time_tolerance_sec=0.075,
         agent_radius_m=50.0,
+    )
+
+
+def audit_row_for_record(
+    record: trainval_builder.TrainvalManifestRecord,
+    reviewed_action: str | None = None,
+) -> HistoricalAuditRow:
+    action = reviewed_action or record.meta_action
+    return HistoricalAuditRow(
+        source_audit="base",
+        sample_token=record.sample_token,
+        scene_token=record.scene_token,
+        timestamp=str(record.timestamp),
+        cam_front_path=record.cam_front_path,
+        historical_derived_action=action,
+        reviewed_action=action,
+        label_correct="yes",
+        trajectory_alignment_correct="yes",
+        agent_alignment_correct="yes",
+        label_rule_version="phase-1.6-meta-action-v0.1",
     )
 
 
@@ -140,6 +169,47 @@ def test_complete_sample_builds_unaudited_trainval_record(
         "left_lateral",
         "right_lateral",
     )
+
+
+def test_audited_trainval_record_preserves_source_provenance(
+    tmp_path: Path,
+) -> None:
+    reader = build_scene(tmp_path, tuple(index * 500_000 for index in range(8)))
+    unaudited = evaluate(reader, tmp_path)
+    assert unaudited.record is not None
+    audit_row = audit_row_for_record(unaudited.record)
+
+    audited = evaluate(reader, tmp_path, audit_row=audit_row)
+    assert audited.record is not None
+    manifest_path = tmp_path / "audited.jsonl"
+    write_jsonl_records(
+        (audited.record,),
+        manifest_path,
+        validator=validate_manifest,
+    )
+
+    assert audited.record.audit_status == "audited"
+    assert audited.record.source_audit_record is not None
+    assert audited.record.source_audit_record.reviewed_action == (
+        audited.record.meta_action
+    )
+    assert audited.record.source_audit_record.historical_label_rule_version == (
+        "phase-1.6-meta-action-v0.1"
+    )
+
+
+def test_audit_action_mismatch_fails_build(tmp_path: Path) -> None:
+    reader = build_scene(tmp_path, tuple(index * 500_000 for index in range(8)))
+    unaudited = evaluate(reader, tmp_path)
+    assert unaudited.record is not None
+    mismatched_action = next(
+        action for action in ACTION_SCHEMA
+        if action != unaudited.record.meta_action
+    )
+    audit_row = audit_row_for_record(unaudited.record, mismatched_action)
+
+    with pytest.raises(ValueError, match="audit action does not match frozen"):
+        evaluate(reader, tmp_path, audit_row=audit_row)
 
 
 @pytest.mark.parametrize(
@@ -213,6 +283,8 @@ def test_split_mapping_is_fixed_before_sample_filtering(tmp_path: Path) -> None:
         split_strategy_version=(
             "official_train_scene_label_stratified_v1"
         ),
+        split_mapping_sha256="a" * 64,
+        audit_index={},
         dataroot=tmp_path,
         rules=rules(),
         horizon_sec=3.0,
@@ -248,6 +320,162 @@ def test_trainval_manifest_can_be_validated_and_reloaded(
 def test_output_path_must_remain_under_derived_root(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="relative to VLA_DERIVED_ROOT"):
         trainval_builder.output_path(tmp_path, Path("../outside.jsonl"))
+
+
+def test_derived_root_environment_path_must_be_absolute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLA_DERIVED_ROOT", "relative/output")
+
+    with pytest.raises(ValueError, match="must be an absolute path"):
+        trainval_builder._environment_path(
+            "VLA_DERIVED_ROOT",
+            require_absolute=True,
+        )
+
+
+def test_unsatisfied_rare_class_constraint_stops_before_artifact_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    official_tokens = trainval_builder.OfficialSceneTokens(
+        train=tuple(f"train-{index:03d}" for index in range(700)),
+        val=tuple(f"val-{index:03d}" for index in range(150)),
+    )
+    statistics = trainval_builder.SceneLabelStatistics(
+        scene_histograms={
+            token: {action: 0 for action in ACTION_SCHEMA}
+            for token in official_tokens.train
+        },
+        sample_distribution={action: 0 for action in ACTION_SCHEMA},
+        scene_support={action: 0 for action in ACTION_SCHEMA},
+        scanned_sample_count=0,
+        included_sample_count=0,
+        exclusion_counts={},
+        audit_outcomes={},
+    )
+    failed_status = ActionConstraintStatus(
+        action="left_lateral",
+        total_sample_count=1,
+        total_scene_support=1,
+        train_sample_count=0,
+        train_scene_support=0,
+        validation_sample_count=1,
+        validation_scene_support=1,
+        constraint_satisfied=False,
+        unsatisfied_reason="class_absent_from_train;total_scene_support=1",
+    )
+    stratified = SimpleNamespace(
+        quality=SimpleNamespace(
+            constraints_satisfied=False,
+            constraint_statuses=(failed_status,),
+        )
+    )
+    monkeypatch.setattr(
+        trainval_builder,
+        "resolve_official_scene_tokens",
+        lambda _nuscenes: official_tokens,
+    )
+    monkeypatch.setattr(
+        trainval_builder,
+        "build_scene_label_statistics",
+        lambda **_kwargs: statistics,
+    )
+    monkeypatch.setattr(
+        trainval_builder,
+        "assign_stratified_scene_splits",
+        lambda **_kwargs: stratified,
+    )
+
+    with pytest.raises(ValueError, match="constraints are not satisfied"):
+        trainval_builder.build_full_scene_splits(
+            nuscenes=FakeNuScenes(),
+            split_seed=20260710,
+            split_strategy_version=(
+                "official_train_scene_label_stratified_v1"
+            ),
+            audit_index={},
+            dataroot=tmp_path,
+            rules=rules(),
+            horizon_sec=3.0,
+            sample_interval_sec=0.5,
+            time_tolerance_sec=0.075,
+            agent_radius_m=50.0,
+        )
+
+    assert tuple(tmp_path.iterdir()) == ()
+
+
+def test_satisfied_constraints_allow_full_scene_split(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    official_tokens = trainval_builder.OfficialSceneTokens(
+        train=tuple(f"train-{index:03d}" for index in range(700)),
+        val=tuple(f"val-{index:03d}" for index in range(150)),
+    )
+    scene_histograms = {
+        token: {action: 0 for action in ACTION_SCHEMA}
+        for token in official_tokens.train
+    }
+    statistics = trainval_builder.SceneLabelStatistics(
+        scene_histograms=scene_histograms,
+        sample_distribution={action: 0 for action in ACTION_SCHEMA},
+        scene_support={action: 0 for action in ACTION_SCHEMA},
+        scanned_sample_count=0,
+        included_sample_count=0,
+        exclusion_counts={},
+        audit_outcomes={},
+    )
+    assignments = {
+        token: "train" if index < 560 else "validation"
+        for index, token in enumerate(official_tokens.train)
+    }
+    quality = evaluate_scene_split(
+        scene_histograms,
+        assignments,
+        ACTION_SCHEMA,
+    )
+    stratified = SimpleNamespace(
+        assignments=assignments,
+        quality=quality,
+        refinement_count=0,
+    )
+    monkeypatch.setattr(
+        trainval_builder,
+        "resolve_official_scene_tokens",
+        lambda _nuscenes: official_tokens,
+    )
+    monkeypatch.setattr(
+        trainval_builder,
+        "build_scene_label_statistics",
+        lambda **_kwargs: statistics,
+    )
+    monkeypatch.setattr(
+        trainval_builder,
+        "assign_stratified_scene_splits",
+        lambda **_kwargs: stratified,
+    )
+
+    result = trainval_builder.build_full_scene_splits(
+        nuscenes=FakeNuScenes(),
+        split_seed=20260710,
+        split_strategy_version="official_train_scene_label_stratified_v1",
+        audit_index={},
+        dataroot=tmp_path,
+        rules=rules(),
+        horizon_sec=3.0,
+        sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
+        agent_radius_m=50.0,
+    )
+
+    assert result.stratified_quality.constraints_satisfied
+    assert Counter(result.scene_splits.values()) == {
+        "train": 560,
+        "validation": 140,
+        "test": 150,
+    }
 
 
 def test_official_scene_resolution_and_project_mapping_have_exact_counts() -> None:

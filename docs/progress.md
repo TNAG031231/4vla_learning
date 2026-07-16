@@ -64,6 +64,7 @@ split
 official_split
 split_seed
 split_strategy_version
+split_mapping_sha256
 manifest_schema_version
 audit_status
 source_audit_record
@@ -76,8 +77,9 @@ source_audit_record
 - 历史 source audit 的路径、alignment 与 v0.1 rule version 已重新核验；`label_correct=yes=103/no=5` 保持为历史事实，108 条历史 CAM_FRONT 路径均与当前派生路径一致。
 - VRU presence（当前 sample、配置半径内）：`yes=89`、`no=19`；strict boundary-flag cases=17，diagnostic cases=46，含 lateral、speed 与 stop 相关 flags。
 - `safety_rule_version=not_available`；安全审核从 Phase 1 开始，不是本次 label freeze gate 的完成条件。
-- 正式 trainval schema 为 `phase0_trainval_dataset_manifest_v1`，pilot records 均为 `audit_status=unaudited`、`source_audit_record=null`；现有 `phase0_audited_seed_subset_v1` 保持兼容。
+- 正式 trainval schema 为 `phase0_trainval_dataset_manifest_v1`，支持已有 audit token 的 `audited` 完整来源与未匹配记录的 `unaudited/null`；现有 `phase0_audited_seed_subset_v1` 保持兼容。本次固定 20-scene pilot 未抽中历史 audit token，因此实际为 `audited=0`、`unaudited=533`；完整 850-scene 扫描确认 108 个 audit token 全部匹配、0 过滤、0 缺失。
 - official train 有效样本 17847 条，六类分布为 `keep=6322`、`accelerate=1857`、`decelerate=2860`、`stop=3044`、`left_lateral=1691`、`right_lateral=2073`；stratified/fixed-random objective 分别为 `0.0020518908` / `0.0605638706`。
+- 完整 scene mapping sidecar 位于 `VLA_DERIVED_ROOT` 且不进入 Git：850 scenes 映射为 project train/validation/test `560/140/150`，mapping SHA-256 为 `a96e04aaf068e75b0aa3ecb8412dc5b35fea2412d7090bbee0a6661132923b12`，scene histogram SHA-256 为 `0cee51a6f64e3f2e10382ca7672cc0aa1386065a3fe8a1f927f5469e211a11a2`；六类硬约束均满足。
 - 新 trainval pilot 排除统计：`insufficient_remaining_horizon=124`、`timestamp_out_of_tolerance=147`，其余正式排除原因均为 0；motion availability 为 `full=501`、`partial=17`、`unavailable=15`。
 
 ## Open Questions / Pending Verification

@@ -4,7 +4,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import random
 from typing import Final, Sequence
 
@@ -65,6 +65,7 @@ class ManifestValidationSummary:
     manifest_schema_version: str
     label_rule_version: str
     motion_availability_distribution: dict[str, int]
+    split_mapping_sha256: str | None
 
 
 def assign_scene_splits(
@@ -242,11 +243,51 @@ def _required_number(mapping: Mapping[str, object], key: str) -> float:
     return float(value)
 
 
+def is_valid_cam_front_path(path_value: str) -> bool:
+    posix_path = PurePosixPath(path_value)
+    windows_path = PureWindowsPath(path_value)
+    return (
+        "\\" not in path_value
+        and not posix_path.is_absolute()
+        and not windows_path.is_absolute()
+        and not windows_path.drive
+        and ".." not in posix_path.parts
+        and len(posix_path.parts) == 3
+        and posix_path.parts[:2] == ("samples", "CAM_FRONT")
+        and bool(posix_path.name)
+    )
+
+
 def _validate_cam_front_path(row: Mapping[str, object]) -> None:
     path_value = _required_string(row, "cam_front_path")
-    path = PurePosixPath(path_value)
-    if path.is_absolute() or ".." in path.parts:
-        raise ValueError("cam_front_path must be relative to NUSCENES_ROOT")
+    if not is_valid_cam_front_path(path_value):
+        raise ValueError(
+            "cam_front_path must be under samples/CAM_FRONT/ and relative "
+            "to NUSCENES_ROOT"
+        )
+
+
+def _validate_source_audit_record(
+    row: Mapping[str, object],
+    source_audit_record: Mapping[str, object],
+) -> None:
+    _required_string(source_audit_record, "source_audit")
+    if _required_string(source_audit_record, "sample_token") != _required_string(
+        row,
+        "sample_token",
+    ):
+        raise ValueError("source audit sample_token must match manifest row")
+    normalize_action(
+        _required_string(source_audit_record, "historical_derived_action")
+    )
+    reviewed_action = normalize_action(
+        _required_string(source_audit_record, "reviewed_action")
+    )
+    if reviewed_action != normalize_action(_required_string(row, "meta_action")):
+        raise ValueError("source audit reviewed_action must match frozen action")
+    if source_audit_record.get("label_correct") not in {"yes", "no"}:
+        raise ValueError("source audit label_correct must be yes or no")
+    _required_string(source_audit_record, "historical_label_rule_version")
 
 
 def _validate_audit_fields(
@@ -256,11 +297,20 @@ def _validate_audit_fields(
     audit_status = row.get("audit_status")
     source_audit_record = row.get("source_audit_record")
     if schema_version == TRAINVAL_MANIFEST_SCHEMA_VERSION:
-        if audit_status != "unaudited":
-            raise ValueError("trainval manifest audit_status must be unaudited")
-        if source_audit_record is not None:
-            raise ValueError("unaudited source_audit_record must be null")
-        return
+        if audit_status == "unaudited":
+            if source_audit_record is not None:
+                raise ValueError("unaudited source_audit_record must be null")
+            return
+        if audit_status == "audited":
+            if not isinstance(source_audit_record, Mapping):
+                raise ValueError(
+                    "audited trainval source_audit_record must be a mapping"
+                )
+            _validate_source_audit_record(row, source_audit_record)
+            return
+        raise ValueError(
+            "trainval manifest audit_status must be audited or unaudited"
+        )
     if audit_status is not None and audit_status != "audited":
         raise ValueError("audited manifest audit_status must be audited")
     if "source_audit_record" in row and not isinstance(
@@ -394,6 +444,7 @@ def validate_manifest(path: Path) -> ManifestValidationSummary:
     label_rule_versions = set()
     manifest_samples = []
     motion_availability = Counter[str]()
+    split_mapping_hashes = set()
     for row in rows:
         sample_token = _required_string(row, "sample_token")
         if sample_token in sample_tokens:
@@ -410,6 +461,9 @@ def validate_manifest(path: Path) -> ManifestValidationSummary:
         _validate_audit_fields(row, schema_version)
         if schema_version == TRAINVAL_MANIFEST_SCHEMA_VERSION:
             _validate_trainval_split_fields(row)
+            split_mapping_hashes.add(
+                _required_string(row, "split_mapping_sha256")
+            )
         pose_timestamp_source = _validate_pose(row)
         availability, motion_timestamp_source = _validate_motion(row)
         if motion_timestamp_source != pose_timestamp_source:
@@ -440,12 +494,21 @@ def validate_manifest(path: Path) -> ManifestValidationSummary:
         raise ValueError("manifest_schema_version must be singular")
     if len(label_rule_versions) != 1:
         raise ValueError("label_rule_version must be singular")
+    schema_version = schema_versions.pop()
+    if (
+        schema_version == TRAINVAL_MANIFEST_SCHEMA_VERSION
+        and len(split_mapping_hashes) != 1
+    ):
+        raise ValueError("trainval split_mapping_sha256 must be singular")
     return ManifestValidationSummary(
         sample_count=len(rows),
         scene_count=len({sample.scene_token for sample in manifest_samples}),
-        manifest_schema_version=schema_versions.pop(),
+        manifest_schema_version=schema_version,
         label_rule_version=label_rule_versions.pop(),
         motion_availability_distribution=dict(motion_availability),
+        split_mapping_sha256=(
+            split_mapping_hashes.pop() if split_mapping_hashes else None
+        ),
     )
 
 

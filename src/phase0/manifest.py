@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, is_dataclass
 import json
 import math
+import os
 from pathlib import Path
-from typing import Protocol, Sequence
+import tempfile
+from typing import Callable, Protocol, TextIO
 
 from pyquaternion import Quaternion
 
@@ -93,11 +95,64 @@ def json_record(record: object) -> dict[str, object]:
     return payload
 
 
-def write_jsonl_records(records: Sequence[object], output_path: Path) -> None:
+def _atomic_text_write(
+    output_path: Path,
+    writer: Callable[[TextIO], None],
+    validator: Callable[[Path], object] | None = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as output_file:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output_file:
+            temporary_path = Path(output_file.name)
+            writer(output_file)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        if validator is not None:
+            validator(temporary_path)
+        os.replace(temporary_path, output_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def write_jsonl_records(
+    records: Iterable[object],
+    output_path: Path,
+    validator: Callable[[Path], object] | None = None,
+) -> None:
+    def write_records(output_file: TextIO) -> None:
         for record in records:
-            output_file.write(json.dumps(json_record(record)) + "\n")
+            output_file.write(
+                json.dumps(json_record(record), separators=(",", ":")) + "\n"
+            )
+
+    _atomic_text_write(output_path, write_records, validator)
+
+
+def write_canonical_json(
+    payload: Mapping[str, object],
+    output_path: Path,
+    validator: Callable[[Path], object] | None = None,
+) -> None:
+    def write_payload(output_file: TextIO) -> None:
+        json.dump(
+            payload,
+            output_file,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    _atomic_text_write(output_path, write_payload, validator)
 
 
 def _mapping_value(
