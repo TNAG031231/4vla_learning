@@ -25,11 +25,11 @@ from inspect_nuscenes_sample import (
     extract_future_ego_trajectory,
     get_nearby_agents,
 )
-from src.actions.schema import ACTION_SCHEMA
+from src.actions.schema import ACTION_SCHEMA, LABEL_RULE_VERSION
 
 
 EXPECTED_TOTAL_SAMPLES = 108
-EXPECTED_LABEL_RULE_VERSION = "phase-1.6-meta-action-v0.2"
+EXPECTED_LABEL_RULE_VERSION = LABEL_RULE_VERSION
 EXPECTED_ACTION_DISTRIBUTION = Counter(
     {
         "accelerate": 6,

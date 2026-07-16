@@ -247,6 +247,16 @@ def test_motion_without_two_past_intervals_is_partial() -> None:
     assert motion["unavailable_reason"] == "insufficient_past_history_for_acceleration"
 
 
+def test_motion_with_missing_past_pose_is_unavailable() -> None:
+    reader = build_motion_reader()
+    del reader.tables["ego_pose"]["pose-previous"]
+
+    motion = manifest_builder.current_ego_motion(reader, "current")
+
+    assert motion["availability"] == "unavailable"
+    assert motion["unavailable_reason"] == "past_ego_pose_unavailable"
+
+
 def test_motion_does_not_cross_scenes() -> None:
     reader = build_motion_reader(previous_scene_token="scene-b")
 

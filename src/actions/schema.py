@@ -7,6 +7,7 @@ DECELERATE: Final = "decelerate"
 STOP: Final = "stop"
 LEFT_LATERAL: Final = "left_lateral"
 RIGHT_LATERAL: Final = "right_lateral"
+LABEL_RULE_VERSION: Final = "phase-1.6-meta-action-v0.2"
 
 ACTION_SCHEMA: Final = (
     KEEP,

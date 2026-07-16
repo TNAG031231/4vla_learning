@@ -15,6 +15,7 @@ from src.phase0.protocol import (
     complete_action_distribution,
     evaluate_classification,
     read_manifest_samples,
+    select_pilot_scene_tokens,
     validate_manifest,
     validate_scene_split_isolation,
 )
@@ -54,6 +55,27 @@ def test_scene_level_split_rejects_same_scene_across_splits() -> None:
 
     with pytest.raises(ValueError, match="scene_token spans splits"):
         validate_scene_split_isolation(samples)
+
+
+def test_pilot_scene_selection_is_reproducible_and_covers_all_splits() -> None:
+    scene_splits = {
+        **{f"train-{index}": "train" for index in range(560)},
+        **{f"validation-{index}": "validation" for index in range(140)},
+        **{f"test-{index}": "test" for index in range(150)},
+    }
+    frozen_mapping = dict(scene_splits)
+
+    first = select_pilot_scene_tokens(scene_splits, scene_count=20, seed=20260715)
+    second = select_pilot_scene_tokens(scene_splits, scene_count=20, seed=20260715)
+
+    assert first == second
+    assert scene_splits == frozen_mapping
+    assert len(first) == len(set(first)) == 20
+    assert Counter(scene_splits[token] for token in first) == {
+        "train": 13,
+        "validation": 3,
+        "test": 4,
+    }
 
 
 def test_metrics_keep_all_actions_when_split_has_missing_classes() -> None:
@@ -214,6 +236,52 @@ def test_complete_manifest_validator_accepts_contract(tmp_path: Path) -> None:
     assert summary.scene_count == 1
     assert summary.manifest_schema_version == "phase0_audited_seed_subset_v1"
     assert summary.label_rule_version == "phase-1.6-meta-action-v0.2"
+
+
+def test_trainval_manifest_validator_accepts_unaudited_contract(
+    tmp_path: Path,
+) -> None:
+    row = manifest_row()
+    row["manifest_schema_version"] = "phase0_trainval_dataset_manifest_v1"
+    row["audit_status"] = "unaudited"
+    row["source_audit_record"] = None
+    row["official_split"] = "train"
+    row["split_seed"] = 20260710
+    row["split_strategy_version"] = (
+        "official_train_scene_label_stratified_v1"
+    )
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    summary = validate_manifest(manifest_path)
+
+    assert summary.manifest_schema_version == "phase0_trainval_dataset_manifest_v1"
+
+
+def test_trainval_manifest_validator_rejects_audit_record(
+    tmp_path: Path,
+) -> None:
+    row = manifest_row()
+    row["manifest_schema_version"] = "phase0_trainval_dataset_manifest_v1"
+    row["audit_status"] = "unaudited"
+    row["source_audit_record"] = {"source_audit": "unexpected"}
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_audit_record must be null"):
+        validate_manifest(manifest_path)
+
+
+def test_manifest_validator_rejects_absolute_cam_front_path(
+    tmp_path: Path,
+) -> None:
+    row = manifest_row()
+    row["cam_front_path"] = "/private/data/image.jpg"
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="relative to NUSCENES_ROOT"):
+        validate_manifest(manifest_path)
 
 
 def test_complete_manifest_validator_rejects_duplicate_sample_token(

@@ -4,15 +4,26 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import random
 from typing import Final, Sequence
 
 from src.actions.schema import ACTION_SCHEMA, is_valid_action, normalize_action
+from src.phase0.stratified_split import SPLIT_STRATEGY_VERSION
 
 
 SPLITS: Final = ("train", "validation", "test")
-MANIFEST_SCHEMA_VERSION: Final = "phase0_audited_seed_subset_v1"
+AUDITED_MANIFEST_SCHEMA_VERSION: Final = "phase0_audited_seed_subset_v1"
+TRAINVAL_MANIFEST_SCHEMA_VERSION: Final = "phase0_trainval_dataset_manifest_v1"
+MANIFEST_SCHEMA_VERSION: Final = AUDITED_MANIFEST_SCHEMA_VERSION
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS: Final = frozenset(
+    (AUDITED_MANIFEST_SCHEMA_VERSION, TRAINVAL_MANIFEST_SCHEMA_VERSION)
+)
+PHASE0_SPLIT_SEED: Final = 20260710
+OFFICIAL_TRAIN_SCENE_COUNT: Final = 700
+OFFICIAL_VAL_SCENE_COUNT: Final = 150
+PROJECT_TRAIN_SCENE_COUNT: Final = 560
+PROJECT_VALIDATION_SCENE_COUNT: Final = 140
 POSE_TIMESTAMP_SOURCE: Final = "CAM_FRONT_sample_data"
 MOTION_SOURCE: Final = "ego_pose_past_difference"
 POSE_TIMESTAMP_UNIT: Final = "microsecond"
@@ -95,6 +106,69 @@ def assign_scene_splits(
     return assignments
 
 
+def _pilot_split_counts(
+    scene_splits: Mapping[str, str],
+    scene_count: int,
+) -> dict[str, int]:
+    available = Counter(scene_splits.values())
+    if set(available) != set(SPLITS):
+        raise ValueError(
+            "pilot selection requires train, validation, and test scenes"
+        )
+    if scene_count < len(SPLITS) or scene_count > len(scene_splits):
+        raise ValueError("pilot scene_count is outside the available scene range")
+
+    raw_counts = {
+        split: scene_count * available[split] / len(scene_splits)
+        for split in SPLITS
+    }
+    selected_counts = {
+        split: max(1, int(raw_counts[split])) for split in SPLITS
+    }
+    while sum(selected_counts.values()) < scene_count:
+        split = max(
+            SPLITS,
+            key=lambda name: (
+                raw_counts[name] - selected_counts[name],
+                -SPLITS.index(name),
+            ),
+        )
+        selected_counts[split] += 1
+    while sum(selected_counts.values()) > scene_count:
+        candidates = tuple(
+            split for split in SPLITS if selected_counts[split] > 1
+        )
+        split = max(
+            candidates,
+            key=lambda name: (
+                selected_counts[name] - raw_counts[name],
+                SPLITS.index(name),
+            ),
+        )
+        selected_counts[split] -= 1
+    if any(selected_counts[split] > available[split] for split in SPLITS):
+        raise ValueError("pilot scene allocation exceeds available scenes")
+    return selected_counts
+
+
+def select_pilot_scene_tokens(
+    scene_splits: Mapping[str, str],
+    scene_count: int,
+    seed: int,
+) -> tuple[str, ...]:
+    selected_counts = _pilot_split_counts(scene_splits, scene_count)
+    rng = random.Random(seed)
+    selected = []
+    for split in SPLITS:
+        candidates = sorted(
+            token for token, assigned_split in scene_splits.items()
+            if assigned_split == split
+        )
+        rng.shuffle(candidates)
+        selected.extend(candidates[: selected_counts[split]])
+    return tuple(selected)
+
+
 def validate_scene_split_isolation(samples: Sequence[ManifestSample]) -> None:
     scene_splits: dict[str, str] = {}
     for sample in samples:
@@ -166,6 +240,55 @@ def _required_number(mapping: Mapping[str, object], key: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"manifest row missing numeric {key}")
     return float(value)
+
+
+def _validate_cam_front_path(row: Mapping[str, object]) -> None:
+    path_value = _required_string(row, "cam_front_path")
+    path = PurePosixPath(path_value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("cam_front_path must be relative to NUSCENES_ROOT")
+
+
+def _validate_audit_fields(
+    row: Mapping[str, object],
+    schema_version: str,
+) -> None:
+    audit_status = row.get("audit_status")
+    source_audit_record = row.get("source_audit_record")
+    if schema_version == TRAINVAL_MANIFEST_SCHEMA_VERSION:
+        if audit_status != "unaudited":
+            raise ValueError("trainval manifest audit_status must be unaudited")
+        if source_audit_record is not None:
+            raise ValueError("unaudited source_audit_record must be null")
+        return
+    if audit_status is not None and audit_status != "audited":
+        raise ValueError("audited manifest audit_status must be audited")
+    if "source_audit_record" in row and not isinstance(
+        source_audit_record,
+        Mapping,
+    ):
+        raise ValueError("audited source_audit_record must be a mapping")
+
+
+def _validate_trainval_split_fields(row: Mapping[str, object]) -> None:
+    split = _required_string(row, "split")
+    official_split = _required_string(row, "official_split")
+    split_seed = row.get("split_seed")
+    split_strategy_version = _required_string(row, "split_strategy_version")
+    if official_split not in {"train", "val"}:
+        raise ValueError("trainval official_split must be train or val")
+    if not isinstance(split_seed, int) or isinstance(split_seed, bool):
+        raise ValueError("trainval split_seed must be an integer")
+    if split_seed != PHASE0_SPLIT_SEED:
+        raise ValueError("trainval split_seed does not match the frozen seed")
+    if split_strategy_version != SPLIT_STRATEGY_VERSION:
+        raise ValueError("unsupported trainval split_strategy_version")
+    if official_split == "val" and split != "test":
+        raise ValueError("official val scenes must map to project test")
+    if official_split == "train" and split not in {"train", "validation"}:
+        raise ValueError(
+            "official train scenes must map to project train or validation"
+        )
 
 
 def _validate_pose(row: Mapping[str, object]) -> str:
@@ -277,13 +400,16 @@ def validate_manifest(path: Path) -> ManifestValidationSummary:
             raise ValueError(f"duplicate sample_token: {sample_token}")
         sample_tokens.add(sample_token)
         schema_version = _required_string(row, "manifest_schema_version")
-        if schema_version != MANIFEST_SCHEMA_VERSION:
+        if schema_version not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS:
             raise ValueError("unsupported manifest_schema_version")
         schema_versions.add(schema_version)
         label_rule_versions.add(_required_string(row, "label_rule_version"))
         normalize_action(_required_string(row, "meta_action"))
         _required_number(row, "timestamp")
-        _required_string(row, "cam_front_path")
+        _validate_cam_front_path(row)
+        _validate_audit_fields(row, schema_version)
+        if schema_version == TRAINVAL_MANIFEST_SCHEMA_VERSION:
+            _validate_trainval_split_fields(row)
         pose_timestamp_source = _validate_pose(row)
         availability, motion_timestamp_source = _validate_motion(row)
         if motion_timestamp_source != pose_timestamp_source:

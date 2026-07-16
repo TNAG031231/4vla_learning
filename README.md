@@ -11,15 +11,16 @@
 - 108 个样本的人工审核、6 类 action 覆盖和 real-data freeze audit（108/108）；
 - 现有数据检查、审核、环境检查与 workspace cleanup 脚本及对应测试。
 - Phase 0.1 audited seed-subset manifest、固定 seed 的 scene-level split、Majority Baseline、六类统一评测协议、invalid prediction 指标处理和完整 manifest contract validator。
+- Phase 0.1b trainval manifest v1 协议、official-train scene-level label-stratified split 与可复现 20-scene pilot。
 
 ### Planned
 
-- Phase 0.1b 从 nuScenes mini 扩展至 trainval，并生成正式 dataset manifest v1（next）；
+- Phase 0.1b 完整 850-scene manifest 构建与分层人工抽检（next）；
 - coarse action 的 rule-based、zero-shot / few-shot 与 LoRA / action adapter baselines；
 - GT-derived BEV/OCC-aware temporal safety evaluator、offline reranker 与可选 coarse-action DPO；
 - short temporal input、map / route、fine-grained maneuver、continuous waypoint、optional BEV/OCC auxiliary 与闭环或 quasi-closed-loop evaluation。
 
-Phase -1 freeze gate 与 Phase 0.1 均已完成并合并。当前已实现 coarse meta-action label/data protocol、audited manifest/split/evaluation infrastructure 与 Majority Baseline；coarse neural action head、Qwen3-VL、rule-based baseline、LoRA、action adapter、安全 scorer、reranker、DPO、fine maneuver、waypoint 与 predicted BEV/OCC 均为 planned。
+Phase -1 freeze gate 与 Phase 0.1 均已完成并合并；Phase 0.1b 已完成 trainval manifest v1 协议、完整 850-scene label/split 统计和 20-scene pilot，尚未写出完整 850-scene manifest。当前已实现 coarse meta-action label/data protocol、audited/trainval manifest infrastructure 与 Majority Baseline；coarse neural action head、Qwen3-VL、rule-based baseline、LoRA、action adapter、安全 scorer、reranker、DPO、fine maneuver、waypoint 与 predicted BEV/OCC 均为 planned。
 
 ## Inference and Safety Boundaries
 
@@ -65,9 +66,16 @@ conda run -n codex4vla_env python scripts/check_env.py
 conda run -n codex4vla_env pytest tests/test_check_env.py tests/test_clean_workspace.py tests/test_inspect_nuscenes_sample.py tests/test_verify_labels.py tests/test_meta_action.py tests/test_phase_1_7_manual_audit.py
 conda run -n codex4vla_env python data/validate_label_freeze.py --dataroot data/nuscenes
 conda run -n codex4vla_env python scripts/clean_workspace.py
+conda run -n codex4vla_env python data/build_trainval_manifest.py --config configs/trainval_manifest.yaml --pilot
 ```
 
-`clean_workspace.py` 默认仅输出 dry-run 候选，不删除文件。项目当前不提供 baseline、reranker、DPO 或 trajectory training 命令，因为它们尚未实现。
+trainval pilot 命令要求预先设置 `NUSCENES_ROOT` 与 `VLA_DERIVED_ROOT`；派生 manifest 写入后者且不进入 Git。`clean_workspace.py` 默认仅输出 dry-run 候选，不删除文件。项目当前不提供 neural baseline、reranker、DPO 或 trajectory training 命令，因为它们尚未实现。
+
+## Phase 0.1b Pilot
+
+正式 split 先基于完整官方 train/val scenes 固定：官方 train 的 700 scenes 使用 seed `20260710` 和 `official_train_scene_label_stratified_v1`，按有效样本六维 action histogram 映射为 project train 560 / validation 140；官方 val 的 150 scenes 不参与优化并全部作为 project test。目标函数为 train/validation 相对 official train 的类别分布距离、validation scene coverage 偏差与长尾硬约束罚项之和；实测 stratified objective 为 `0.0020518908`，fixed-random 对照为 `0.0605638706`，六类硬约束均满足。pilot 再以 seed `20260715` 从该固定映射中选择 20 scenes，实际覆盖 train 13 / validation 3 / test 4。
+
+已执行的新 pilot 扫描 804 samples，纳入 `phase0_trainval_dataset_manifest_v1` 533 条，排除 271 条：`insufficient_remaining_horizon=124`、`timestamp_out_of_tolerance=147`，其余排除原因均为 0。motion availability 为 `full=501`、`partial=17`、`unavailable=15`；路径泄漏与 scene split overlap 检查均通过。trainval 记录新增 `official_split`、`split_seed` 与 `split_strategy_version` 追溯字段；完整 850-scene manifest 构建与分层人工抽检仍为下一 gate。
 
 ## Repository Entry Points
 
