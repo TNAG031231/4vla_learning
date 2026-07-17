@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from data import build_phase0_manifest as manifest_builder
 from src.phase0.protocol import read_manifest_samples
-from src.phase0.manifest import write_jsonl_records
+from src.phase0.manifest import SourceAuditRecord, write_jsonl_records
 
 
 class FakeNuScenes:
@@ -24,6 +24,16 @@ class FakeNuScenes:
 
     def get(self, table_name: str, token: str) -> dict[str, object]:
         return self.tables[table_name][token]
+
+
+def test_common_manifest_module_does_not_depend_on_specific_builders() -> None:
+    module_source = (PROJECT_ROOT / "src/phase0/manifest.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "build_phase0_manifest" not in module_source
+    assert "build_trainval_manifest" not in module_source
+    assert manifest_builder.SourceAuditRecord is SourceAuditRecord
 
 
 def rotation_from_yaw(yaw_rad: float) -> list[float]:

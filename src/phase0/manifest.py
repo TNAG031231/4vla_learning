@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import json
 import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Callable, Protocol, TextIO
+from typing import Callable, overload, Protocol, TextIO, TypeVar
 
 from pyquaternion import Quaternion
 
@@ -22,6 +22,7 @@ from src.phase0.protocol import (
 
 
 SAFETY_RULE_VERSION = "not_available"
+ValidationResult = TypeVar("ValidationResult")
 COORDINATE_METADATA = {
     "current_ego_pose": {
         "frame": "nuScenes_global",
@@ -65,6 +66,16 @@ COORDINATE_METADATA = {
 }
 
 
+@dataclass(frozen=True)
+class SourceAuditRecord:
+    source_audit: str
+    sample_token: str
+    historical_derived_action: str
+    reviewed_action: str
+    label_correct: str
+    historical_label_rule_version: str
+
+
 class NuScenesReader(Protocol):
     def get(self, table_name: str, token: str) -> dict[str, object]:
         ...
@@ -95,13 +106,32 @@ def json_record(record: object) -> dict[str, object]:
     return payload
 
 
+@overload
 def _atomic_text_write(
     output_path: Path,
     writer: Callable[[TextIO], None],
-    validator: Callable[[Path], object] | None = None,
+    validator: None = None,
 ) -> None:
+    ...
+
+
+@overload
+def _atomic_text_write(
+    output_path: Path,
+    writer: Callable[[TextIO], None],
+    validator: Callable[[Path], ValidationResult],
+) -> ValidationResult:
+    ...
+
+
+def _atomic_text_write(
+    output_path: Path,
+    writer: Callable[[TextIO], None],
+    validator: Callable[[Path], ValidationResult] | None = None,
+) -> ValidationResult | None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
+    validation_result: ValidationResult | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -116,33 +146,70 @@ def _atomic_text_write(
             output_file.flush()
             os.fsync(output_file.fileno())
         if validator is not None:
-            validator(temporary_path)
+            validation_result = validator(temporary_path)
         os.replace(temporary_path, output_path)
         temporary_path = None
+        return validation_result
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
 
 
+@overload
 def write_jsonl_records(
     records: Iterable[object],
     output_path: Path,
-    validator: Callable[[Path], object] | None = None,
+    validator: None = None,
 ) -> None:
+    ...
+
+
+@overload
+def write_jsonl_records(
+    records: Iterable[object],
+    output_path: Path,
+    validator: Callable[[Path], ValidationResult],
+) -> ValidationResult:
+    ...
+
+
+def write_jsonl_records(
+    records: Iterable[object],
+    output_path: Path,
+    validator: Callable[[Path], ValidationResult] | None = None,
+) -> ValidationResult | None:
     def write_records(output_file: TextIO) -> None:
         for record in records:
             output_file.write(
                 json.dumps(json_record(record), separators=(",", ":")) + "\n"
             )
 
-    _atomic_text_write(output_path, write_records, validator)
+    return _atomic_text_write(output_path, write_records, validator)
+
+
+@overload
+def write_canonical_json(
+    payload: Mapping[str, object],
+    output_path: Path,
+    validator: None = None,
+) -> None:
+    ...
+
+
+@overload
+def write_canonical_json(
+    payload: Mapping[str, object],
+    output_path: Path,
+    validator: Callable[[Path], ValidationResult],
+) -> ValidationResult:
+    ...
 
 
 def write_canonical_json(
     payload: Mapping[str, object],
     output_path: Path,
-    validator: Callable[[Path], object] | None = None,
-) -> None:
+    validator: Callable[[Path], ValidationResult] | None = None,
+) -> ValidationResult | None:
     def write_payload(output_file: TextIO) -> None:
         json.dump(
             payload,
@@ -152,7 +219,7 @@ def write_canonical_json(
             separators=(",", ":"),
         )
 
-    _atomic_text_write(output_path, write_payload, validator)
+    return _atomic_text_write(output_path, write_payload, validator)
 
 
 def _mapping_value(

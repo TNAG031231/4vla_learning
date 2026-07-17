@@ -13,6 +13,7 @@ from src.phase0.scene_mapping import (
     ensure_scene_mapping,
     hash_scene_histograms,
     read_scene_mapping,
+    validate_scene_mapping_payload,
 )
 from src.phase0.stratified_split import SPLIT_STRATEGY_VERSION
 
@@ -92,6 +93,51 @@ def test_mapping_hash_changes_when_one_assignment_changes() -> None:
     assert first["scene_split_mapping_sha256"] != changed[
         "scene_split_mapping_sha256"
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_hash"),
+    (
+        ("scene_split_mapping_sha256", "a" * 63),
+        ("scene_split_mapping_sha256", "G" * 64),
+        ("scene_split_mapping_sha256", "A" * 64),
+        ("scene_histogram_sha256", "b" * 63),
+        ("scene_histogram_sha256", "z" * 64),
+        ("scene_histogram_sha256", "B" * 64),
+    ),
+)
+def test_scene_mapping_rejects_invalid_sha256_contract(
+    field: str,
+    invalid_hash: str,
+) -> None:
+    official, project, histograms = scene_inputs()
+    payload = mapping_payload(official, project, histograms)
+    payload[field] = invalid_hash
+
+    with pytest.raises(ValueError, match="lowercase 64-character SHA-256"):
+        validate_scene_mapping_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "message"),
+    (
+        ("nuScenes_version", "v1.0-mini", "nuScenes_version"),
+        ("split_seed", 1, "split_seed"),
+        ("split_strategy_version", "old", "split_strategy_version"),
+        ("label_rule_version", "old", "label_rule_version"),
+    ),
+)
+def test_scene_mapping_rejects_nonfrozen_versions(
+    field: str,
+    invalid_value: object,
+    message: str,
+) -> None:
+    official, project, histograms = scene_inputs()
+    payload = mapping_payload(official, project, histograms)
+    payload[field] = invalid_value
+
+    with pytest.raises(ValueError, match=message):
+        validate_scene_mapping_payload(payload)
 
 
 def test_existing_mapping_mismatch_fails_without_overwrite(tmp_path: Path) -> None:

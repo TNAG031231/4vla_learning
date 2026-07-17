@@ -9,11 +9,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.actions.schema import ACTION_SCHEMA
+from src.phase0.manifest import write_jsonl_records
 from src.phase0.protocol import (
     ManifestSample,
     assign_scene_splits,
     complete_action_distribution,
     evaluate_classification,
+    iter_manifest_rows,
     read_manifest_samples,
     select_pilot_scene_tokens,
     validate_manifest,
@@ -353,6 +355,118 @@ def test_trainval_manifest_validator_requires_one_mapping_hash(
 
     with pytest.raises(ValueError, match="must be singular"):
         validate_manifest(manifest_path)
+
+
+@pytest.mark.parametrize(
+    "invalid_hash",
+    (
+        "a" * 63,
+        "g" * 64,
+        "A" * 64,
+        123,
+    ),
+)
+def test_trainval_manifest_validator_rejects_invalid_mapping_hash(
+    tmp_path: Path,
+    invalid_hash: object,
+) -> None:
+    row = trainval_manifest_row()
+    row["split_mapping_sha256"] = invalid_hash
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lowercase 64-character SHA-256"):
+        validate_manifest(manifest_path)
+
+
+def test_streaming_manifest_validator_does_not_call_path_read_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(trainval_manifest_row()) + "\n",
+        encoding="utf-8",
+    )
+
+    def reject_read_text(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("streaming validator must not call Path.read_text")
+
+    monkeypatch.setattr(Path, "read_text", reject_read_text)
+
+    assert tuple(iter_manifest_rows(manifest_path))[0]["sample_token"] == "sample"
+    assert validate_manifest(manifest_path).sample_count == 1
+
+
+def test_large_generator_is_atomically_written_and_summary_is_returned(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    def records():
+        for index in range(2_000):
+            yield trainval_manifest_row(f"sample-{index:04d}")
+
+    summary = write_jsonl_records(
+        records(),
+        manifest_path,
+        validator=validate_manifest,
+    )
+
+    assert summary.sample_count == 2_000
+    assert summary.scene_count == 1
+    assert summary.split_mapping_sha256 == "a" * 64
+
+
+def test_streaming_validator_detects_distant_duplicate_token(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text("old\n", encoding="utf-8")
+
+    def records():
+        for index in range(1_000):
+            yield trainval_manifest_row(f"sample-{index:04d}")
+        yield trainval_manifest_row("sample-0000")
+
+    with pytest.raises(ValueError, match="duplicate sample_token"):
+        write_jsonl_records(
+            records(),
+            manifest_path,
+            validator=validate_manifest,
+        )
+
+    assert manifest_path.read_text(encoding="utf-8") == "old\n"
+    assert tuple(tmp_path.glob(".manifest.jsonl.*.tmp")) == ()
+
+
+def test_streaming_validator_detects_distant_scene_split_overlap(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    def records():
+        first = trainval_manifest_row("sample-first")
+        first["scene_token"] = "shared-scene"
+        yield first
+        for index in range(1_000):
+            row = trainval_manifest_row(f"sample-{index:04d}")
+            row["scene_token"] = f"scene-{index:04d}"
+            yield row
+        last = trainval_manifest_row("sample-last")
+        last["scene_token"] = "shared-scene"
+        last["split"] = "validation"
+        yield last
+
+    with pytest.raises(ValueError, match="scene_token spans splits"):
+        write_jsonl_records(
+            records(),
+            manifest_path,
+            validator=validate_manifest,
+        )
+
+    assert not manifest_path.exists()
+    assert tuple(tmp_path.glob(".manifest.jsonl.*.tmp")) == ()
 
 
 def test_complete_manifest_validator_rejects_duplicate_sample_token(

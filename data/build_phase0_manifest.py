@@ -43,12 +43,14 @@ from src.actions.schema import normalize_action
 from src.phase0.manifest import (
     COORDINATE_METADATA,
     SAFETY_RULE_VERSION,
+    SourceAuditRecord,
     current_ego_motion,
     current_ego_pose,
     json_record,
     write_jsonl_records,
 )
 from src.phase0.protocol import (
+    ManifestValidationSummary,
     ManifestSample,
     MANIFEST_SCHEMA_VERSION,
     assign_scene_splits,
@@ -56,16 +58,6 @@ from src.phase0.protocol import (
     validate_manifest,
     validate_scene_split_isolation,
 )
-
-
-@dataclass(frozen=True)
-class SourceAuditRecord:
-    source_audit: str
-    sample_token: str
-    historical_derived_action: str
-    reviewed_action: str
-    label_correct: str
-    historical_label_rule_version: str
 
 
 @dataclass(frozen=True)
@@ -204,8 +196,12 @@ def build_manifest_records(
 def write_manifest(
     records: Sequence[Phase0ManifestRecord],
     output_path: Path,
-) -> None:
-    write_jsonl_records(records, output_path, validator=validate_manifest)
+) -> ManifestValidationSummary:
+    return write_jsonl_records(
+        records,
+        output_path,
+        validator=validate_manifest,
+    )
 
 
 def _required_config_string(config: Mapping[str, object], key: str) -> str:
@@ -308,8 +304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _print_audit(records)
     output_path = Path(_required_config_string(config, "manifest_path"))
-    write_manifest(records, output_path)
-    validation = validate_manifest(output_path)
+    validation = write_manifest(records, output_path)
     if validation.sample_count != len(records):
         raise ValueError("written manifest sample count does not match records")
     print(f"manifest: {output_path}")

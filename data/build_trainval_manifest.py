@@ -28,7 +28,6 @@ from derive_meta_action import (
     derive_meta_action,
     load_meta_action_rules,
 )
-from build_phase0_manifest import SourceAuditRecord
 from inspect_nuscenes_sample import (
     CAMERA_CHANNEL,
     extract_future_ego_trajectory,
@@ -45,12 +44,14 @@ from src.actions.schema import ACTION_SCHEMA, LABEL_RULE_VERSION
 from src.phase0.manifest import (
     COORDINATE_METADATA,
     SAFETY_RULE_VERSION,
+    SourceAuditRecord,
     current_ego_motion,
     current_ego_pose,
     json_record,
     write_jsonl_records,
 )
 from src.phase0.protocol import (
+    ManifestValidationSummary,
     OFFICIAL_TRAIN_SCENE_COUNT,
     OFFICIAL_VAL_SCENE_COUNT,
     PHASE0_SPLIT_SEED,
@@ -252,6 +253,31 @@ def audit_token_summary(
         "missing_count": len(missing_tokens),
         "missing_sample_tokens": missing_tokens,
     }
+
+
+def require_complete_audit_coverage(
+    result: FullSplitResult,
+    audit_index: Mapping[str, HistoricalAuditRow],
+) -> dict[str, object]:
+    summary = audit_token_summary(result, audit_index)
+    expected_count = len(audit_index)
+    if (
+        summary["successfully_matched_count"] != expected_count
+        or summary["filtered_count"] != 0
+        or summary["missing_count"] != 0
+    ):
+        print(
+            json.dumps(
+                {"audit_coverage_gate": summary},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise ValueError(
+            "audit coverage gate failed: expected all audit tokens to be "
+            "matched with no filtered or missing tokens"
+        )
+    return summary
 
 
 def _environment_path(name: str, *, require_absolute: bool = False) -> Path:
@@ -963,6 +989,23 @@ def diagnostic_results(
     return diagnostics
 
 
+def write_trainval_manifest(
+    records: Sequence[TrainvalManifestRecord],
+    manifest_path: Path,
+    split_mapping_sha256: str,
+) -> ManifestValidationSummary:
+    validation = write_jsonl_records(
+        records,
+        manifest_path,
+        validator=validate_manifest,
+    )
+    if validation.sample_count != len(records):
+        raise ValueError("written manifest sample count does not match records")
+    if validation.split_mapping_sha256 != split_mapping_sha256:
+        raise ValueError("written manifest split mapping hash does not match sidecar")
+    return validation
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the Phase 0.1b nuScenes trainval manifest v1."
@@ -1028,6 +1071,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         time_tolerance_sec=trajectory_config.trajectory_time_tolerance_sec,
         agent_radius_m=trajectory_config.nearby_radius_m,
     )
+    audit_summary = require_complete_audit_coverage(
+        full_split,
+        audit_index,
+    )
     scene_histogram_sha256 = hash_scene_histograms(
         full_split.train_statistics.scene_histograms
     )
@@ -1054,7 +1101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         {
             "scene_histogram_sha256": scene_histogram_sha256,
             "scene_split_mapping_sha256": split_mapping_sha256,
-            "audit_tokens": audit_token_summary(full_split, audit_index),
+            "audit_tokens": audit_summary,
         }
     )
     print(
@@ -1093,16 +1140,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         agent_radius_m=trajectory_config.nearby_radius_m,
     )
     manifest_path = output_path(derived_root, relative_output)
-    write_jsonl_records(
+    write_trainval_manifest(
         result.records,
         manifest_path,
-        validator=validate_manifest,
+        split_mapping_sha256,
     )
-    validation = validate_manifest(manifest_path)
-    if validation.sample_count != len(result.records):
-        raise ValueError("written manifest sample count does not match records")
-    if validation.split_mapping_sha256 != split_mapping_sha256:
-        raise ValueError("written manifest split mapping hash does not match sidecar")
 
     summary = pilot_summary(
         result=result,

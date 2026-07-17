@@ -5,17 +5,20 @@ import hashlib
 import json
 from pathlib import Path
 
-from src.actions.schema import ACTION_SCHEMA
+from src.actions.schema import ACTION_SCHEMA, LABEL_RULE_VERSION
 from src.phase0.manifest import write_canonical_json
 from src.phase0.protocol import (
     OFFICIAL_TRAIN_SCENE_COUNT,
     OFFICIAL_VAL_SCENE_COUNT,
+    PHASE0_SPLIT_SEED,
     PROJECT_TRAIN_SCENE_COUNT,
     PROJECT_VALIDATION_SCENE_COUNT,
+    validate_sha256,
 )
 from src.phase0.stratified_split import (
     HARD_CONSTRAINT_PENALTY,
     MAX_SWAP_REFINEMENTS,
+    SPLIT_STRATEGY_VERSION,
 )
 
 
@@ -74,6 +77,10 @@ def build_scene_mapping_payload(
         raise ValueError(
             "official and project scene mappings must cover the same scenes"
         )
+    validated_histogram_hash = validate_sha256(
+        scene_histogram_sha256,
+        "scene_histogram_sha256",
+    )
     scenes = [
         {
             "scene_token": scene_token,
@@ -95,7 +102,7 @@ def build_scene_mapping_payload(
         "split_strategy_version": split_strategy_version,
         "label_rule_version": label_rule_version,
         "action_schema": list(ACTION_SCHEMA),
-        "scene_histogram_sha256": scene_histogram_sha256,
+        "scene_histogram_sha256": validated_histogram_hash,
         "objective": dict(OBJECTIVE_CONFIGURATION),
         "scenes": scenes,
     }
@@ -106,9 +113,28 @@ def build_scene_mapping_payload(
 
 
 def validate_scene_mapping_payload(payload: Mapping[str, object]) -> str:
-    mapping_hash = payload.get("scene_split_mapping_sha256")
-    if not isinstance(mapping_hash, str) or not mapping_hash:
-        raise ValueError("scene mapping is missing scene_split_mapping_sha256")
+    mapping_hash = validate_sha256(
+        payload.get("scene_split_mapping_sha256"),
+        "scene_split_mapping_sha256",
+    )
+    validate_sha256(
+        payload.get("scene_histogram_sha256"),
+        "scene_histogram_sha256",
+    )
+    if payload.get("mapping_schema_version") != MAPPING_SCHEMA_VERSION:
+        raise ValueError("unsupported scene mapping schema version")
+    if payload.get("nuScenes_version") != "v1.0-trainval":
+        raise ValueError("scene mapping nuScenes_version mismatch")
+    if payload.get("split_seed") != PHASE0_SPLIT_SEED:
+        raise ValueError("scene mapping split_seed mismatch")
+    if payload.get("split_strategy_version") != SPLIT_STRATEGY_VERSION:
+        raise ValueError("scene mapping split_strategy_version mismatch")
+    if payload.get("label_rule_version") != LABEL_RULE_VERSION:
+        raise ValueError("scene mapping label_rule_version mismatch")
+    if payload.get("action_schema") != list(ACTION_SCHEMA):
+        raise ValueError("scene mapping action schema mismatch")
+    if payload.get("objective") != OBJECTIVE_CONFIGURATION:
+        raise ValueError("scene mapping objective configuration mismatch")
     material = {
         key: value
         for key, value in payload.items()
@@ -116,15 +142,6 @@ def validate_scene_mapping_payload(payload: Mapping[str, object]) -> str:
     }
     if canonical_sha256(material) != mapping_hash:
         raise ValueError("scene split mapping hash mismatch")
-    if payload.get("mapping_schema_version") != MAPPING_SCHEMA_VERSION:
-        raise ValueError("unsupported scene mapping schema version")
-    if payload.get("action_schema") != list(ACTION_SCHEMA):
-        raise ValueError("scene mapping action schema mismatch")
-    if payload.get("objective") != OBJECTIVE_CONFIGURATION:
-        raise ValueError("scene mapping objective configuration mismatch")
-    histogram_hash = payload.get("scene_histogram_sha256")
-    if not isinstance(histogram_hash, str) or not histogram_hash:
-        raise ValueError("scene mapping is missing scene_histogram_sha256")
     scenes = payload.get("scenes")
     if not isinstance(scenes, list) or len(scenes) != 850:
         raise ValueError("scene mapping must contain 850 scenes")

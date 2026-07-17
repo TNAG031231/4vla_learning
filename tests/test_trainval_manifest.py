@@ -14,8 +14,12 @@ from data import build_trainval_manifest as trainval_builder
 from data.derive_meta_action import MetaActionRules, load_meta_action_rules
 from data.validate_label_freeze import HistoricalAuditRow
 from src.actions.schema import ACTION_SCHEMA, LABEL_RULE_VERSION
-from src.phase0.manifest import write_jsonl_records
-from src.phase0.protocol import read_manifest_samples, validate_manifest
+from src.phase0.manifest import SourceAuditRecord, write_jsonl_records
+from src.phase0.protocol import (
+    ManifestValidationSummary,
+    read_manifest_samples,
+    validate_manifest,
+)
 from src.phase0.stratified_split import (
     ActionConstraintStatus,
     assign_stratified_scene_splits,
@@ -169,6 +173,15 @@ def test_complete_sample_builds_unaudited_trainval_record(
         "left_lateral",
         "right_lateral",
     )
+    assert trainval_builder.SourceAuditRecord is SourceAuditRecord
+
+
+def test_trainval_builder_does_not_import_seed_subset_builder() -> None:
+    source = (PROJECT_ROOT / "data/build_trainval_manifest.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "from build_phase0_manifest import" not in source
 
 
 def test_audited_trainval_record_preserves_source_provenance(
@@ -315,6 +328,130 @@ def test_trainval_manifest_can_be_validated_and_reloaded(
     assert summary.sample_count == 1
     assert samples[0].sample_token == "sample-0"
     assert samples[0].split == "train"
+
+
+def test_trainval_atomic_write_uses_validator_summary_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = build_scene(tmp_path, tuple(index * 500_000 for index in range(8)))
+    decision = evaluate(reader, tmp_path)
+    assert decision.record is not None
+    manifest_path = tmp_path / "derived" / "manifest.jsonl"
+    validation_calls = 0
+    real_validate_manifest = trainval_builder.validate_manifest
+
+    def counted_validate_manifest(path: Path) -> ManifestValidationSummary:
+        nonlocal validation_calls
+        validation_calls += 1
+        return real_validate_manifest(path)
+
+    monkeypatch.setattr(
+        trainval_builder,
+        "validate_manifest",
+        counted_validate_manifest,
+    )
+
+    summary = trainval_builder.write_trainval_manifest(
+        (decision.record,),
+        manifest_path,
+        "a" * 64,
+    )
+
+    assert validation_calls == 1
+    assert summary.sample_count == 1
+    assert summary.split_mapping_sha256 == "a" * 64
+
+
+def audit_coverage_result(
+    train_outcomes: dict[str, str],
+    test_outcomes: dict[str, str],
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        train_statistics=SimpleNamespace(audit_outcomes=train_outcomes),
+        test_statistics=SimpleNamespace(audit_outcomes=test_outcomes),
+    )
+
+
+def test_complete_audit_coverage_gate_passes() -> None:
+    result = audit_coverage_result(
+        {"audit-a": "included"},
+        {"audit-b": "included"},
+    )
+    audit_index = {
+        "audit-a": SimpleNamespace(),
+        "audit-b": SimpleNamespace(),
+    }
+
+    summary = trainval_builder.require_complete_audit_coverage(
+        result,
+        audit_index,
+    )
+
+    assert summary["successfully_matched_count"] == 2
+    assert summary["filtered_count"] == 0
+    assert summary["missing_count"] == 0
+
+
+def test_filtered_audit_token_fails_before_artifact_write(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = audit_coverage_result(
+        {"audit-a": "timestamp_out_of_tolerance"},
+        {"audit-b": "included"},
+    )
+    audit_index = {
+        "audit-a": SimpleNamespace(),
+        "audit-b": SimpleNamespace(),
+    }
+
+    with pytest.raises(ValueError, match="audit coverage gate failed"):
+        trainval_builder.require_complete_audit_coverage(
+            result,
+            audit_index,
+        )
+
+    output = capsys.readouterr().out
+    assert "timestamp_out_of_tolerance" in output
+    assert not (tmp_path / "scene_mapping.json").exists()
+    assert not (tmp_path / "manifest.jsonl").exists()
+
+
+def test_missing_audit_token_fails_before_artifact_write(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = audit_coverage_result(
+        {"audit-a": "included"},
+        {},
+    )
+    audit_index = {
+        "audit-a": SimpleNamespace(),
+        "audit-missing": SimpleNamespace(),
+    }
+
+    with pytest.raises(ValueError, match="audit coverage gate failed"):
+        trainval_builder.require_complete_audit_coverage(
+            result,
+            audit_index,
+        )
+
+    output = capsys.readouterr().out
+    assert "audit-missing" in output
+    assert not (tmp_path / "scene_mapping.json").exists()
+    assert not (tmp_path / "manifest.jsonl").exists()
+
+
+def test_audit_coverage_gate_precedes_all_artifact_writes() -> None:
+    source = (PROJECT_ROOT / "data/build_trainval_manifest.py").read_text(
+        encoding="utf-8"
+    )
+    main_source = source.split("def main", 1)[1]
+
+    gate_position = main_source.index("require_complete_audit_coverage")
+    assert gate_position < main_source.index("ensure_scene_mapping")
+    assert gate_position < main_source.index("write_trainval_manifest")
 
 
 def test_output_path_must_remain_under_derived_root(tmp_path: Path) -> None:
