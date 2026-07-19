@@ -7,6 +7,15 @@ from src.actions.schema import ACTION_SCHEMA
 from src.phase0.protocol import validate_sha256
 
 
+PHASE0_2B_VALIDATION_ARTIFACT_FIELDS = (
+    "rule_version",
+    "selected_candidate_id",
+    "thresholds_sha256",
+    "metrics",
+    "predicted_class_distribution",
+    "decision_reason_distribution",
+    "test_evaluation_performed",
+)
 NORMALIZED_VALIDATION_METRICS_FIELDS = (
     "sample_count",
     "accuracy",
@@ -33,13 +42,21 @@ def _required_mapping(
     return value
 
 
-def _finite_number(mapping: Mapping[str, object], key: str) -> float:
+def _classification_score(
+    mapping: Mapping[str, object],
+    key: str,
+    description: str,
+) -> float:
     value = mapping.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"validation metrics {key} must be a finite number")
+        raise ValueError(f"{description} must be a finite number")
     number = float(value)
     if not math.isfinite(number):
-        raise ValueError(f"validation metrics {key} must be a finite number")
+        raise ValueError(f"{description} must be a finite number")
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(
+            f"{description} must be between 0.0 and 1.0 inclusive"
+        )
     return number
 
 
@@ -52,7 +69,12 @@ def _per_class_f1(metrics: Mapping[str, object]) -> dict[str, float]:
             "validation metrics per_class_f1 must contain exactly ACTION_SCHEMA"
         )
     return {
-        action: _finite_number(values, action) for action in ACTION_SCHEMA
+        action: _classification_score(
+            values,
+            action,
+            f"validation metrics per_class_f1[{action}]",
+        )
+        for action in ACTION_SCHEMA
     }
 
 
@@ -91,6 +113,40 @@ def _prediction_distribution(
     return distribution
 
 
+def _decision_reason_distribution(
+    artifact: Mapping[str, object],
+    sample_count: int,
+) -> dict[str, int]:
+    values = artifact.get("decision_reason_distribution")
+    if not isinstance(values, Mapping):
+        raise ValueError(
+            "validation artifact decision_reason_distribution must be a mapping"
+        )
+    distribution = {}
+    for reason, count in values.items():
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(
+                "validation artifact decision_reason_distribution reason keys "
+                "must be non-empty strings"
+            )
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+        ):
+            raise ValueError(
+                "validation artifact decision_reason_distribution counts "
+                "must be non-negative integers"
+            )
+        distribution[reason] = count
+    if sum(distribution.values()) != sample_count:
+        raise ValueError(
+            "validation artifact decision_reason_distribution must sum to "
+            "sample_count"
+        )
+    return distribution
+
+
 def normalize_phase0_2b_validation_metrics_artifact(
     artifact: Mapping[str, object],
     *,
@@ -101,9 +157,9 @@ def normalize_phase0_2b_validation_metrics_artifact(
 ) -> dict[str, object]:
     if not isinstance(artifact, Mapping):
         raise ValueError("validation artifact must be a mapping")
-    if set(NORMALIZED_VALIDATION_METRICS_FIELDS).intersection(artifact):
+    if set(artifact) != set(PHASE0_2B_VALIDATION_ARTIFACT_FIELDS):
         raise ValueError(
-            "validation artifact must use the Phase 0.2b producer schema"
+            "validation artifact Phase 0.2b producer fields must match exactly"
         )
     if _required_string(artifact, "rule_version") != expected_rule_version:
         raise ValueError("validation artifact rule_version does not match")
@@ -142,10 +198,19 @@ def normalize_phase0_2b_validation_metrics_artifact(
         raise ValueError(
             "validation artifact test_evaluation_performed must be false"
         )
+    _decision_reason_distribution(artifact, sample_count)
     normalized = {
         "sample_count": sample_count,
-        "accuracy": _finite_number(metrics, "accuracy"),
-        "macro_f1": _finite_number(metrics, "macro_f1"),
+        "accuracy": _classification_score(
+            metrics,
+            "accuracy",
+            "validation metrics accuracy",
+        ),
+        "macro_f1": _classification_score(
+            metrics,
+            "macro_f1",
+            "validation metrics macro_f1",
+        ),
         "per_class_f1": _per_class_f1(metrics),
         "prediction_class_distribution": _prediction_distribution(
             artifact,

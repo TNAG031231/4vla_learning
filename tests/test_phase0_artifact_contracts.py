@@ -32,6 +32,15 @@ CANDIDATE_ID = "candidate-0293"
 SAMPLE_COUNT = 3594
 THRESHOLDS = EgoMotionRuleThresholds(0.2, 0.05, 0.5, 0.3)
 THRESHOLDS_SHA256 = THRESHOLDS.sha256()
+PHASE0_2B_PRODUCER_FIELDS = (
+    "rule_version",
+    "selected_candidate_id",
+    "thresholds_sha256",
+    "metrics",
+    "predicted_class_distribution",
+    "decision_reason_distribution",
+    "test_evaluation_performed",
+)
 
 
 def producer_payload() -> dict[str, object]:
@@ -123,13 +132,31 @@ def test_adapter_normalizes_producer_payload_for_comparison() -> None:
     )
 
 
-@pytest.mark.parametrize("value", (None, [], "metrics"))
-def test_adapter_rejects_missing_or_non_mapping_metrics(value: object) -> None:
+@pytest.mark.parametrize("field", PHASE0_2B_PRODUCER_FIELDS)
+def test_adapter_rejects_missing_producer_field(field: str) -> None:
     payload = producer_payload()
-    if value is None:
-        payload.pop("metrics")
-    else:
-        payload["metrics"] = value
+    payload.pop(field)
+
+    with pytest.raises(ValueError, match="producer fields must match exactly"):
+        normalize(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("test_metrics", "test_predictions", "unknown"),
+)
+def test_adapter_rejects_extra_producer_field(field: str) -> None:
+    payload = producer_payload()
+    payload[field] = {}
+
+    with pytest.raises(ValueError, match="producer fields must match exactly"):
+        normalize(payload)
+
+
+@pytest.mark.parametrize("value", ([], "metrics"))
+def test_adapter_rejects_non_mapping_metrics(value: object) -> None:
+    payload = producer_payload()
+    payload["metrics"] = value
 
     with pytest.raises(ValueError, match="metrics must be a mapping"):
         normalize(payload)
@@ -174,6 +201,19 @@ def test_adapter_rejects_non_finite_metrics(
         normalize(payload)
 
 
+@pytest.mark.parametrize("field", ("accuracy", "macro_f1"))
+@pytest.mark.parametrize("value", (-0.01, 1.01))
+def test_adapter_rejects_out_of_range_metrics(
+    field: str,
+    value: float,
+) -> None:
+    payload = producer_payload()
+    nested_mapping(payload, "metrics")[field] = value
+
+    with pytest.raises(ValueError, match=f"{field} must be between 0.0 and 1.0"):
+        normalize(payload)
+
+
 @pytest.mark.parametrize("mutation", ("missing", "extra", "non_numeric"))
 def test_adapter_rejects_invalid_per_class_f1(mutation: str) -> None:
     payload = producer_payload()
@@ -192,9 +232,44 @@ def test_adapter_rejects_invalid_per_class_f1(mutation: str) -> None:
         normalize(payload)
 
 
-def test_adapter_rejects_missing_prediction_distribution() -> None:
+@pytest.mark.parametrize("value", (-0.01, 1.01))
+def test_adapter_rejects_out_of_range_per_class_f1(value: float) -> None:
     payload = producer_payload()
-    payload.pop("predicted_class_distribution")
+    per_class = nested_mapping(nested_mapping(payload, "metrics"), "per_class_f1")
+    per_class[ACTION_SCHEMA[0]] = value
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"per_class_f1\\[{ACTION_SCHEMA[0]}\\] must be between "
+            "0.0 and 1.0"
+        ),
+    ):
+        normalize(payload)
+
+
+@pytest.mark.parametrize("value", (0.0, 1.0))
+def test_adapter_accepts_classification_score_boundaries(value: float) -> None:
+    payload = producer_payload()
+    metrics = nested_mapping(payload, "metrics")
+    metrics["accuracy"] = value
+    metrics["macro_f1"] = value
+    metrics["per_class_f1"] = {
+        action: value for action in ACTION_SCHEMA
+    }
+
+    normalized = normalize(payload)
+
+    assert normalized["accuracy"] == value
+    assert normalized["macro_f1"] == value
+    assert normalized["per_class_f1"] == {
+        action: value for action in ACTION_SCHEMA
+    }
+
+
+def test_adapter_rejects_non_mapping_prediction_distribution() -> None:
+    payload = producer_payload()
+    payload["predicted_class_distribution"] = []
 
     with pytest.raises(ValueError, match="must be a mapping"):
         normalize(payload)
@@ -226,6 +301,48 @@ def test_adapter_rejects_invalid_prediction_distribution(
         message = "sum to sample_count"
 
     with pytest.raises(ValueError, match=message):
+        normalize(payload)
+
+
+@pytest.mark.parametrize("value", ([], "reasons"))
+def test_adapter_rejects_non_mapping_decision_reason_distribution(
+    value: object,
+) -> None:
+    payload = producer_payload()
+    payload["decision_reason_distribution"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="decision_reason_distribution must be a mapping",
+    ):
+        normalize(payload)
+
+
+@pytest.mark.parametrize("reason", ("", 1))
+def test_adapter_rejects_invalid_decision_reason(reason: object) -> None:
+    payload = producer_payload()
+    payload["decision_reason_distribution"] = {reason: SAMPLE_COUNT}
+
+    with pytest.raises(ValueError, match="reason keys must be non-empty strings"):
+        normalize(payload)
+
+
+@pytest.mark.parametrize("count", (-1, True, 1.0))
+def test_adapter_rejects_invalid_decision_reason_count(count: object) -> None:
+    payload = producer_payload()
+    payload["decision_reason_distribution"] = {"default_keep": count}
+
+    with pytest.raises(ValueError, match="counts must be non-negative integers"):
+        normalize(payload)
+
+
+def test_adapter_rejects_decision_reason_count_sum_mismatch() -> None:
+    payload = producer_payload()
+    payload["decision_reason_distribution"] = {
+        "default_keep": SAMPLE_COUNT - 1
+    }
+
+    with pytest.raises(ValueError, match="must sum to sample_count"):
         normalize(payload)
 
 
@@ -262,7 +379,7 @@ def test_adapter_rejects_test_evaluation_performed() -> None:
 
 
 def test_adapter_rejects_flattened_synthetic_schema() -> None:
-    with pytest.raises(ValueError, match="producer schema"):
+    with pytest.raises(ValueError, match="producer fields must match exactly"):
         normalize(synthetic_test_metrics())
 
 

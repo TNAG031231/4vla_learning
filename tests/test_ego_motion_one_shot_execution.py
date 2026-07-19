@@ -412,21 +412,45 @@ def test_validation_adapter_failure_precedes_manifest_scan_and_claim(
         ),
     )
     manifest_scan_called = False
+    train_loader_called = False
+    claim_creation_called = False
 
     def forbidden_manifest_scan(path: Path) -> tuple[Mapping[str, object], ...]:
         nonlocal manifest_scan_called
         manifest_scan_called = True
         raise AssertionError(f"manifest scan reached after adapter failure: {path}")
 
+    def forbidden_train_loader(
+        rows: object,
+    ) -> tuple[object, ...]:
+        nonlocal train_loader_called
+        train_loader_called = True
+        raise AssertionError(f"train loader reached after adapter failure: {rows}")
+
+    def forbidden_claim_creation(*args: object) -> None:
+        nonlocal claim_creation_called
+        claim_creation_called = True
+        raise AssertionError(f"claim creation reached after adapter failure: {args}")
+
     monkeypatch.setattr(
         "scripts.run_ego_motion_one_shot_test.iter_manifest_rows",
         forbidden_manifest_scan,
     )
+    monkeypatch.setattr(
+        "scripts.run_ego_motion_one_shot_test.load_train_samples_without_test_access",
+        forbidden_train_loader,
+    )
+    monkeypatch.setattr(
+        "scripts.run_ego_motion_one_shot_test.create_execution_claim",
+        forbidden_claim_creation,
+    )
 
-    with pytest.raises(ValueError, match="producer schema"):
-        validate_execution_preconditions(paths, provenance)
+    with pytest.raises(ValueError, match="producer fields must match exactly"):
+        run_one_shot_execution(paths, provenance)
 
     assert not manifest_scan_called
+    assert not train_loader_called
+    assert not claim_creation_called
     assert not paths.claim_path.exists()
 
 
