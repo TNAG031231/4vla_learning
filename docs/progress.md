@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-- 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.1b dataset protocol v1 已通过全量构建、自动验收、排除原因诊断与 train/validation 视觉审核并冻结。
+- 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。
 - 当前状态不代表已经实现 neural baseline 或训练模型。
 
 ## Confirmed Milestones
@@ -15,7 +15,7 @@
 - 已完成并冻结 Phase 0.1b trainval dataset protocol v1：`horizon_sec=3.0`、`sample_interval_sec=0.5`、`time_tolerance_sec=0.075`、`label_rule_version=phase-1.6-meta-action-v0.2`、`split_strategy_version=official_train_scene_label_stratified_v1`、`split_seed=20260710`。
 - 完整 850-scene split 为 project train/validation/test `560/140/150`；正式 manifest 扫描 34,149 samples，纳入 21,646 条（train 14,253 / validation 3,594 / test 3,799），排除 12,503 条。
 - 已完成 Phase 0.2a current/past ego-motion 输入审计：train/validation/test 的 `full/partial/unavailable` 分别为 `13476/392/385`、`3401/99/94`、`3594/106/99`；输入合同仅包含 speed、longitudinal acceleration、yaw rate、availability 与对应 past interval，test label 未用于统计或调参。
-- 已实现 Phase 0.2b deterministic ego-motion rule baseline：固定 625-candidate grid 在 validation 选择 `stop=0.2 m/s`、`lateral=0.05 rad/s`、`accelerate=0.5 m/s²`、`decelerate=0.3 m/s²`，macro-F1/accuracy 为 `0.615681/0.623817`；Majority Baseline 为 `0.087186/0.354201`。test 未评测；Phase 0.2c failure analysis / rule freeze 尚未完成。
+- 已实现 Phase 0.2b deterministic ego-motion rule baseline：固定 625-candidate grid 在 validation 选择 `stop=0.2 m/s`、`lateral=0.05 rad/s`、`accelerate=0.5 m/s²`、`decelerate=0.3 m/s²`，macro-F1/accuracy 为 `0.615681/0.623817`；Majority Baseline 为 `0.087186/0.354201`。该阶段未使用 test。
 - 已建立环境检查与 workspace cleanup dry-run 脚本。
 
 ## Active Source Files
@@ -89,15 +89,18 @@ source_audit_record
 - 0.100 秒 nearest candidate 可恢复更多样本，exact-grid interpolation 标签总体一致率为 98.0458%，但 validation `decelerate` 一致率为 91.89%，仍存在边界风险，因此正式协议保持 0.075 秒。exact-grid interpolation 作为可选 v1.1 数据增强 backlog，不阻塞 Phase 0.2。
 - visual protocol comparison template 已通过；首批 train/validation 可视化未发现明显轨迹方向、左右坐标或时间顺序错误。test 未用于协议选择且继续封存，0.100/exact-grid 未成为正式协议。
 - Phase 0.2c failure analysis 已完成，`phase0.2-ego-motion-rule-v0.1` 冻结为 `candidate-0293`：stop speed `0.2 m/s`、lateral yaw rate `0.05 rad/s`、accelerate `0.5 m/s²`、decelerate `0.3 m/s²`；validation prediction 复现为 `3594/3594`。
-- validation 的主要错误模式为 `keep → decelerate`（260）与 `decelerate → keep`（181）。该 validation 同时用于 Phase 0.2b 候选选择与报告，不代表无偏 test 性能；test 尚未评测。
+- validation 的主要错误模式为 `keep → decelerate`（260）与 `decelerate → keep`（181）。该 validation 同时用于 Phase 0.2b 候选选择与报告，不代表无偏 test 性能。
+- Phase 0.2d formal execution 在 Git commit `e1cebb4182d1d30ee893c619f6cd45fe1aaaee39`、execution CLI SHA-256 `da160707ee3813b29d81c1e8d06442364843ea523235f464b1d413ce23d7beee` 下调用一次，exit code 为 `1`；execution claim SHA-256 为 `48d6bcccfd43eff529a9a50390bc6851f9f0edb7cdeb1bee6401bf23ae301cea`，状态为 `consumed_failed`。
+- 失败点为 `build_formal_outputs → build_validation_to_test_comparison`：正式 `validation_metrics.json` 使用嵌套 `metrics` 与顶层 `predicted_class_distribution`，comparison builder 期望顶层扁平 metrics 与 `prediction_class_distribution`。durable claim 后已访问 test label/motion；正式 test outputs 未生成、正式 test metrics 不可用，rule 与 thresholds 均未根据 test 结果修改，`rerun_permitted=false`。
+- 该 test split 已在 Phase 0.2d sealed one-shot execution 中永久消费。尽管正式指标未成功持久化，它也不再是后续规则、模型、阈值或架构选择的 untouched holdout。不得重新执行、恢复、重算或使用该 test split 进行任何调参、候选选择或规则修改。
 
 ## Open Questions / Pending Verification
 
 - exact-grid interpolation v1.1 是可选数据增强 backlog；如后续评估，应保持现有 v1 manifest、sidecar 与 test split 不变，并单独提升协议版本。
-- Phase 0.2c deterministic rule failure analysis / freeze 已完成；Phase 0.2d one-shot test 尚未执行。
+- Phase 0.2d 状态为 `consumed_failed`；后续必须新增独立的 validation-artifact schema adapter 和真实 artifact-shape regression test。该修复仅适用于未来协议，不得用于重跑当前 test。
 
 ## Next Gate
 
-- Phase 0.2d one-shot test 是下一 gate；必须使用已冻结的 `phase0.2-ego-motion-rule-v0.1`，不得根据 test 结果改写规则或阈值。
-- 后续实验复用已冻结的 train/validation/test scene mapping、action vocabulary 与 manifest v1；不得根据模型、prompt 或标签分布重新调整 test split。
-- test 继续封存；Phase 0.2 的 sample-level 输出、输入字段审计与统一 action metrics 完成前，不进入 Phase 0.3。
+- 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
+- Phase 0.3 可继续使用 train/validation 进行开发与模型选择，但不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
+- 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
