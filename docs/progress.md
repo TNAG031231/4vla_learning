@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-- 当前阶段：Phase -1 gate 与 Phase 0.1 已完成；Phase 0.1b trainval manifest v1 协议、完整 scene label/split 统计和 20-scene pilot 已完成，完整 850-scene manifest 写出 pending。
+- 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.1b dataset protocol v1 已通过全量构建、自动验收、排除原因诊断与 train/validation 视觉审核并冻结。
 - 当前状态不代表已经实现 neural baseline 或训练模型。
 
 ## Confirmed Milestones
@@ -12,8 +12,8 @@
 - 已完成 Phase -1.7 人工 meta-action 审核：108 个样本中 `trajectory_alignment_correct=yes` 为 108，`agent_alignment_correct=yes` 为 108；6 类 action 均有审核覆盖。
 - 已完成 Phase -1.9 real-data label freeze gate 与 manifest readiness precheck：108 条冻结审核记录均具有完整 3 秒轨迹、存在的相对 `CAM_FRONT` 路径和当前时刻配置半径内的 VRU presence。
 - 已完成 Phase 0.1 audited seed-subset manifest、固定 seed scene split、统一评测协议、完整 contract validator 与 Majority Baseline。
-- 已完成 Phase 0.1b trainval manifest v1 协议和 `official_train_scene_label_stratified_v1` split：official train 700 scenes → project train 560 / validation 140，official val 150 scenes → project test 150；完整 manifest 尚未写出。
-- 新 20-scene pilot 的 train/validation/test scenes 为 13/3/4，扫描 804 samples，纳入 533，排除 271；完整 scene mapping 的 overlap 为 0，六类长尾硬约束均满足。
+- 已完成并冻结 Phase 0.1b trainval dataset protocol v1：`horizon_sec=3.0`、`sample_interval_sec=0.5`、`time_tolerance_sec=0.075`、`label_rule_version=phase-1.6-meta-action-v0.2`、`split_strategy_version=official_train_scene_label_stratified_v1`、`split_seed=20260710`。
+- 完整 850-scene split 为 project train/validation/test `560/140/150`；正式 manifest 扫描 34,149 samples，纳入 21,646 条（train 14,253 / validation 3,594 / test 3,799），排除 12,503 条。
 - 已建立环境检查与 workspace cleanup dry-run 脚本。
 
 ## Active Source Files
@@ -77,18 +77,21 @@ source_audit_record
 - 历史 source audit 的路径、alignment 与 v0.1 rule version 已重新核验；`label_correct=yes=103/no=5` 保持为历史事实，108 条历史 CAM_FRONT 路径均与当前派生路径一致。
 - VRU presence（当前 sample、配置半径内）：`yes=89`、`no=19`；strict boundary-flag cases=17，diagnostic cases=46，含 lateral、speed 与 stop 相关 flags。
 - `safety_rule_version=not_available`；安全审核从 Phase 1 开始，不是本次 label freeze gate 的完成条件。
-- 正式 trainval schema 为 `phase0_trainval_dataset_manifest_v1`，支持已有 audit token 的 `audited` 完整来源与未匹配记录的 `unaudited/null`；现有 `phase0_audited_seed_subset_v1` 保持兼容。本次固定 20-scene pilot 未抽中历史 audit token，因此实际为 `audited=0`、`unaudited=533`；完整 850-scene 扫描确认 108 个 audit token 全部匹配、0 过滤、0 缺失。
+- 正式 trainval schema 为 `phase0_trainval_dataset_manifest_v1`，支持已有 audit token 的 `audited` 完整来源与未匹配记录的 `unaudited/null`；现有 `phase0_audited_seed_subset_v1` 保持兼容。完整 manifest 为 `audited=108`、`unaudited=21538`，108 个历史 audit token 全部匹配、0 过滤、0 缺失。
 - official train 有效样本 17847 条，六类分布为 `keep=6322`、`accelerate=1857`、`decelerate=2860`、`stop=3044`、`left_lateral=1691`、`right_lateral=2073`；stratified/fixed-random objective 分别为 `0.0020518908` / `0.0605638706`。
-- 完整 scene mapping sidecar 位于 `VLA_DERIVED_ROOT` 且不进入 Git：850 scenes 映射为 project train/validation/test `560/140/150`，mapping SHA-256 为 `a96e04aaf068e75b0aa3ecb8412dc5b35fea2412d7090bbee0a6661132923b12`，scene histogram SHA-256 为 `0cee51a6f64e3f2e10382ca7672cc0aa1386065a3fe8a1f927f5469e211a11a2`；六类硬约束均满足。
-- 新 trainval pilot 排除统计：`insufficient_remaining_horizon=124`、`timestamp_out_of_tolerance=147`，其余正式排除原因均为 0；motion availability 为 `full=501`、`partial=17`、`unavailable=15`。
+- 正式 manifest 与 mapping sidecar 位于 `$VLA_DERIVED_ROOT/phase_0_1b/trainval_manifest_v1/`，不进入 Git 且不得由后续实验覆盖。manifest 文件 SHA-256 为 `60517f985fec8fe3977a31660a5204942e9fd36baf09ea4d950328b1f225d1b3`，sidecar 文件 SHA-256 为 `fa94cc4c1d7b7b24476d6043cd132fa0b7fa5ace2285a82200c363a3d3501be8`，内部 mapping SHA-256 为 `a96e04aaf068e75b0aa3ecb8412dc5b35fea2412d7090bbee0a6661132923b12`，scene histogram SHA-256 为 `0cee51a6f64e3f2e10382ca7672cc0aa1386065a3fe8a1f927f5469e211a11a2`。
+- 全量排除统计为 `insufficient_remaining_horizon=5210`、`timestamp_out_of_tolerance=7293`。前者已完成专项诊断；后者未发现时间单位、timestamp source、nearest-search、scene-chain 或浮点边界实现错误。
+- streaming manifest validation、exclusion diagnostic 与 rare-class constraints 均通过；duplicate sample token、scene split overlap、绝对路径泄漏、缺失 CAM_FRONT、official val → project test 违规和 official train → project test 违规均为 0。
+- 0.100 秒 nearest candidate 可恢复更多样本，exact-grid interpolation 标签总体一致率为 98.0458%，但 validation `decelerate` 一致率为 91.89%，仍存在边界风险，因此正式协议保持 0.075 秒。exact-grid interpolation 作为可选 v1.1 数据增强 backlog，不阻塞 Phase 0.2。
+- visual protocol comparison template 已通过；首批 train/validation 可视化未发现明显轨迹方向、左右坐标或时间顺序错误。test 未用于协议选择且继续封存，0.100/exact-grid 未成为正式协议。
 
 ## Open Questions / Pending Verification
 
-- 下一步是完整 850-scene trainval manifest 构建与按 split/action/boundary 的分层人工抽检。
-- 不启动 Phase 0.2 rule baseline、Qwen3-VL、LoRA、DPO、safety scorer、完整 occupancy network 或 trajectory-level 训练，直至 Phase 0.1b 全量 gate 完成。
+- exact-grid interpolation v1.1 是可选数据增强 backlog；如后续评估，应保持现有 v1 manifest、sidecar 与 test split 不变，并单独提升协议版本。
+- Phase 0.1b gate 已完成；下一阶段可按既定顺序进入 Phase 0.2，但本次仅冻结数据协议，不实现 rule baseline 或任何模型训练。
 
 ## Next Gate
 
-- 保持 `sample_token → CAM_FRONT image → future ego trajectory → nearby 3D agents → one-page visualization` 的可复现核验。
-- 保持 official train 700 → project train 560 / validation 140 的 label-stratified scene-level split，并保持 official val 150 → project test 150 且不参与优化。
-- 运行完整 trainval manifest v1 构建，复核排除原因、六类分布、motion availability、绝对路径泄漏与 split overlap，再进行分层人工抽检。
+- Phase 0.2 rule baseline 只允许使用 inference-time current/past ego state，不得读取 future ego trajectory、derived meta-action 或 test label。
+- 后续实验复用已冻结的 train/validation/test scene mapping、action vocabulary 与 manifest v1；不得根据模型、prompt 或标签分布重新调整 test split。
+- test 继续封存；Phase 0.2 的 sample-level 输出、输入字段审计与统一 action metrics 完成前，不进入 Phase 0.3。
