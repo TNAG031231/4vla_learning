@@ -1,0 +1,35 @@
+freeze_schema_version: "phase0.2_rule_freeze_v0.1"
+frozen_rule_version: "phase0.2-ego-motion-rule-v0.1"
+source_rule_version: "phase0.2b-ego-motion-rule-v0.1"
+
+manifest_relative_path: "phase_0_1b/trainval_manifest_v1/manifest.jsonl"
+expected_manifest_sha256: "60517f985fec8fe3977a31660a5204942e9fd36baf09ea4d950328b1f225d1b3"
+expected_manifest_schema_version: "phase0_trainval_dataset_manifest_v1"
+expected_label_rule_version: "phase-1.6-meta-action-v0.2"
+expected_split_seed: 20260710
+expected_split_strategy_version: "official_train_scene_label_stratified_v1"
+
+source_output_relative_dir: "phase_0_2/ego_motion_rule_v0_1"
+output_relative_dir: "phase_0_2/ego_motion_rule_freeze_v0_1"
+
+selected_candidate_id: "candidate-0293"
+expected_thresholds_sha256: "43feb5e2baad95bed63e98557eb63c7c2a8fdfbca07a503825f60d41b08d82c9"
+
+thresholds:
+  stop_speed_threshold_mps: 0.2
+  lateral_yaw_rate_threshold_radps: 0.05
+  accelerate_threshold_mps2: 0.5
+  decelerate_threshold_mps2: 0.3
+
+expected_source_sha256:
+  candidate_leaderboard.json: "bc5067a27fb216bbea36af7f62346f2522958b20bce07e42113db737801c11c6"
+  selected_rule.json: "981f28b5cab62fce8d21a77690b317ce02296e5423cfb6e0f988db5e6c821529"
+  validation_predictions.jsonl: "588569dc75989d993435b6b3b42cfc18a079bf4dd95ae1b0ef2f540e4dd2be20"
+  validation_metrics.json: "a56e8c9a49c05d6a4f0c09489398fcf214e6733e7ee642029533a73f66edff51"
+  majority_validation_metrics.json: "a04e32e033c95f9272e1db2cc1e818b4e431a49e33df22e80e78ab1d1260bb1b"
+  comparison.json: "6f9ef3366163e7c688b86d7f725f5a076d674ca4ba012d9aaa9003a32f935dff"
+
+diagnostic_margin:
+  stop_speed_mps: 0.05
+  lateral_yaw_rate_radps: 0.01
+  longitudinal_acceleration_mps2: 0.05

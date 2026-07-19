@@ -88,14 +88,16 @@ source_audit_record
 - streaming manifest validation、exclusion diagnostic 与 rare-class constraints 均通过；duplicate sample token、scene split overlap、绝对路径泄漏、缺失 CAM_FRONT、official val → project test 违规和 official train → project test 违规均为 0。
 - 0.100 秒 nearest candidate 可恢复更多样本，exact-grid interpolation 标签总体一致率为 98.0458%，但 validation `decelerate` 一致率为 91.89%，仍存在边界风险，因此正式协议保持 0.075 秒。exact-grid interpolation 作为可选 v1.1 数据增强 backlog，不阻塞 Phase 0.2。
 - visual protocol comparison template 已通过；首批 train/validation 可视化未发现明显轨迹方向、左右坐标或时间顺序错误。test 未用于协议选择且继续封存，0.100/exact-grid 未成为正式协议。
+- Phase 0.2c failure analysis 已完成，`phase0.2-ego-motion-rule-v0.1` 冻结为 `candidate-0293`：stop speed `0.2 m/s`、lateral yaw rate `0.05 rad/s`、accelerate `0.5 m/s²`、decelerate `0.3 m/s²`；validation prediction 复现为 `3594/3594`。
+- validation 的主要错误模式为 `keep → decelerate`（260）与 `decelerate → keep`（181）。该 validation 同时用于 Phase 0.2b 候选选择与报告，不代表无偏 test 性能；test 尚未评测。
 
 ## Open Questions / Pending Verification
 
 - exact-grid interpolation v1.1 是可选数据增强 backlog；如后续评估，应保持现有 v1 manifest、sidecar 与 test split 不变，并单独提升协议版本。
-- Phase 0.2b deterministic rule baseline 已完成；Phase 0.2c failure analysis / rule freeze 尚未完成，不进入后续模型阶段。
+- Phase 0.2c deterministic rule failure analysis / freeze 已完成；Phase 0.2d one-shot test 尚未执行。
 
 ## Next Gate
 
-- Phase 0.2c 仅允许在已冻结的 validation 协议上开展 failure analysis 与新 rule version 评估，不得事后改写 Phase 0.2b 的固定 candidate grid 或使用 test 调参。
+- Phase 0.2d one-shot test 是下一 gate；必须使用已冻结的 `phase0.2-ego-motion-rule-v0.1`，不得根据 test 结果改写规则或阈值。
 - 后续实验复用已冻结的 train/validation/test scene mapping、action vocabulary 与 manifest v1；不得根据模型、prompt 或标签分布重新调整 test split。
 - test 继续封存；Phase 0.2 的 sample-level 输出、输入字段审计与统一 action metrics 完成前，不进入 Phase 0.3。
