@@ -1,0 +1,8 @@
+version: "phase0.2-ego-motion-v0.1"
+manifest_relative_path: "phase_0_1b/trainval_manifest_v1/manifest.jsonl"
+expected_manifest_sha256: "60517f985fec8fe3977a31660a5204942e9fd36baf09ea4d950328b1f225d1b3"
+expected_manifest_schema_version: "phase0_trainval_dataset_manifest_v1"
+expected_label_rule_version: "phase-1.6-meta-action-v0.2"
+expected_split_seed: 20260710
+expected_split_strategy_version: "official_train_scene_label_stratified_v1"
+output_relative_dir: "phase_0_2/ego_motion_v0_1"
