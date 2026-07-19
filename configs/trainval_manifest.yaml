@@ -1,0 +1,12 @@
+version: "v1.0-trainval"
+split_seed: 20260710
+split_strategy_version: "official_train_scene_label_stratified_v1"
+pilot_seed: 20260715
+pilot_scene_count: 20
+data_config_path: "configs/data.yaml"
+action_config_path: "configs/action_rules.yaml"
+base_audit_path: "data/phase_1_7_manual_audit.csv"
+supplement_audit_path: "data/phase_1_7_lateral_supplement_audit.csv"
+manifest_relative_path: "phase_0_1b/trainval_manifest_v1/manifest.jsonl"
+pilot_manifest_relative_path: "phase_0_1b/trainval_manifest_v1/pilot_manifest.jsonl"
+scene_split_mapping_relative_path: "phase_0_1b/trainval_manifest_v1/scene_split_mapping_v1.json"

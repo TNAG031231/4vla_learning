@@ -11,15 +11,15 @@
 - 108 个样本的人工审核、6 类 action 覆盖和 real-data freeze audit（108/108）；
 - 现有数据检查、审核、环境检查与 workspace cleanup 脚本及对应测试。
 - Phase 0.1 audited seed-subset manifest、固定 seed 的 scene-level split、Majority Baseline、六类统一评测协议、invalid prediction 指标处理和完整 manifest contract validator。
+- Phase 0.1b trainval dataset protocol v1、完整 850-scene manifest、official-train scene-level label-stratified split、排除原因诊断与 train/validation 视觉审核。
 
 ### Planned
 
-- Phase 0.1b 从 nuScenes mini 扩展至 trainval，并生成正式 dataset manifest v1（next）；
 - coarse action 的 rule-based、zero-shot / few-shot 与 LoRA / action adapter baselines；
 - GT-derived BEV/OCC-aware temporal safety evaluator、offline reranker 与可选 coarse-action DPO；
 - short temporal input、map / route、fine-grained maneuver、continuous waypoint、optional BEV/OCC auxiliary 与闭环或 quasi-closed-loop evaluation。
 
-Phase -1 freeze gate 与 Phase 0.1 均已完成并合并。当前已实现 coarse meta-action label/data protocol、audited manifest/split/evaluation infrastructure 与 Majority Baseline；coarse neural action head、Qwen3-VL、rule-based baseline、LoRA、action adapter、安全 scorer、reranker、DPO、fine maneuver、waypoint 与 predicted BEV/OCC 均为 planned。
+Phase -1 freeze gate 与 Phase 0.1 均已完成并合并；Phase 0.1b dataset protocol v1 已完成全量构建、自动验收、排除原因诊断和 train/validation 视觉审核并冻结。当前已实现 coarse meta-action label/data protocol、audited/trainval manifest infrastructure 与 Majority Baseline；coarse neural action head、Qwen3-VL、rule-based baseline、LoRA、action adapter、安全 scorer、reranker、DPO、fine maneuver、waypoint 与 predicted BEV/OCC 均为 planned。
 
 ## Inference and Safety Boundaries
 
@@ -52,9 +52,9 @@ flowchart LR
 
 ## Current Phase 0.1 Manifest Schema
 
-当前已实现的 `phase0_audited_seed_subset_v1` 是 audited seed-subset schema，不是正式 trainval manifest v1。稳定字段为 `sample_token`、`scene_token`、`timestamp`、`cam_front_path`、`current_ego_pose`、`current_ego_motion`、`coordinate_metadata`、`future_ego_trajectory`、`nearby_agents`、`split` 与 `manifest_schema_version`；派生/追溯字段为 `meta_action`、`label_rule_version`、`safety_rule_version` 与 `source_audit_record`。当前 `label_rule_version=phase-1.6-meta-action-v0.2`。
+当前 `phase0_audited_seed_subset_v1` 仍是 audited seed-subset schema，不是完整 trainval 训练数据。Phase 0.1b 已冻结正式 `phase0_trainval_dataset_manifest_v1`：在相同稳定字段基础上增加 `official_split`、`split_seed`、`split_strategy_version`、`split_mapping_sha256`、`audit_status` 与 `source_audit_record` 追溯；已有 audit token 保留完整审核来源，未匹配记录保持 `unaudited/null`。当前 `label_rule_version=phase-1.6-meta-action-v0.2`，旧 schema 保持兼容。
 
-`current_ego_pose` 记录 `frame`、`translation_m`、`rotation_wxyz`、`timestamp_us`、`timestamp_source`；`current_ego_motion` 记录 `speed_mps`、`longitudinal_acceleration_mps2`、`yaw_rate_radps`、`source`、`timestamp_source`、`availability`、`history_interval_sec`、`acceleration_interval_sec` 与 `unavailable_reason`。timestamp source 固定为 `CAM_FRONT_sample_data`，motion 仅使用当前和历史 pose，绝不使用 future pose 或 future trajectory。正式 trainval dataset manifest v1 仅在 Phase 0.1b 生成。
+`current_ego_pose` 记录 `frame`、`translation_m`、`rotation_wxyz`、`timestamp_us`、`timestamp_source`；`current_ego_motion` 记录 `speed_mps`、`longitudinal_acceleration_mps2`、`yaw_rate_radps`、`source`、`timestamp_source`、`availability`、`history_interval_sec`、`acceleration_interval_sec` 与 `unavailable_reason`。timestamp source 固定为 `CAM_FRONT_sample_data`，motion 仅使用当前和历史 pose，绝不使用 future pose 或 future trajectory。正式 trainval dataset manifest v1 位于 `$VLA_DERIVED_ROOT/phase_0_1b/trainval_manifest_v1/`，不进入 Git，且不得由后续实验静默覆盖。
 
 ## Quickstart: Existing Commands
 
@@ -65,9 +65,20 @@ conda run -n codex4vla_env python scripts/check_env.py
 conda run -n codex4vla_env pytest tests/test_check_env.py tests/test_clean_workspace.py tests/test_inspect_nuscenes_sample.py tests/test_verify_labels.py tests/test_meta_action.py tests/test_phase_1_7_manual_audit.py
 conda run -n codex4vla_env python data/validate_label_freeze.py --dataroot data/nuscenes
 conda run -n codex4vla_env python scripts/clean_workspace.py
+conda run -n codex4vla_env python data/build_trainval_manifest.py --config configs/trainval_manifest.yaml --pilot
 ```
 
-`clean_workspace.py` 默认仅输出 dry-run 候选，不删除文件。项目当前不提供 baseline、reranker、DPO 或 trajectory training 命令，因为它们尚未实现。
+trainval pilot 命令要求预先设置 `NUSCENES_ROOT` 与 `VLA_DERIVED_ROOT`；派生 manifest 写入后者且不进入 Git。`clean_workspace.py` 默认仅输出 dry-run 候选，不删除文件。项目当前不提供 neural baseline、reranker、DPO 或 trajectory training 命令，因为它们尚未实现。
+
+## Phase 0.1b Dataset Protocol v1（Frozen）
+
+正式 split 先基于完整官方 train/val scenes 固定：官方 train 的 700 scenes 使用 seed `20260710` 和 `official_train_scene_label_stratified_v1`，按有效样本六维 action histogram 映射为 project train 560 / validation 140；官方 val 的 150 scenes 不参与优化并全部作为 project test。目标函数为 train/validation 相对 official train 的类别分布距离、validation scene coverage 偏差与长尾硬约束罚项之和；实测 stratified objective 为 `0.0020518908`，fixed-random 对照为 `0.0605638706`，六类硬约束均满足。pilot 再以 seed `20260715` 从该固定映射中选择 20 scenes，实际覆盖 train 13 / validation 3 / test 4。
+
+正式协议冻结为 `horizon_sec=3.0`、`sample_interval_sec=0.5`、`time_tolerance_sec=0.075`、`label_rule_version=phase-1.6-meta-action-v0.2`、`split_strategy_version=official_train_scene_label_stratified_v1`、`split_seed=20260710`。全量扫描 34,149 samples，纳入 21,646 条（train 14,253 / validation 3,594 / test 3,799），排除 12,503 条：`insufficient_remaining_horizon=5210`、`timestamp_out_of_tolerance=7293`。两类排除均已完成专项诊断；未发现时间单位、timestamp source、nearest-search、scene-chain 或浮点边界实现错误。
+
+正式 manifest 文件 SHA-256 为 `60517f985fec8fe3977a31660a5204942e9fd36baf09ea4d950328b1f225d1b3`，scene mapping sidecar 文件 SHA-256 为 `fa94cc4c1d7b7b24476d6043cd132fa0b7fa5ace2285a82200c363a3d3501be8`，内部 mapping SHA-256 为 `a96e04aaf068e75b0aa3ecb8412dc5b35fea2412d7090bbee0a6661132923b12`，scene histogram SHA-256 为 `0cee51a6f64e3f2e10382ca7672cc0aa1386065a3fe8a1f927f5469e211a11a2`。108 个历史 audit token 全部匹配，manifest 为 `audited=108`、`unaudited=21538`；duplicate token、scene overlap、绝对路径泄漏、缺失 CAM_FRONT 和 official/project split 违规均为 0，rare-class constraints 与 full manifest validation 均通过。
+
+train/validation 视觉审核未发现明显轨迹方向、左右坐标或时间顺序错误，test 未用于协议选择并继续封存。0.100 秒 nearest candidate 可恢复更多样本，exact-grid interpolation 的总体标签一致率为 98.0458%，但 validation `decelerate` 一致率为 91.89%，仍存在边界风险，因此正式协议保持 0.075 秒；exact-grid interpolation 仅作为可选 v1.1 数据增强 backlog，不阻塞后续阶段。
 
 ## Repository Entry Points
 
@@ -78,7 +89,7 @@ conda run -n codex4vla_env python scripts/clean_workspace.py
 
 ## Roadmap and Scope
 
-当前顺序为：Phase -1 数据闭环与 coarse 标签冻结（completed）→ Phase 0.1 manifest 协议、scene-level split、统一 metrics 与 Majority Baseline（completed）→ Phase 0.1b trainval scale-up（next）→ Phase 0.2 ego-motion rule baseline → Phase 0.3 Qwen3-VL zero-shot / few-shot → Phase 0.4 coarse LoRA / action adapter → Phase 0.5a geometric safety scorer → Phase 0.5b offline safety reranker → Phase 0.6 preference pair audit 与可选 coarse-action DPO。mini 只用于数据链路 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须基于 trainval manifest，mini 上仅允许 smoke run。
+当前顺序为：Phase -1 数据闭环与 coarse 标签冻结（completed）→ Phase 0.1 manifest 协议、scene-level split、统一 metrics 与 Majority Baseline（completed）→ Phase 0.1b trainval scale-up 与 dataset protocol v1 冻结（completed）→ Phase 0.2 ego-motion rule baseline（next）→ Phase 0.3 Qwen3-VL zero-shot / few-shot → Phase 0.4 coarse LoRA / action adapter → Phase 0.5a geometric safety scorer → Phase 0.5b offline safety reranker → Phase 0.6 preference pair audit 与可选 coarse-action DPO。mini 只用于数据链路 smoke test、快速回归、人工审核和小规模调试；正式 LoRA、action adapter 与 DPO 必须基于 trainval manifest，mini 上仅允许 smoke run。
 
 后续扩展为：short temporal input → map / route / lane topology → hierarchical fine-grained maneuver → continuous waypoint head → BEV / occupancy auxiliary supervision → closed-loop or quasi-closed-loop evaluation。Phase 0 的 action experiments 仍须报告 macro-F1、per-class F1、confusion matrix、class distribution、invalid output rate 与 failure cases；safety 结果同时监控 collision/near-miss、VRU、`unnecessary_stop` 与 macro-F1。
 

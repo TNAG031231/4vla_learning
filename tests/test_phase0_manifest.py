@@ -1,4 +1,5 @@
 import math
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from data import build_phase0_manifest as manifest_builder
 from src.phase0.protocol import read_manifest_samples
+from src.phase0.manifest import SourceAuditRecord, write_jsonl_records
 
 
 class FakeNuScenes:
@@ -22,6 +24,16 @@ class FakeNuScenes:
 
     def get(self, table_name: str, token: str) -> dict[str, object]:
         return self.tables[table_name][token]
+
+
+def test_common_manifest_module_does_not_depend_on_specific_builders() -> None:
+    module_source = (PROJECT_ROOT / "src/phase0/manifest.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "build_phase0_manifest" not in module_source
+    assert "build_trainval_manifest" not in module_source
+    assert manifest_builder.SourceAuditRecord is SourceAuditRecord
 
 
 def rotation_from_yaw(yaw_rad: float) -> list[float]:
@@ -179,6 +191,58 @@ def test_manifest_reader_rejects_unknown_action(tmp_path: Path) -> None:
         raise AssertionError("unknown meta_action must be rejected")
 
 
+def test_atomic_jsonl_write_replaces_complete_file(tmp_path: Path) -> None:
+    output_path = tmp_path / "manifest.jsonl"
+    output_path.write_text("old\n", encoding="utf-8")
+
+    write_jsonl_records(
+        ({"sample_token": "a"}, {"sample_token": "b"}),
+        output_path,
+    )
+
+    assert [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    ] == [{"sample_token": "a"}, {"sample_token": "b"}]
+
+
+def test_atomic_jsonl_write_preserves_old_file_and_cleans_temp_on_error(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "manifest.jsonl"
+    output_path.write_text("old\n", encoding="utf-8")
+
+    def failing_records():
+        yield {"sample_token": "new"}
+        raise RuntimeError("simulated write failure")
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        write_jsonl_records(failing_records(), output_path)
+
+    assert output_path.read_text(encoding="utf-8") == "old\n"
+    assert tuple(tmp_path.glob(".manifest.jsonl.*.tmp")) == ()
+
+
+def test_atomic_jsonl_validation_failure_preserves_old_file(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "manifest.jsonl"
+    output_path.write_text("old\n", encoding="utf-8")
+
+    def reject_output(_: Path) -> None:
+        raise ValueError("simulated validation failure")
+
+    with pytest.raises(ValueError, match="simulated validation failure"):
+        write_jsonl_records(
+            ({"sample_token": "new"},),
+            output_path,
+            validator=reject_output,
+        )
+
+    assert output_path.read_text(encoding="utf-8") == "old\n"
+    assert tuple(tmp_path.glob(".manifest.jsonl.*.tmp")) == ()
+
+
 def test_current_ego_pose_and_motion_use_past_samples_only() -> None:
     reader = build_motion_reader()
 
@@ -245,6 +309,16 @@ def test_motion_without_two_past_intervals_is_partial() -> None:
     assert motion["availability"] == "partial"
     assert motion["acceleration_interval_sec"] is None
     assert motion["unavailable_reason"] == "insufficient_past_history_for_acceleration"
+
+
+def test_motion_with_missing_past_pose_is_unavailable() -> None:
+    reader = build_motion_reader()
+    del reader.tables["ego_pose"]["pose-previous"]
+
+    motion = manifest_builder.current_ego_motion(reader, "current")
+
+    assert motion["availability"] == "unavailable"
+    assert motion["unavailable_reason"] == "past_ego_pose_unavailable"
 
 
 def test_motion_does_not_cross_scenes() -> None:

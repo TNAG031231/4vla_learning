@@ -33,6 +33,7 @@ class FakeNuScenes:
                 "token": "current",
                 "scene_token": "scene",
                 "timestamp": 1_000_000,
+                "prev": "",
                 "next": "future",
                 "data": {"CAM_FRONT": "current_camera"},
             },
@@ -40,6 +41,7 @@ class FakeNuScenes:
                 "token": "future",
                 "scene_token": "scene",
                 "timestamp": 1_500_000,
+                "prev": "current",
                 "next": "",
                 "data": {"CAM_FRONT": "future_camera"},
             },
@@ -75,6 +77,7 @@ class FakeJitterNuScenes:
                 "token": "current",
                 "scene_token": "scene",
                 "timestamp": current_timestamp,
+                "prev": "",
                 "next": tokens[1] if len(tokens) > 1 else "",
                 "data": {"CAM_FRONT": "camera-current"},
             },
@@ -95,6 +98,7 @@ class FakeJitterNuScenes:
                 "token": token,
                 "scene_token": "scene",
                 "timestamp": current_timestamp + round(time_sec * 1_000_000),
+                "prev": tokens[index],
                 "next": next_token,
                 "data": {"CAM_FRONT": camera_token},
             }
@@ -301,6 +305,106 @@ def test_missing_three_second_keyframe_is_truncated() -> None:
 
     assert len(trajectory.points) == 6
     assert trajectory.is_truncated is True
+
+
+def test_future_grid_accepts_timestamp_at_tolerance_boundary() -> None:
+    inspection = load_inspection_module()
+
+    grid = inspection.select_future_sample_grid(
+        nuscenes=FakeJitterNuScenes((0.575,)),
+        sample_token="current",
+        horizon_sec=0.5,
+        sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
+    )
+
+    assert grid.horizon_covered is True
+    assert grid.exclusion_reason is None
+    assert grid.selected_sample_tokens == ("future-0",)
+
+
+def test_future_grid_rejects_timestamp_beyond_tolerance_boundary() -> None:
+    inspection = load_inspection_module()
+
+    grid = inspection.select_future_sample_grid(
+        nuscenes=FakeJitterNuScenes((0.575001,)),
+        sample_token="current",
+        horizon_sec=0.5,
+        sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
+    )
+
+    assert grid.horizon_covered is False
+    assert grid.exclusion_reason == "timestamp_out_of_tolerance"
+
+
+def test_future_grid_distinguishes_insufficient_horizon() -> None:
+    inspection = load_inspection_module()
+
+    grid = inspection.select_future_sample_grid(
+        nuscenes=FakeJitterNuScenes((0.4,)),
+        sample_token="current",
+        horizon_sec=1.0,
+        sample_interval_sec=0.5,
+        time_tolerance_sec=0.075,
+    )
+
+    assert grid.horizon_covered is False
+    assert grid.exclusion_reason == "insufficient_remaining_horizon"
+
+
+def test_future_grid_distinguishes_broken_chain_and_scene_mismatch() -> None:
+    inspection = load_inspection_module()
+    broken_reader = FakeJitterNuScenes((0.5,))
+    broken_reader.records[("sample", "future-0")]["prev"] = "wrong"
+    cross_scene_reader = FakeJitterNuScenes((0.5,))
+    cross_scene_reader.records[("sample", "future-0")]["scene_token"] = "other"
+
+    broken = inspection.select_future_sample_grid(
+        broken_reader,
+        "current",
+        0.5,
+        0.5,
+        0.075,
+    )
+    cross_scene = inspection.select_future_sample_grid(
+        cross_scene_reader,
+        "current",
+        0.5,
+        0.5,
+        0.075,
+    )
+
+    assert broken.exclusion_reason == "broken_next_chain"
+    assert cross_scene.exclusion_reason == "scene_mismatch"
+
+
+@pytest.mark.parametrize(
+    "future_times_sec",
+    ((0.5,), (0.4,), (0.575001,)),
+)
+def test_future_grid_and_trajectory_truncation_are_consistent(
+    future_times_sec: tuple[float, ...],
+) -> None:
+    inspection = load_inspection_module()
+    reader = FakeJitterNuScenes(future_times_sec)
+    grid = inspection.select_future_sample_grid(
+        reader,
+        "current",
+        0.5,
+        0.5,
+        0.075,
+    )
+    trajectory = inspection.extract_future_ego_trajectory(
+        reader,
+        "current",
+        0.5,
+        0.5,
+        0.075,
+        future_grid=grid,
+    )
+
+    assert trajectory.is_truncated is (not grid.horizon_covered)
 
 
 def test_global_point_is_transformed_into_current_ego_frame() -> None:

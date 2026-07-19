@@ -9,12 +9,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.actions.schema import ACTION_SCHEMA
+from src.phase0.manifest import write_jsonl_records
 from src.phase0.protocol import (
     ManifestSample,
     assign_scene_splits,
     complete_action_distribution,
     evaluate_classification,
+    iter_manifest_rows,
     read_manifest_samples,
+    select_pilot_scene_tokens,
     validate_manifest,
     validate_scene_split_isolation,
 )
@@ -54,6 +57,27 @@ def test_scene_level_split_rejects_same_scene_across_splits() -> None:
 
     with pytest.raises(ValueError, match="scene_token spans splits"):
         validate_scene_split_isolation(samples)
+
+
+def test_pilot_scene_selection_is_reproducible_and_covers_all_splits() -> None:
+    scene_splits = {
+        **{f"train-{index}": "train" for index in range(560)},
+        **{f"validation-{index}": "validation" for index in range(140)},
+        **{f"test-{index}": "test" for index in range(150)},
+    }
+    frozen_mapping = dict(scene_splits)
+
+    first = select_pilot_scene_tokens(scene_splits, scene_count=20, seed=20260715)
+    second = select_pilot_scene_tokens(scene_splits, scene_count=20, seed=20260715)
+
+    assert first == second
+    assert scene_splits == frozen_mapping
+    assert len(first) == len(set(first)) == 20
+    assert Counter(scene_splits[token] for token in first) == {
+        "train": 13,
+        "validation": 3,
+        "test": 4,
+    }
 
 
 def test_metrics_keep_all_actions_when_split_has_missing_classes() -> None:
@@ -201,6 +225,24 @@ def manifest_row(sample_token: str = "sample") -> dict[str, object]:
     }
 
 
+def trainval_manifest_row(sample_token: str = "sample") -> dict[str, object]:
+    row = manifest_row(sample_token)
+    row.update(
+        {
+            "manifest_schema_version": "phase0_trainval_dataset_manifest_v1",
+            "audit_status": "unaudited",
+            "source_audit_record": None,
+            "official_split": "train",
+            "split_seed": 20260710,
+            "split_strategy_version": (
+                "official_train_scene_label_stratified_v1"
+            ),
+            "split_mapping_sha256": "a" * 64,
+        }
+    )
+    return row
+
+
 def test_complete_manifest_validator_accepts_contract(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.jsonl"
     manifest_path.write_text(
@@ -214,6 +256,217 @@ def test_complete_manifest_validator_accepts_contract(tmp_path: Path) -> None:
     assert summary.scene_count == 1
     assert summary.manifest_schema_version == "phase0_audited_seed_subset_v1"
     assert summary.label_rule_version == "phase-1.6-meta-action-v0.2"
+
+
+def test_trainval_manifest_validator_accepts_unaudited_contract(
+    tmp_path: Path,
+) -> None:
+    row = trainval_manifest_row()
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    summary = validate_manifest(manifest_path)
+
+    assert summary.manifest_schema_version == "phase0_trainval_dataset_manifest_v1"
+    assert summary.split_mapping_sha256 == "a" * 64
+
+
+def test_trainval_manifest_validator_accepts_audited_provenance(
+    tmp_path: Path,
+) -> None:
+    row = trainval_manifest_row()
+    row["audit_status"] = "audited"
+    row["source_audit_record"] = {
+        "source_audit": "base",
+        "sample_token": "sample",
+        "historical_derived_action": "keep",
+        "reviewed_action": "keep",
+        "label_correct": "yes",
+        "historical_label_rule_version": "phase-1.6-meta-action-v0.1",
+    }
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    summary = validate_manifest(manifest_path)
+
+    assert summary.sample_count == 1
+
+
+def test_trainval_manifest_validator_rejects_missing_audited_provenance(
+    tmp_path: Path,
+) -> None:
+    row = trainval_manifest_row()
+    row["audit_status"] = "audited"
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a mapping"):
+        validate_manifest(manifest_path)
+
+
+def test_trainval_manifest_validator_rejects_audit_record(
+    tmp_path: Path,
+) -> None:
+    row = trainval_manifest_row()
+    row["source_audit_record"] = {"source_audit": "unexpected"}
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_audit_record must be null"):
+        validate_manifest(manifest_path)
+
+
+@pytest.mark.parametrize(
+    "cam_front_path",
+    (
+        "/private/data/image.jpg",
+        "C:/data/image.jpg",
+        "C:\\data\\image.jpg",
+        "\\\\server\\share\\image.jpg",
+        "samples/CAM_FRONT/../image.jpg",
+        "samples/CAM_BACK/image.jpg",
+        "other/samples/CAM_FRONT/image.jpg",
+    ),
+)
+def test_manifest_validator_rejects_nonportable_cam_front_path(
+    tmp_path: Path,
+    cam_front_path: str,
+) -> None:
+    row = manifest_row()
+    row["cam_front_path"] = cam_front_path
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="relative to NUSCENES_ROOT"):
+        validate_manifest(manifest_path)
+
+
+def test_trainval_manifest_validator_requires_one_mapping_hash(
+    tmp_path: Path,
+) -> None:
+    first = trainval_manifest_row("sample-a")
+    second = trainval_manifest_row("sample-b")
+    second["split_mapping_sha256"] = "b" * 64
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(first) + "\n" + json.dumps(second) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be singular"):
+        validate_manifest(manifest_path)
+
+
+@pytest.mark.parametrize(
+    "invalid_hash",
+    (
+        "a" * 63,
+        "g" * 64,
+        "A" * 64,
+        123,
+    ),
+)
+def test_trainval_manifest_validator_rejects_invalid_mapping_hash(
+    tmp_path: Path,
+    invalid_hash: object,
+) -> None:
+    row = trainval_manifest_row()
+    row["split_mapping_sha256"] = invalid_hash
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lowercase 64-character SHA-256"):
+        validate_manifest(manifest_path)
+
+
+def test_streaming_manifest_validator_does_not_call_path_read_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(trainval_manifest_row()) + "\n",
+        encoding="utf-8",
+    )
+
+    def reject_read_text(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("streaming validator must not call Path.read_text")
+
+    monkeypatch.setattr(Path, "read_text", reject_read_text)
+
+    assert tuple(iter_manifest_rows(manifest_path))[0]["sample_token"] == "sample"
+    assert validate_manifest(manifest_path).sample_count == 1
+
+
+def test_large_generator_is_atomically_written_and_summary_is_returned(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    def records():
+        for index in range(2_000):
+            yield trainval_manifest_row(f"sample-{index:04d}")
+
+    summary = write_jsonl_records(
+        records(),
+        manifest_path,
+        validator=validate_manifest,
+    )
+
+    assert summary.sample_count == 2_000
+    assert summary.scene_count == 1
+    assert summary.split_mapping_sha256 == "a" * 64
+
+
+def test_streaming_validator_detects_distant_duplicate_token(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text("old\n", encoding="utf-8")
+
+    def records():
+        for index in range(1_000):
+            yield trainval_manifest_row(f"sample-{index:04d}")
+        yield trainval_manifest_row("sample-0000")
+
+    with pytest.raises(ValueError, match="duplicate sample_token"):
+        write_jsonl_records(
+            records(),
+            manifest_path,
+            validator=validate_manifest,
+        )
+
+    assert manifest_path.read_text(encoding="utf-8") == "old\n"
+    assert tuple(tmp_path.glob(".manifest.jsonl.*.tmp")) == ()
+
+
+def test_streaming_validator_detects_distant_scene_split_overlap(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    def records():
+        first = trainval_manifest_row("sample-first")
+        first["scene_token"] = "shared-scene"
+        yield first
+        for index in range(1_000):
+            row = trainval_manifest_row(f"sample-{index:04d}")
+            row["scene_token"] = f"scene-{index:04d}"
+            yield row
+        last = trainval_manifest_row("sample-last")
+        last["scene_token"] = "shared-scene"
+        last["split"] = "validation"
+        yield last
+
+    with pytest.raises(ValueError, match="scene_token spans splits"):
+        write_jsonl_records(
+            records(),
+            manifest_path,
+            validator=validate_manifest,
+        )
+
+    assert not manifest_path.exists()
+    assert tuple(tmp_path.glob(".manifest.jsonl.*.tmp")) == ()
 
 
 def test_complete_manifest_validator_rejects_duplicate_sample_token(
