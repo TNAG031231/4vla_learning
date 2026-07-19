@@ -1,14 +1,32 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
+from itertools import product
+import json
 import math
 from statistics import fmean, pstdev
 from typing import Final
 
-from src.actions.schema import ACTION_SCHEMA, normalize_action
-from src.phase0.protocol import SPLITS, validate_sha256
+from src.actions.schema import (
+    ACCELERATE,
+    ACTION_SCHEMA,
+    DECELERATE,
+    KEEP,
+    LEFT_LATERAL,
+    RIGHT_LATERAL,
+    STOP,
+    normalize_action,
+)
+from src.phase0.protocol import (
+    SPLITS,
+    ClassificationMetrics,
+    complete_action_distribution,
+    evaluate_classification,
+    validate_sha256,
+)
 
 
 AUDIT_FIELDS: Final = (
@@ -55,6 +73,95 @@ class EgoMotionAuditSample:
     manifest_schema_version: str
     split_mapping_sha256: str
     train_meta_action: str | None
+
+
+@dataclass(frozen=True)
+class EgoMotionRuleThresholds:
+    stop_speed_threshold_mps: float
+    lateral_yaw_rate_threshold_radps: float
+    accelerate_threshold_mps2: float
+    decelerate_threshold_mps2: float
+
+    def __post_init__(self) -> None:
+        for name, value in self.as_dict().items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be a finite positive number")
+
+    def canonical_tuple(self) -> tuple[float, float, float, float]:
+        return (
+            self.stop_speed_threshold_mps,
+            self.lateral_yaw_rate_threshold_radps,
+            self.accelerate_threshold_mps2,
+            self.decelerate_threshold_mps2,
+        )
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "stop_speed_threshold_mps": self.stop_speed_threshold_mps,
+            "lateral_yaw_rate_threshold_radps": (
+                self.lateral_yaw_rate_threshold_radps
+            ),
+            "accelerate_threshold_mps2": self.accelerate_threshold_mps2,
+            "decelerate_threshold_mps2": self.decelerate_threshold_mps2,
+        }
+
+    def sha256(self) -> str:
+        payload = json.dumps(
+            self.as_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class EgoMotionPredictionSample:
+    sample_token: str
+    scene_token: str
+    split: str
+    features: EgoMotionFeatures
+    ground_truth_action: str
+    label_rule_version: str
+    manifest_schema_version: str
+    split_mapping_sha256: str
+
+
+@dataclass(frozen=True)
+class EgoMotionDecision:
+    predicted_action: str
+    decision_reason: str
+
+
+@dataclass(frozen=True)
+class EgoMotionPredictionRecord:
+    sample_token: str
+    scene_token: str
+    split: str
+    ground_truth_action: str
+    predicted_action: str
+    is_correct: bool
+    baseline_name: str
+    rule_version: str
+    candidate_id: str
+    thresholds_sha256: str
+    motion_availability: str
+    speed_mps: float | None
+    longitudinal_acceleration_mps2: float | None
+    yaw_rate_radps: float | None
+    decision_reason: str
+    label_rule_version: str
+    manifest_schema_version: str
+    split_mapping_sha256: str
+
+
+@dataclass(frozen=True)
+class EgoMotionCandidateEvaluation:
+    candidate_id: str
+    thresholds: EgoMotionRuleThresholds
+    thresholds_sha256: str
+    metrics: ClassificationMetrics
+    minimum_per_class_f1: float
+    predicted_class_distribution: dict[str, int]
 
 
 def _required_string(mapping: Mapping[str, object], key: str) -> str:
@@ -150,6 +257,191 @@ def parse_ego_motion_audit_sample(
         ),
         train_meta_action=train_meta_action,
     )
+
+
+def parse_rule_evaluation_sample(
+    row: Mapping[str, object],
+) -> EgoMotionPredictionSample | None:
+    split = _required_string(row, "split")
+    if split != "validation":
+        if split not in SPLITS:
+            raise ValueError(f"unsupported split: {split!r}")
+        return None
+    return EgoMotionPredictionSample(
+        sample_token=_required_string(row, "sample_token"),
+        scene_token=_required_string(row, "scene_token"),
+        split=split,
+        features=parse_ego_motion_features(row),
+        ground_truth_action=normalize_action(_required_string(row, "meta_action")),
+        label_rule_version=_required_string(row, "label_rule_version"),
+        manifest_schema_version=_required_string(row, "manifest_schema_version"),
+        split_mapping_sha256=validate_sha256(
+            row.get("split_mapping_sha256"),
+            "split_mapping_sha256",
+        ),
+    )
+
+
+def predict_ego_motion_action(
+    features: EgoMotionFeatures,
+    thresholds: EgoMotionRuleThresholds,
+) -> EgoMotionDecision:
+    if features.availability == "unavailable":
+        return EgoMotionDecision(KEEP, "unavailable_motion_fallback_keep")
+    if features.availability not in {"full", "partial"}:
+        raise ValueError(f"unsupported motion availability: {features.availability!r}")
+    if (
+        features.availability == "partial"
+        and features.longitudinal_acceleration_mps2 is not None
+    ):
+        raise ValueError("partial motion must keep acceleration null")
+    if features.speed_mps is None or features.yaw_rate_radps is None:
+        raise ValueError("available motion requires speed and yaw rate")
+
+    if features.speed_mps <= thresholds.stop_speed_threshold_mps:
+        return EgoMotionDecision(STOP, "speed_below_stop_threshold")
+    if features.yaw_rate_radps >= thresholds.lateral_yaw_rate_threshold_radps:
+        return EgoMotionDecision(LEFT_LATERAL, "positive_yaw_rate_lateral")
+    if features.yaw_rate_radps <= -thresholds.lateral_yaw_rate_threshold_radps:
+        return EgoMotionDecision(RIGHT_LATERAL, "negative_yaw_rate_lateral")
+    if features.availability == "full":
+        if features.longitudinal_acceleration_mps2 is None:
+            raise ValueError("full motion requires longitudinal acceleration")
+        if (
+            features.longitudinal_acceleration_mps2
+            >= thresholds.accelerate_threshold_mps2
+        ):
+            return EgoMotionDecision(
+                ACCELERATE,
+                "positive_longitudinal_acceleration",
+            )
+        if (
+            features.longitudinal_acceleration_mps2
+            <= -thresholds.decelerate_threshold_mps2
+        ):
+            return EgoMotionDecision(
+                DECELERATE,
+                "negative_longitudinal_acceleration",
+            )
+    return EgoMotionDecision(KEEP, "default_keep")
+
+
+def build_rule_candidates(
+    candidate_grid: Mapping[str, Sequence[float]],
+) -> tuple[tuple[str, EgoMotionRuleThresholds], ...]:
+    field_names = (
+        "stop_speed_threshold_mps",
+        "lateral_yaw_rate_threshold_radps",
+        "accelerate_threshold_mps2",
+        "decelerate_threshold_mps2",
+    )
+    values_by_field: list[tuple[float, ...]] = []
+    for field_name in field_names:
+        raw_values = candidate_grid.get(field_name)
+        if raw_values is None or len(raw_values) == 0:
+            raise ValueError(f"candidate grid field {field_name} must be non-empty")
+        values = []
+        for value in raw_values:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"candidate grid field {field_name} must contain numbers"
+                )
+            values.append(float(value))
+        canonical_values = tuple(values)
+        if len(canonical_values) != len(set(canonical_values)):
+            raise ValueError(f"candidate grid field {field_name} has duplicates")
+        if any(
+            not math.isfinite(value) or value <= 0.0
+            for value in canonical_values
+        ):
+            raise ValueError(
+                f"candidate grid field {field_name} must contain finite positives"
+            )
+        values_by_field.append(tuple(sorted(canonical_values)))
+
+    candidates = []
+    for index, values in enumerate(product(*values_by_field), 1):
+        thresholds = EgoMotionRuleThresholds(*values)
+        candidates.append((f"candidate-{index:04d}", thresholds))
+    return tuple(candidates)
+
+
+def evaluate_rule_candidate(
+    samples: Sequence[EgoMotionPredictionSample],
+    candidate_id: str,
+    thresholds: EgoMotionRuleThresholds,
+) -> EgoMotionCandidateEvaluation:
+    if not samples:
+        raise ValueError("rule candidate evaluation requires validation samples")
+    if any(sample.split != "validation" for sample in samples):
+        raise ValueError("rule candidate evaluation only accepts validation samples")
+    ground_truth = tuple(sample.ground_truth_action for sample in samples)
+    predictions = tuple(
+        predict_ego_motion_action(sample.features, thresholds).predicted_action
+        for sample in samples
+    )
+    metrics = evaluate_classification(ground_truth, predictions)
+    return EgoMotionCandidateEvaluation(
+        candidate_id=candidate_id,
+        thresholds=thresholds,
+        thresholds_sha256=thresholds.sha256(),
+        metrics=metrics,
+        minimum_per_class_f1=min(metrics.per_class_f1.values()),
+        predicted_class_distribution=complete_action_distribution(predictions),
+    )
+
+
+def select_best_rule_candidate(
+    candidates: Sequence[EgoMotionCandidateEvaluation],
+) -> EgoMotionCandidateEvaluation:
+    if not candidates:
+        raise ValueError("candidate selection requires at least one evaluation")
+    return min(
+        candidates,
+        key=lambda candidate: (
+            -candidate.metrics.macro_f1,
+            -candidate.minimum_per_class_f1,
+            -candidate.metrics.accuracy,
+            candidate.thresholds.canonical_tuple(),
+        ),
+    )
+
+
+def build_prediction_records(
+    samples: Sequence[EgoMotionPredictionSample],
+    candidate: EgoMotionCandidateEvaluation,
+    rule_version: str,
+) -> tuple[EgoMotionPredictionRecord, ...]:
+    records = []
+    for sample in samples:
+        if sample.split != "validation":
+            raise ValueError("prediction records only support validation samples")
+        decision = predict_ego_motion_action(sample.features, candidate.thresholds)
+        records.append(
+            EgoMotionPredictionRecord(
+                sample_token=sample.sample_token,
+                scene_token=sample.scene_token,
+                split=sample.split,
+                ground_truth_action=sample.ground_truth_action,
+                predicted_action=decision.predicted_action,
+                is_correct=decision.predicted_action == sample.ground_truth_action,
+                baseline_name="ego_motion_rule",
+                rule_version=rule_version,
+                candidate_id=candidate.candidate_id,
+                thresholds_sha256=candidate.thresholds_sha256,
+                motion_availability=sample.features.availability,
+                speed_mps=sample.features.speed_mps,
+                longitudinal_acceleration_mps2=(
+                    sample.features.longitudinal_acceleration_mps2
+                ),
+                yaw_rate_radps=sample.features.yaw_rate_radps,
+                decision_reason=decision.decision_reason,
+                label_rule_version=sample.label_rule_version,
+                manifest_schema_version=sample.manifest_schema_version,
+                split_mapping_sha256=sample.split_mapping_sha256,
+            )
+        )
+    return tuple(records)
 
 
 def _empty_field_values() -> dict[str, list[float]]:
