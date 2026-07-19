@@ -43,6 +43,9 @@ from src.baselines.ego_motion_test import (
     evaluate_majority_on_test_samples,
     validate_preflight_receipt_for_execution,
 )
+from src.phase0.artifact_contracts import (
+    normalize_phase0_2b_validation_metrics_artifact,
+)
 from src.phase0.protocol import ManifestSample, iter_manifest_rows, validate_sha256
 
 
@@ -320,8 +323,15 @@ def validate_execution_preconditions(
         provenance.protocol,
         expected_manifest_sha256=manifest_sha,
     )
-    validation_metrics = _load_json_object_bytes(
+    validation_artifact = _load_json_object_bytes(
         paths.validation_metrics_path.read_bytes(), "validation metrics"
+    )
+    validation_metrics = normalize_phase0_2b_validation_metrics_artifact(
+        validation_artifact,
+        expected_rule_version=provenance.protocol.source_rule_version,
+        expected_candidate_id=provenance.protocol.candidate_id,
+        expected_thresholds_sha256=provenance.protocol.thresholds_sha256,
+        expected_sample_count=EXPECTED_SPLIT_SAMPLE_COUNTS["validation"],
     )
     execution_source_sha = sha256_file(paths.execution_source_path)
     validate_sha256(execution_source_sha, "execution_source_sha256")

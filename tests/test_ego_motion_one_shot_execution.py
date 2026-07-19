@@ -21,6 +21,9 @@ from scripts.prepare_ego_motion_one_shot_test import (
     _protocol,
     build_preflight_receipt,
 )
+from scripts.run_ego_motion_rule_baseline import (
+    build_validation_metrics_artifact_payload,
+)
 from scripts.run_ego_motion_one_shot_test import (
     CONFIRMATION,
     EXECUTION_CLAIM_FILENAME,
@@ -47,7 +50,11 @@ from scripts.run_ego_motion_one_shot_test import (
     write_formal_outputs_once,
 )
 from src.actions.schema import ACTION_SCHEMA
-from src.baselines.ego_motion import EgoMotionFeatures
+from src.baselines.ego_motion import (
+    EgoMotionCandidateEvaluation,
+    EgoMotionFeatures,
+    EgoMotionRuleThresholds,
+)
 from src.baselines.ego_motion_analysis import DiagnosticMargins
 from src.baselines.ego_motion_test import (
     DECLARED_TEST_OUTPUTS,
@@ -58,6 +65,7 @@ from src.baselines.ego_motion_test import (
     build_validation_to_test_comparison,
     evaluate_frozen_rule_test_samples,
 )
+from src.phase0.protocol import evaluate_classification
 
 
 MAPPING_SHA = "a96e04aaf068e75b0aa3ecb8412dc5b35fea2412d7090bbee0a6661132923b12"
@@ -165,16 +173,30 @@ def canonical_json(payload: Mapping[str, object]) -> str:
     )
 
 
-def validation_metrics() -> dict[str, object]:
-    distribution = {action: 0 for action in ACTION_SCHEMA}
-    distribution["keep"] = 3594
-    return {
-        "sample_count": 3594,
-        "accuracy": 0.5,
-        "macro_f1": 0.4,
-        "per_class_f1": {action: 0.4 for action in ACTION_SCHEMA},
-        "prediction_class_distribution": distribution,
-    }
+def validation_metrics_artifact() -> dict[str, object]:
+    sample_count = EXPECTED_SPLIT_SAMPLE_COUNTS["validation"]
+    actions = tuple(
+        ACTION_SCHEMA[index % len(ACTION_SCHEMA)]
+        for index in range(sample_count)
+    )
+    metrics = evaluate_classification(actions, actions)
+    thresholds = EgoMotionRuleThresholds(0.2, 0.05, 0.5, 0.3)
+    selected = EgoMotionCandidateEvaluation(
+        candidate_id="candidate-0293",
+        thresholds=thresholds,
+        thresholds_sha256=thresholds.sha256(),
+        metrics=metrics,
+        minimum_per_class_f1=min(metrics.per_class_f1.values()),
+        predicted_class_distribution={
+            action: sample_count // len(ACTION_SCHEMA)
+            for action in ACTION_SCHEMA
+        },
+    )
+    return build_validation_metrics_artifact_payload(
+        "phase0.2b-ego-motion-rule-v0.1",
+        selected,
+        {"default_keep": sample_count},
+    )
 
 
 def build_tree(tmp_path: Path) -> tuple[ExecutionPaths, ExecutionProvenance]:
@@ -226,7 +248,7 @@ def build_tree(tmp_path: Path) -> tuple[ExecutionPaths, ExecutionProvenance]:
     )
     validation_path.parent.mkdir(parents=True)
     validation_path.write_text(
-        canonical_json(validation_metrics()), encoding="utf-8"
+        canonical_json(validation_metrics_artifact()), encoding="utf-8"
     )
     evaluator_hashes = _source_hashes(config_path)
     preflight = build_preflight_receipt(
@@ -361,6 +383,50 @@ def test_provenance_hash_mismatch_fails_before_claim(
     with pytest.raises(ValueError, match=expected_message):
         validate_execution_preconditions(paths, provenance)
 
+    assert not paths.claim_path.exists()
+
+
+def test_validation_adapter_failure_precedes_manifest_scan_and_claim(
+    execution_tree: tuple[ExecutionPaths, ExecutionProvenance],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, provenance = execution_tree
+    flat_metrics = {
+        "sample_count": EXPECTED_SPLIT_SAMPLE_COUNTS["validation"],
+        "accuracy": 1.0,
+        "macro_f1": 1.0,
+        "per_class_f1": {action: 1.0 for action in ACTION_SCHEMA},
+        "prediction_class_distribution": {
+            action: EXPECTED_SPLIT_SAMPLE_COUNTS["validation"]
+            // len(ACTION_SCHEMA)
+            for action in ACTION_SCHEMA
+        },
+    }
+    paths.validation_metrics_path.write_text(
+        canonical_json(flat_metrics), encoding="utf-8"
+    )
+    provenance = replace(
+        provenance,
+        expected_validation_metrics_sha256=sha256(
+            paths.validation_metrics_path
+        ),
+    )
+    manifest_scan_called = False
+
+    def forbidden_manifest_scan(path: Path) -> tuple[Mapping[str, object], ...]:
+        nonlocal manifest_scan_called
+        manifest_scan_called = True
+        raise AssertionError(f"manifest scan reached after adapter failure: {path}")
+
+    monkeypatch.setattr(
+        "scripts.run_ego_motion_one_shot_test.iter_manifest_rows",
+        forbidden_manifest_scan,
+    )
+
+    with pytest.raises(ValueError, match="producer schema"):
+        validate_execution_preconditions(paths, provenance)
+
+    assert not manifest_scan_called
     assert not paths.claim_path.exists()
 
 
@@ -1044,6 +1110,9 @@ def test_comparison_uses_fixed_validation_metrics_source(
 ) -> None:
     paths, provenance = execution_tree
     preconditions = validate_execution_preconditions(paths, provenance)
+    producer_artifact = json.loads(
+        paths.validation_metrics_path.read_text(encoding="utf-8")
+    )
     test_metrics = {
         "sample_count": 3799,
         "accuracy": 0.6,
@@ -1058,6 +1127,17 @@ def test_comparison_uses_fixed_validation_metrics_source(
         preconditions.validation_metrics, test_metrics
     )
 
+    assert "metrics" in producer_artifact
+    assert "predicted_class_distribution" in producer_artifact
+    assert "per_class_f1" not in producer_artifact
+    assert "prediction_class_distribution" not in producer_artifact
+    assert tuple(preconditions.validation_metrics) == (
+        "sample_count",
+        "accuracy",
+        "macro_f1",
+        "per_class_f1",
+        "prediction_class_distribution",
+    )
     assert comparison["validation_sample_count"] == 3594
     assert comparison["test_sample_count"] == 3799
     assert comparison["rule_modified_from_test_results"] is False
