@@ -14,7 +14,8 @@
 - 已完成 Phase 0.1 audited seed-subset manifest、固定 seed scene split、统一评测协议、完整 contract validator 与 Majority Baseline。
 - 已完成并冻结 Phase 0.1b trainval dataset protocol v1：`horizon_sec=3.0`、`sample_interval_sec=0.5`、`time_tolerance_sec=0.075`、`label_rule_version=phase-1.6-meta-action-v0.2`、`split_strategy_version=official_train_scene_label_stratified_v1`、`split_seed=20260710`。
 - 完整 850-scene split 为 project train/validation/test `560/140/150`；正式 manifest 扫描 34,149 samples，纳入 21,646 条（train 14,253 / validation 3,594 / test 3,799），排除 12,503 条。
-- 已完成 Phase 0.2a current/past ego-motion 输入审计：train/validation/test 的 `full/partial/unavailable` 分别为 `13476/392/385`、`3401/99/94`、`3594/106/99`；输入合同仅包含 speed、longitudinal acceleration、yaw rate、availability 与对应 past interval，test label 未用于统计或调参。Phase 0.2 rule predictor 仍为 planned。
+- 已完成 Phase 0.2a current/past ego-motion 输入审计：train/validation/test 的 `full/partial/unavailable` 分别为 `13476/392/385`、`3401/99/94`、`3594/106/99`；输入合同仅包含 speed、longitudinal acceleration、yaw rate、availability 与对应 past interval，test label 未用于统计或调参。
+- 已实现 Phase 0.2b deterministic ego-motion rule baseline：固定 625-candidate grid 在 validation 选择 `stop=0.2 m/s`、`lateral=0.05 rad/s`、`accelerate=0.5 m/s²`、`decelerate=0.3 m/s²`，macro-F1/accuracy 为 `0.615681/0.623817`；Majority Baseline 为 `0.087186/0.354201`。test 未评测；Phase 0.2c failure analysis / rule freeze 尚未完成。
 - 已建立环境检查与 workspace cleanup dry-run 脚本。
 
 ## Active Source Files
@@ -43,9 +44,10 @@ conda run -n codex4vla_env python scripts/clean_workspace.py
 conda run -n codex4vla_env python data/validate_label_freeze.py --dataroot data/nuscenes
 conda run -n codex4vla_env python data/build_trainval_manifest.py --config configs/trainval_manifest.yaml --pilot
 conda run -n codex4vla_env python scripts/audit_ego_motion_inputs.py --config configs/phase0_2_ego_motion.yaml
+conda run -n codex4vla_env python scripts/run_ego_motion_rule_baseline.py --config configs/phase0_2_rule_baseline.yaml
 ```
 
-trainval pilot 与 Phase 0.2a 输入审计需要预先设置 `NUSCENES_ROOT` 与 `VLA_DERIVED_ROOT`；原始数据、派生 manifest 与审计 JSON 均不进入 Git。
+trainval pilot、Phase 0.2a 输入审计与 Phase 0.2b rule baseline 需要预先设置 `NUSCENES_ROOT` 与 `VLA_DERIVED_ROOT`；原始数据、派生 manifest、审计 JSON 与 baseline 输出均不进入 Git。
 
 ## Data / Manifest Field Contracts
 
@@ -90,10 +92,10 @@ source_audit_record
 ## Open Questions / Pending Verification
 
 - exact-grid interpolation v1.1 是可选数据增强 backlog；如后续评估，应保持现有 v1 manifest、sidecar 与 test split 不变，并单独提升协议版本。
-- Phase 0.1b gate 已完成；下一阶段可按既定顺序进入 Phase 0.2，但本次仅冻结数据协议，不实现 rule baseline 或任何模型训练。
+- Phase 0.2b deterministic rule baseline 已完成；Phase 0.2c failure analysis / rule freeze 尚未完成，不进入后续模型阶段。
 
 ## Next Gate
 
-- Phase 0.2 rule baseline 只允许使用 inference-time current/past ego state，不得读取 future ego trajectory、derived meta-action 或 test label。
+- Phase 0.2c 仅允许在已冻结的 validation 协议上开展 failure analysis 与新 rule version 评估，不得事后改写 Phase 0.2b 的固定 candidate grid 或使用 test 调参。
 - 后续实验复用已冻结的 train/validation/test scene mapping、action vocabulary 与 manifest v1；不得根据模型、prompt 或标签分布重新调整 test split。
 - test 继续封存；Phase 0.2 的 sample-level 输出、输入字段审计与统一 action metrics 完成前，不进入 Phase 0.3。
