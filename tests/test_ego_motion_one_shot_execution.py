@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import BinaryIO
 
 import pytest
 import yaml
@@ -31,8 +32,11 @@ from scripts.run_ego_motion_one_shot_test import (
     FormalOutputs,
     _canonical_json_bytes,
     _source_hashes,
+    _validate_no_outputs_or_claim,
+    _write_atomic_once,
     build_formal_outputs,
     create_execution_claim,
+    formal_temporary_path,
     load_test_samples_after_claim,
     load_train_samples_without_test_access,
     parse_args,
@@ -409,6 +413,39 @@ def test_any_formal_output_blocks_execution_before_claim(
     assert not paths.claim_path.exists()
 
 
+@pytest.mark.parametrize("formal_filename", DECLARED_TEST_OUTPUTS)
+def test_stale_temporary_output_blocks_execution_before_claim(
+    execution_tree: tuple[ExecutionPaths, ExecutionProvenance],
+    formal_filename: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, provenance = execution_tree
+    temporary_path = formal_temporary_path(paths.output_dir, formal_filename)
+    temporary_path.write_bytes(b"stale-temporary-output")
+    manifest_scan_called = False
+
+    def forbidden_manifest_scan(path: Path) -> tuple[Mapping[str, object], ...]:
+        nonlocal manifest_scan_called
+        manifest_scan_called = True
+        raise AssertionError(f"manifest scan reached after stale temp: {path}")
+
+    monkeypatch.setattr(
+        "scripts.run_ego_motion_one_shot_test.iter_manifest_rows",
+        forbidden_manifest_scan,
+    )
+
+    with pytest.raises(FileExistsError, match="stale temporary output"):
+        validate_execution_preconditions(paths, provenance)
+
+    assert not manifest_scan_called
+    assert not paths.claim_path.exists()
+    assert all(
+        not (paths.output_dir / filename).exists()
+        for filename in DECLARED_TEST_OUTPUTS
+    )
+    assert temporary_path.read_bytes() == b"stale-temporary-output"
+
+
 def test_existing_claim_blocks_execution(
     execution_tree: tuple[ExecutionPaths, ExecutionProvenance],
 ) -> None:
@@ -449,6 +486,168 @@ def test_claim_is_exclusive_and_has_fixed_canonical_payload(
     assert claim.payload["rerun_permitted"] is False
     assert claim.path.read_bytes() == _canonical_json_bytes(claim.payload)
     assert "timestamp" not in claim.payload
+    with pytest.raises(FileExistsError):
+        create_execution_claim(paths, provenance, preconditions)
+
+
+def test_claim_file_and_parent_directory_are_fsynced_before_test_access(
+    execution_tree: tuple[ExecutionPaths, ExecutionProvenance],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, provenance = execution_tree
+    preconditions = validate_execution_preconditions(paths, provenance)
+    module = sys.modules["scripts.run_ego_motion_one_shot_test"]
+    original_open = Path.open
+    original_fsync = module.os.fsync
+    events: list[str] = []
+    claim_file_closed = False
+
+    class TrackedClaimFile:
+        def __init__(self, raw_file: BinaryIO) -> None:
+            self.raw_file = raw_file
+
+        def __enter__(self) -> TrackedClaimFile:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: object,
+            exc_value: object,
+            traceback: object,
+        ) -> None:
+            nonlocal claim_file_closed
+            self.raw_file.close()
+            claim_file_closed = True
+            events.append("claim file close")
+
+        def write(self, payload: bytes) -> int:
+            events.append("claim write")
+            return self.raw_file.write(payload)
+
+        def flush(self) -> None:
+            events.append("claim flush")
+            self.raw_file.flush()
+
+        def fileno(self) -> int:
+            return self.raw_file.fileno()
+
+    def tracked_open(
+        path: Path,
+        mode: str = "r",
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        raw_file = original_open(path, mode, *args, **kwargs)
+        if path == paths.claim_path and mode == "xb":
+            events.append("claim exclusive create")
+            return TrackedClaimFile(raw_file)
+        return raw_file
+
+    def tracked_file_fsync(descriptor: int) -> None:
+        events.append("claim file fsync")
+        original_fsync(descriptor)
+
+    def tracked_directory_fsync(path: Path) -> None:
+        assert claim_file_closed
+        assert path == paths.claim_path.parent
+        events.append("claim parent directory fsync")
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(module.os, "fsync", tracked_file_fsync)
+    monkeypatch.setattr(module, "_fsync_directory", tracked_directory_fsync)
+    claim = create_execution_claim(paths, provenance, preconditions)
+
+    class AccessTrackingRow(GuardedRow):
+        def get(self, key: str, default: object = None) -> object:
+            if key in {"meta_action", "current_ego_motion"}:
+                if dict.get(self, "split") == "test":
+                    events.append("test sealed field access")
+            return super().get(key, default)
+
+    rows = [
+        AccessTrackingRow(row, claim_path=paths.claim_path)
+        for row in synthetic_rows()
+    ]
+    load_test_samples_after_claim(rows, provenance.protocol, claim)
+
+    required_order = (
+        "claim exclusive create",
+        "claim write",
+        "claim flush",
+        "claim file fsync",
+        "claim file close",
+        "claim parent directory fsync",
+        "test sealed field access",
+    )
+    positions = tuple(events.index(event) for event in required_order)
+    assert positions == tuple(sorted(positions))
+
+
+def test_fsync_directory_fsyncs_and_closes_parent_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = sys.modules["scripts.run_ego_motion_one_shot_test"]
+    events: list[tuple[str, object]] = []
+
+    def tracked_open(path: Path, flags: int) -> int:
+        events.append(("open", (path, flags)))
+        return 42
+
+    def tracked_fsync(descriptor: int) -> None:
+        events.append(("fsync", descriptor))
+
+    def tracked_close(descriptor: int) -> None:
+        events.append(("close", descriptor))
+
+    monkeypatch.setattr(module.os, "open", tracked_open)
+    monkeypatch.setattr(module.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(module.os, "close", tracked_close)
+
+    module._fsync_directory(tmp_path)
+
+    assert events == [
+        ("open", (tmp_path, module.os.O_RDONLY)),
+        ("fsync", 42),
+        ("close", 42),
+    ]
+
+
+def test_directory_fsync_failure_preserves_claim_and_blocks_test_access(
+    execution_tree: tuple[ExecutionPaths, ExecutionProvenance],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, provenance = execution_tree
+    preconditions = validate_execution_preconditions(paths, provenance)
+    test_loader_called = False
+
+    def fail_directory_fsync(path: Path) -> None:
+        assert path == paths.claim_path.parent
+        raise OSError("directory fsync failed")
+
+    def forbidden_test_loader(*args: object, **kwargs: object) -> None:
+        nonlocal test_loader_called
+        test_loader_called = True
+        raise AssertionError("test loader must not run after directory fsync failure")
+
+    monkeypatch.setattr(
+        "scripts.run_ego_motion_one_shot_test._fsync_directory",
+        fail_directory_fsync,
+    )
+    monkeypatch.setattr(
+        "scripts.run_ego_motion_one_shot_test.load_test_samples_after_claim",
+        forbidden_test_loader,
+    )
+
+    with pytest.raises(OSError, match="directory fsync failed"):
+        run_one_shot_execution(paths, provenance)
+
+    assert not test_loader_called
+    assert paths.claim_path.exists()
+    assert all(
+        not (paths.output_dir / filename).exists()
+        for filename in DECLARED_TEST_OUTPUTS
+    )
     with pytest.raises(FileExistsError):
         create_execution_claim(paths, provenance, preconditions)
 
@@ -741,7 +940,7 @@ def test_written_hashes_and_receipt_exclusions(
 ) -> None:
     paths, provenance = execution_tree
 
-    run_one_shot_execution(paths, provenance)
+    outputs = run_one_shot_execution(paths, provenance)
     receipt = json.loads(
         (paths.output_dir / "one_shot_test_receipt.json").read_text(
             encoding="utf-8"
@@ -754,6 +953,10 @@ def test_written_hashes_and_receipt_exclusions(
     assert "one_shot_preflight_receipt.json" not in receipt["output_sha256"]
     for filename, digest in receipt["output_sha256"].items():
         assert sha256(paths.output_dir / filename) == digest
+    for filename in DECLARED_TEST_OUTPUTS:
+        assert sha256(paths.output_dir / filename) == hashlib.sha256(
+            outputs.serialized_files[filename]
+        ).hexdigest()
     assert receipt["execution_source_sha256"] == sha256(
         paths.execution_source_path
     )
@@ -785,6 +988,32 @@ def test_receipt_is_written_last(
 
     assert writes == list(DECLARED_TEST_OUTPUTS)
     assert writes[-1] == "one_shot_test_receipt.json"
+
+
+def test_writer_and_precondition_share_temporary_path_helper(
+    execution_tree: tuple[ExecutionPaths, ExecutionProvenance],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, _ = execution_tree
+    module = sys.modules["scripts.run_ego_motion_one_shot_test"]
+    original_helper = module.formal_temporary_path
+    helper_calls: list[tuple[Path, str]] = []
+
+    def tracked_helper(output_dir: Path, filename: str) -> Path:
+        helper_calls.append((output_dir, filename))
+        return original_helper(output_dir, filename)
+
+    monkeypatch.setattr(module, "formal_temporary_path", tracked_helper)
+
+    _validate_no_outputs_or_claim(paths)
+    formal_path = paths.output_dir / DECLARED_TEST_OUTPUTS[0]
+    _write_atomic_once(formal_path, b"synthetic-output")
+
+    assert helper_calls[: len(DECLARED_TEST_OUTPUTS)] == [
+        (paths.output_dir, filename) for filename in DECLARED_TEST_OUTPUTS
+    ]
+    assert helper_calls[-1] == (paths.output_dir, formal_path.name)
+    assert formal_path.read_bytes() == b"synthetic-output"
 
 
 def test_second_execution_is_permanently_blocked_by_claim(
@@ -845,7 +1074,15 @@ def test_cli_has_no_rerun_or_overwrite_escape_hatches() -> None:
         capture_output=True,
         text=True,
     )
-    forbidden = ("--force", "--retry", "--resume", "--reset", "--overwrite")
+    forbidden = (
+        "--force",
+        "--retry",
+        "--resume",
+        "--reset",
+        "--overwrite",
+        "--cleanup",
+        "--delete-claim",
+    )
 
     assert all(option not in result.stdout for option in forbidden)
 

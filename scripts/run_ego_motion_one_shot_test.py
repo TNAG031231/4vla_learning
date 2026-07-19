@@ -180,6 +180,10 @@ def _verified_sha256(path: Path, expected: str, description: str) -> str:
     return actual
 
 
+def formal_temporary_path(output_dir: Path, filename: str) -> Path:
+    return output_dir / f".{filename}.phase0.2d.tmp"
+
+
 def _validate_no_outputs_or_claim(paths: ExecutionPaths) -> None:
     if paths.claim_path.exists():
         raise FileExistsError(
@@ -191,6 +195,17 @@ def _validate_no_outputs_or_claim(paths: ExecutionPaths) -> None:
     if existing_outputs:
         raise FileExistsError(
             f"formal one-shot test output already exists: {existing_outputs}"
+        )
+    temporary_outputs = tuple(
+        formal_temporary_path(paths.output_dir, name)
+        for name in DECLARED_TEST_OUTPUTS
+    )
+    stale_temporary_outputs = [
+        path.name for path in temporary_outputs if path.exists()
+    ]
+    if stale_temporary_outputs:
+        raise FileExistsError(
+            f"stale temporary output already exists: {stale_temporary_outputs}"
         )
 
 
@@ -366,6 +381,7 @@ def create_execution_claim(
         claim_file.write(serialized)
         claim_file.flush()
         os.fsync(claim_file.fileno())
+    _fsync_directory(paths.claim_path.parent)
     return ExecutionClaim(paths.claim_path, payload)
 
 
@@ -506,7 +522,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _write_atomic_once(path: Path, payload: bytes) -> None:
-    temporary_path = path.with_name(f".{path.name}.phase0.2d.tmp")
+    temporary_path = formal_temporary_path(path.parent, path.name)
     with temporary_path.open("xb") as output_file:
         output_file.write(payload)
         output_file.flush()
