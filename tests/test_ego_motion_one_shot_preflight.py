@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 import hashlib
 import inspect
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -31,15 +32,20 @@ from src.baselines import ego_motion_test
 from src.baselines.ego_motion import EgoMotionFeatures, EgoMotionRuleThresholds
 from src.baselines.ego_motion_analysis import DiagnosticMargins
 from src.baselines.ego_motion_test import (
+    EVALUATOR_SOURCE_PATHS,
+    FORMAL_RESULT_SCHEMA,
+    FORMAL_RESULT_SHA_FILENAMES,
     FORBIDDEN_TEST_FIELDS,
     TEST_PREDICTION_FIELDS,
     FrozenRuleTestProtocol,
     FrozenRuleTestSample,
+    build_one_shot_receipt,
     build_test_diagnostics,
     build_validation_to_test_comparison,
     evaluate_frozen_rule_test_samples,
     evaluate_majority_on_test_samples,
     validate_frozen_rule_contract,
+    validate_preflight_receipt_for_execution,
 )
 from src.baselines.majority import ManifestSample
 from src.phase0.protocol import evaluate_classification
@@ -160,6 +166,59 @@ def freeze_payload() -> dict[str, object]:
         "label_rule_version": source.label_rule_version,
         "split_mapping_sha256": source.split_mapping_sha256,
     }
+
+
+def evaluator_source_sha256() -> dict[str, str]:
+    return {
+        path: f"{index:064x}"
+        for index, path in enumerate(EVALUATOR_SOURCE_PATHS, 1)
+    }
+
+
+def valid_preflight_receipt() -> dict[str, object]:
+    source = protocol()
+    return {
+        "preflight_schema_version": "phase0.2_one_shot_test_preflight_v0.1",
+        "protocol_status": "preflight_passed",
+        "ready_for_execution": True,
+        "one_shot_execution_performed": False,
+        "test_predictions_generated": False,
+        "test_metrics_generated": False,
+        "manifest_sha256": "a" * 64,
+        "freeze_sha256": "b" * 64,
+        "frozen_rule_version": source.frozen_rule_version,
+        "source_rule_version": source.source_rule_version,
+        "candidate_id": source.candidate_id,
+        "thresholds": source.thresholds.as_dict(),
+        "thresholds_sha256": source.thresholds_sha256,
+        "evaluator_source_sha256": evaluator_source_sha256(),
+        "formal_result_schema": dict(FORMAL_RESULT_SCHEMA),
+    }
+
+
+def formal_output_sha256() -> dict[str, str]:
+    return {
+        filename: f"{index + 10:064x}"
+        for index, filename in enumerate(FORMAL_RESULT_SHA_FILENAMES)
+    }
+
+
+def build_valid_one_shot_receipt(
+    **overrides: object,
+) -> dict[str, object]:
+    arguments: dict[str, object] = {
+        "protocol": protocol(),
+        "preflight_receipt": valid_preflight_receipt(),
+        "preflight_receipt_sha256": "c" * 64,
+        "actual_evaluator_source_sha256": evaluator_source_sha256(),
+        "execution_source_sha256": "d" * 64,
+        "manifest_sha256": "a" * 64,
+        "freeze_sha256": "b" * 64,
+        "output_sha256": formal_output_sha256(),
+        "test_sample_count": 3799,
+    }
+    arguments.update(overrides)
+    return build_one_shot_receipt(**arguments)
 
 
 def base_config() -> dict[str, object]:
@@ -488,12 +547,14 @@ def test_validation_to_test_comparison_schema_is_fixed() -> None:
     distribution = {action: 1 for action in ACTION_SCHEMA}
     f1 = {action: 0.5 for action in ACTION_SCHEMA}
     validation = {
+        "sample_count": 6,
         "accuracy": 0.5,
         "macro_f1": 0.5,
         "per_class_f1": f1,
         "prediction_class_distribution": distribution,
     }
     test = {
+        "sample_count": 12,
         "accuracy": 0.6,
         "macro_f1": 0.55,
         "per_class_f1": {action: 0.6 for action in ACTION_SCHEMA},
@@ -504,10 +565,15 @@ def test_validation_to_test_comparison_schema_is_fixed() -> None:
 
     assert tuple(comparison) == (
         "comparison_schema_version",
+        "validation_sample_count",
+        "test_sample_count",
         "test_minus_validation_accuracy",
         "test_minus_validation_macro_f1",
         "test_minus_validation_per_class_f1",
+        "validation_prediction_distribution_rate",
+        "test_prediction_distribution_rate",
         "prediction_distribution_count_difference",
+        "prediction_distribution_rate_difference",
         "rule_modified_from_test_results",
     )
     assert comparison["rule_modified_from_test_results"] is False
@@ -556,6 +622,7 @@ def test_preflight_receipt_records_sealed_information_boundary() -> None:
     assert receipt["test_metrics_generated"] is False
     assert receipt["one_shot_execution_performed"] is False
     assert receipt["ready_for_execution"] is True
+    assert receipt["formal_result_schema"] == FORMAL_RESULT_SCHEMA
 
 
 def test_repeated_preflight_receipt_is_byte_identical(tmp_path: Path) -> None:
@@ -595,3 +662,320 @@ def test_progress_document_has_no_worktree_change() -> None:
     )
 
     assert result.returncode == 0
+
+
+def test_preflight_receipt_sha_must_be_valid() -> None:
+    with pytest.raises(ValueError, match="actual_preflight_receipt_sha256"):
+        validate_preflight_receipt_for_execution(
+            valid_preflight_receipt(),
+            actual_preflight_receipt_sha256="invalid",
+            actual_evaluator_source_sha256=evaluator_source_sha256(),
+            protocol=protocol(),
+            manifest_sha256="a" * 64,
+            freeze_sha256="b" * 64,
+        )
+
+
+def test_preflight_status_must_be_passed() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["protocol_status"] = "preflight_failed"
+
+    with pytest.raises(ValueError, match="protocol_status"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_must_be_ready_for_execution() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["ready_for_execution"] = False
+
+    with pytest.raises(ValueError, match="ready_for_execution"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_must_not_have_executed_one_shot() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["one_shot_execution_performed"] = True
+
+    with pytest.raises(ValueError, match="one_shot_execution_performed"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+@pytest.mark.parametrize(
+    "field_name", ("test_predictions_generated", "test_metrics_generated")
+)
+def test_preflight_must_not_have_generated_formal_outputs(
+    field_name: str,
+) -> None:
+    receipt = valid_preflight_receipt()
+    receipt[field_name] = True
+
+    with pytest.raises(ValueError, match=field_name):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_manifest_sha_must_match_execution() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["manifest_sha256"] = "e" * 64
+
+    with pytest.raises(ValueError, match="manifest_sha256"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_freeze_sha_must_match_execution() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["freeze_sha256"] = "e" * 64
+
+    with pytest.raises(ValueError, match="freeze_sha256"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_candidate_must_match_protocol() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["candidate_id"] = "candidate-0001"
+
+    with pytest.raises(ValueError, match="candidate_id"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_threshold_values_must_match_protocol() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["thresholds"] = {
+        **protocol().thresholds.as_dict(),
+        "stop_speed_threshold_mps": 0.1,
+    }
+
+    with pytest.raises(ValueError, match="thresholds"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_threshold_sha_must_match_protocol() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["thresholds_sha256"] = "e" * 64
+
+    with pytest.raises(ValueError, match="thresholds_sha256"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_evaluator_source_sha_must_match_preflight() -> None:
+    actual_sources = evaluator_source_sha256()
+    actual_sources[EVALUATOR_SOURCE_PATHS[0]] = "e" * 64
+
+    with pytest.raises(ValueError, match="differ from preflight"):
+        build_valid_one_shot_receipt(
+            actual_evaluator_source_sha256=actual_sources
+        )
+
+
+def test_preflight_evaluator_source_set_must_be_complete() -> None:
+    receipt = valid_preflight_receipt()
+    sources = dict(receipt["evaluator_source_sha256"])
+    sources.pop(EVALUATOR_SOURCE_PATHS[-1])
+    receipt["evaluator_source_sha256"] = sources
+
+    with pytest.raises(ValueError, match="complete frozen file set"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_execution_source_sha_must_be_valid() -> None:
+    with pytest.raises(ValueError, match="execution_source_sha256"):
+        build_valid_one_shot_receipt(execution_source_sha256="invalid")
+
+
+def test_output_sha_must_cover_all_five_formal_results() -> None:
+    output_hashes = formal_output_sha256()
+    output_hashes.pop(FORMAL_RESULT_SHA_FILENAMES[-1])
+
+    with pytest.raises(ValueError, match="complete frozen file set"):
+        build_valid_one_shot_receipt(output_sha256=output_hashes)
+
+
+def test_output_sha_must_not_include_receipt_itself() -> None:
+    output_hashes = formal_output_sha256()
+    output_hashes["one_shot_test_receipt.json"] = "e" * 64
+
+    with pytest.raises(ValueError, match="complete frozen file set"):
+        build_valid_one_shot_receipt(output_sha256=output_hashes)
+
+
+def test_formal_receipt_records_single_execution() -> None:
+    receipt = build_valid_one_shot_receipt()
+
+    assert receipt["execution_count"] == 1
+    assert receipt["one_shot_execution_performed"] is True
+    assert receipt["preflight_protocol_status"] == "preflight_passed"
+    assert receipt["preflight_ready_for_execution"] is True
+    assert receipt["evaluator_sources_match_preflight"] is True
+
+
+def test_formal_receipt_forbids_rerun() -> None:
+    receipt = build_valid_one_shot_receipt()
+
+    assert receipt["rerun_permitted"] is False
+
+
+def test_formal_receipt_records_no_rule_modification_from_test() -> None:
+    receipt = build_valid_one_shot_receipt()
+
+    assert receipt["test_result_used_for_rule_modification"] is False
+    assert receipt["rule_modified_from_test_results"] is False
+
+
+def test_preflight_validator_returns_complete_provenance_evidence() -> None:
+    evidence = validate_preflight_receipt_for_execution(
+        valid_preflight_receipt(),
+        actual_preflight_receipt_sha256="c" * 64,
+        actual_evaluator_source_sha256=evaluator_source_sha256(),
+        protocol=protocol(),
+        manifest_sha256="a" * 64,
+        freeze_sha256="b" * 64,
+    )
+
+    assert tuple(evidence) == (
+        "preflight_receipt_sha_matches",
+        "preflight_status_matches",
+        "ready_for_execution",
+        "execution_not_previously_performed",
+        "formal_outputs_not_previously_generated",
+        "manifest_sha_matches",
+        "freeze_sha_matches",
+        "frozen_rule_version_matches",
+        "source_rule_version_matches",
+        "candidate_id_matches",
+        "thresholds_match",
+        "threshold_sha_matches",
+        "evaluator_source_hashes_match",
+    )
+    assert all(evidence.values())
+
+
+def test_formal_result_schema_must_match_preflight() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["formal_result_schema"] = {
+        **FORMAL_RESULT_SCHEMA,
+        "test_metrics": "wrong",
+    }
+
+    with pytest.raises(ValueError, match="formal_result_schema"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def comparison_metrics(
+    sample_count: int,
+    distribution: dict[str, int],
+) -> dict[str, object]:
+    return {
+        "sample_count": sample_count,
+        "accuracy": 0.5,
+        "macro_f1": 0.4,
+        "per_class_f1": {action: 0.4 for action in ACTION_SCHEMA},
+        "prediction_class_distribution": distribution,
+    }
+
+
+def test_validation_distribution_count_must_match_sample_count() -> None:
+    distribution = {action: 1 for action in ACTION_SCHEMA}
+
+    with pytest.raises(ValueError, match="validation.*sample_count"):
+        build_validation_to_test_comparison(
+            comparison_metrics(7, distribution),
+            comparison_metrics(6, distribution),
+        )
+
+
+def test_test_distribution_count_must_match_sample_count() -> None:
+    distribution = {action: 1 for action in ACTION_SCHEMA}
+
+    with pytest.raises(ValueError, match="test.*sample_count"):
+        build_validation_to_test_comparison(
+            comparison_metrics(6, distribution),
+            comparison_metrics(7, distribution),
+        )
+
+
+def test_distribution_must_include_every_action_class() -> None:
+    incomplete = {action: 1 for action in ACTION_SCHEMA[:-1]}
+    complete = {action: 1 for action in ACTION_SCHEMA}
+
+    with pytest.raises(ValueError, match="all action classes"):
+        build_validation_to_test_comparison(
+            comparison_metrics(5, incomplete),
+            comparison_metrics(6, complete),
+        )
+
+
+def test_distribution_rates_are_normalized_in_action_schema_order() -> None:
+    validation_distribution = {
+        action: index for index, action in enumerate(ACTION_SCHEMA, 1)
+    }
+    test_distribution = {action: 2 for action in ACTION_SCHEMA}
+    comparison = build_validation_to_test_comparison(
+        comparison_metrics(
+            sum(validation_distribution.values()), validation_distribution
+        ),
+        comparison_metrics(12, test_distribution),
+    )
+
+    validation_rates = comparison["validation_prediction_distribution_rate"]
+    test_rates = comparison["test_prediction_distribution_rate"]
+    assert isinstance(validation_rates, dict)
+    assert isinstance(test_rates, dict)
+    assert tuple(validation_rates) == ACTION_SCHEMA
+    assert tuple(test_rates) == ACTION_SCHEMA
+    assert math.isclose(sum(validation_rates.values()), 1.0)
+    assert math.isclose(sum(test_rates.values()), 1.0)
+
+
+def test_distribution_rate_difference_is_test_minus_validation() -> None:
+    validation_distribution = {action: 1 for action in ACTION_SCHEMA}
+    test_distribution = {
+        action: (7 if action == ACTION_SCHEMA[0] else 1)
+        for action in ACTION_SCHEMA
+    }
+    comparison = build_validation_to_test_comparison(
+        comparison_metrics(6, validation_distribution),
+        comparison_metrics(12, test_distribution),
+    )
+
+    rate_difference = comparison["prediction_distribution_rate_difference"]
+    assert isinstance(rate_difference, dict)
+    assert rate_difference[ACTION_SCHEMA[0]] == pytest.approx(7 / 12 - 1 / 6)
+    assert rate_difference[ACTION_SCHEMA[1]] == pytest.approx(1 / 12 - 1 / 6)
+
+
+def test_count_and_rate_differences_remain_distinct_across_sample_sizes() -> None:
+    validation_distribution = {action: 10 for action in ACTION_SCHEMA}
+    test_distribution = {action: 1 for action in ACTION_SCHEMA}
+    comparison = build_validation_to_test_comparison(
+        comparison_metrics(60, validation_distribution),
+        comparison_metrics(6, test_distribution),
+    )
+
+    assert set(comparison["prediction_distribution_count_difference"].values()) == {
+        -9
+    }
+    assert set(comparison["prediction_distribution_rate_difference"].values()) == {
+        0.0
+    }
+
+
+def test_preflight_receipt_declares_all_formal_result_schemas() -> None:
+    receipt = build_preflight_receipt(
+        protocol=protocol(),
+        manifest_sha256="a" * 64,
+        freeze_sha256="b" * 64,
+        freeze_source_sha256={"failure_analysis.json": "c" * 64},
+        manifest_summary=ManifestPreflightSummary(3799, 150),
+        evaluator_source_sha256=evaluator_source_sha256(),
+    )
+
+    assert receipt["formal_result_schema"] == FORMAL_RESULT_SCHEMA
+
+
+def test_formal_receipt_is_deterministic_for_identical_inputs() -> None:
+    first = build_valid_one_shot_receipt()
+    second = build_valid_one_shot_receipt()
+
+    assert first == second
+    assert json.dumps(first, sort_keys=True, separators=(",", ":")) == json.dumps(
+        second, sort_keys=True, separators=(",", ":")
+    )

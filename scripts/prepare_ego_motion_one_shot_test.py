@@ -16,6 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.audit_ego_motion_inputs import load_config, sha256_file
 from src.baselines.ego_motion import EgoMotionRuleThresholds
 from src.baselines.ego_motion_test import (
+    EVALUATOR_SOURCE_PATHS,
+    FORMAL_RESULT_SCHEMA,
     FrozenRuleTestProtocol,
     validate_frozen_rule_contract,
 )
@@ -34,14 +36,6 @@ DECLARED_OUTPUTS = (
     "one_shot_test_receipt.json",
 )
 PREFLIGHT_OUTPUTS = ("one_shot_preflight_receipt.json",)
-EVALUATOR_SOURCE_PATHS = (
-    "configs/phase0_2_one_shot_test_v0_1.yaml",
-    "src/actions/schema.py",
-    "src/baselines/ego_motion.py",
-    "src/baselines/ego_motion_test.py",
-    "src/phase0/protocol.py",
-    "scripts/prepare_ego_motion_one_shot_test.py",
-)
 FREEZE_SOURCE_FILENAMES = (
     "failure_analysis.json",
     "validation_failures.jsonl",
@@ -334,6 +328,7 @@ def build_preflight_receipt(
         "test_scene_count": manifest_summary.test_scene_count,
         "evaluator_source_sha256": dict(evaluator_source_sha256),
         "declared_outputs": list(DECLARED_OUTPUTS),
+        "formal_result_schema": dict(FORMAL_RESULT_SCHEMA),
         "test_manifest_rows_parsed": True,
         "test_label_value_accessed_by_application_logic": False,
         "test_motion_value_accessed_by_application_logic": False,
