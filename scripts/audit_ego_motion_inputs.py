@@ -15,7 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baselines.ego_motion import audit_manifest_rows
+from src.baselines.ego_motion import (
+    audit_manifest_rows,
+    build_test_label_access_evidence,
+)
 from src.phase0.manifest import write_canonical_json
 from src.phase0.protocol import (
     PHASE0_SPLIT_SEED,
@@ -117,6 +120,7 @@ def run_audit(config_path: Path, derived_root: Path) -> tuple[Path, dict[str, ob
             "split_strategy_version": expected_split_strategy,
         }
     )
+    audit.update(build_test_label_access_evidence())
     output_path = derived_root / output_relative_dir / "ego_motion_input_audit.json"
     write_canonical_json(audit, output_path)
     return output_path, audit

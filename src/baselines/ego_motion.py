@@ -204,6 +204,23 @@ def _summarize_fields(
     }
 
 
+def build_test_label_access_evidence() -> dict[str, object]:
+    return {
+        "test_label_access_policy": {
+            "schema_validation": "allowed_and_performed",
+            "input_statistics": "forbidden_and_not_performed",
+            "class_conditional_statistics": "forbidden_and_not_performed",
+            "threshold_selection": "forbidden_and_not_performed",
+            "model_selection": "forbidden_and_not_performed",
+            "classification_metrics": "forbidden_and_not_performed",
+            "failure_case_analysis": "forbidden_and_not_performed",
+        },
+        "test_label_used_for_statistics": False,
+        "test_label_used_for_threshold_selection": False,
+        "test_label_used_for_model_selection": False,
+    }
+
+
 def audit_manifest_rows(
     rows: Iterable[Mapping[str, object]],
 ) -> dict[str, object]:
@@ -308,12 +325,11 @@ def audit_manifest_rows(
                 "future_agents",
                 "test_labels",
             ],
-            "label_access": {
+            "statistical_label_access": {
                 "train": "class_conditional_statistics_only",
                 "validation": "forbidden",
                 "test": "forbidden",
             },
         },
         "contract_violation_count": 0,
-        "test_label_accessed": False,
     }

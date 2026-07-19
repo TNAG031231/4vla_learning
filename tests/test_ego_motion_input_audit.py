@@ -16,8 +16,10 @@ from src.actions.schema import ACTION_SCHEMA
 from src.baselines.ego_motion import (
     EgoMotionFeatures,
     audit_manifest_rows,
+    build_test_label_access_evidence,
     parse_ego_motion_audit_sample,
 )
+from src.phase0.protocol import validate_manifest
 
 
 def manifest_row(
@@ -151,22 +153,61 @@ def test_forbidden_future_and_scene_fields_do_not_affect_features() -> None:
     )
 
 
-class LabelGuard(dict[str, object]):
+class NonTrainLabelGuard(dict[str, object]):
     def get(self, key: str, default: object = None) -> object:
         if key == "meta_action":
             raise AssertionError("test meta_action was accessed")
         return super().get(key, default)
 
 
-def test_test_row_meta_action_is_never_accessed() -> None:
-    row = LabelGuard(
+def test_test_meta_action_does_not_enter_statistics_path() -> None:
+    row = NonTrainLabelGuard(
         manifest_row(split="test", meta_action="TEST_LABEL_SENTINEL")
     )
 
     result = audit_manifest_rows((row,))
 
     assert result["sample_count_by_split"]["test"] == 1
-    assert result["test_label_accessed"] is False
+    assert "test_label_accessed" not in result
+
+
+def test_validation_meta_action_does_not_enter_statistics_path() -> None:
+    row = NonTrainLabelGuard(
+        manifest_row(split="validation", meta_action="VALIDATION_LABEL_SENTINEL")
+    )
+
+    result = audit_manifest_rows((row,))
+
+    assert result["sample_count_by_split"]["validation"] == 1
+
+
+def test_manifest_validator_reads_test_meta_action_for_contract(
+    tmp_path: Path,
+) -> None:
+    row = manifest_row(split="test", meta_action="TEST_LABEL_SENTINEL")
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported action"):
+        validate_manifest(manifest_path)
+
+
+def test_audit_evidence_distinguishes_schema_validation_from_label_use() -> None:
+    evidence = build_test_label_access_evidence()
+
+    assert evidence["test_label_access_policy"] == {
+        "schema_validation": "allowed_and_performed",
+        "input_statistics": "forbidden_and_not_performed",
+        "class_conditional_statistics": "forbidden_and_not_performed",
+        "threshold_selection": "forbidden_and_not_performed",
+        "model_selection": "forbidden_and_not_performed",
+        "classification_metrics": "forbidden_and_not_performed",
+        "failure_case_analysis": "forbidden_and_not_performed",
+    }
+    assert evidence["test_label_used_for_statistics"] is False
+    assert evidence["test_label_used_for_threshold_selection"] is False
+    assert evidence["test_label_used_for_model_selection"] is False
+    assert "test_label_accessed" not in evidence
 
 
 def test_only_train_produces_class_conditional_statistics() -> None:
@@ -195,6 +236,9 @@ def test_only_train_produces_class_conditional_statistics() -> None:
     ]["count"] == 1
     assert "validation_class_conditional_motion_statistics" not in result
     assert "test_motion_statistics" not in result
+    assert "test_class_conditional_motion_statistics" not in result
+    assert "test_classification_metrics" not in result
+    assert "test_failure_cases" not in result
     assert result["motion_availability_by_split"]["test"] == {
         "full": 0,
         "partial": 1,
