@@ -14,6 +14,7 @@
 - 已完成 Phase 0.1 audited seed-subset manifest、固定 seed scene split、统一评测协议、完整 contract validator 与 Majority Baseline。
 - 已完成并冻结 Phase 0.1b trainval dataset protocol v1：`horizon_sec=3.0`、`sample_interval_sec=0.5`、`time_tolerance_sec=0.075`、`label_rule_version=phase-1.6-meta-action-v0.2`、`split_strategy_version=official_train_scene_label_stratified_v1`、`split_seed=20260710`。
 - 完整 850-scene split 为 project train/validation/test `560/140/150`；正式 manifest 扫描 34,149 samples，纳入 21,646 条（train 14,253 / validation 3,594 / test 3,799），排除 12,503 条。
+- 已完成 Phase 0.2a current/past ego-motion 输入审计：train/validation/test 的 `full/partial/unavailable` 分别为 `13476/392/385`、`3401/99/94`、`3594/106/99`；输入合同仅包含 speed、longitudinal acceleration、yaw rate、availability 与对应 past interval，test label 未用于统计或调参。Phase 0.2 rule predictor 仍为 planned。
 - 已建立环境检查与 workspace cleanup dry-run 脚本。
 
 ## Active Source Files
@@ -41,9 +42,10 @@ conda run -n codex4vla_env python scripts/check_env.py
 conda run -n codex4vla_env python scripts/clean_workspace.py
 conda run -n codex4vla_env python data/validate_label_freeze.py --dataroot data/nuscenes
 conda run -n codex4vla_env python data/build_trainval_manifest.py --config configs/trainval_manifest.yaml --pilot
+conda run -n codex4vla_env python scripts/audit_ego_motion_inputs.py --config configs/phase0_2_ego_motion.yaml
 ```
 
-trainval pilot 需要预先设置 `NUSCENES_ROOT` 与 `VLA_DERIVED_ROOT`；原始数据和派生 manifest 均不进入 Git。
+trainval pilot 与 Phase 0.2a 输入审计需要预先设置 `NUSCENES_ROOT` 与 `VLA_DERIVED_ROOT`；原始数据、派生 manifest 与审计 JSON 均不进入 Git。
 
 ## Data / Manifest Field Contracts
 
