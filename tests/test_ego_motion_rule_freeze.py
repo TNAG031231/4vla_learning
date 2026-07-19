@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import sys
@@ -25,18 +25,24 @@ from src.baselines.ego_motion_analysis import (
     assert_payload_equal,
     availability_analysis,
     build_failure_records,
+    build_freeze_gates,
     build_freeze_record,
     candidate_stability,
     confusion_pairs,
     decision_reason_analysis,
+    inference_field_contract,
     read_source_predictions,
     reproduce_predictions,
     scene_error_concentration,
     threshold_boundary_analysis,
     threshold_boundary_flags,
     trigger_overlap_analysis,
+    validate_leaderboard_contract,
     validate_selected_rule,
     validate_source_hashes,
+)
+from scripts.analyze_and_freeze_ego_motion_rule import (
+    _validate_prediction_contracts,
 )
 from src.phase0.manifest import write_canonical_json, write_jsonl_records
 
@@ -142,6 +148,12 @@ def candidate(
     minimum_f1: float = 0.3,
     accuracy: float = 0.62,
 ) -> dict[str, object]:
+    candidate_thresholds = EgoMotionRuleThresholds(
+        stop,
+        lateral,
+        accelerate,
+        decelerate,
+    )
     return {
         "candidate_id": candidate_id,
         "thresholds": {
@@ -150,6 +162,7 @@ def candidate(
             "accelerate_threshold_mps2": accelerate,
             "decelerate_threshold_mps2": decelerate,
         },
+        "thresholds_sha256": candidate_thresholds.sha256(),
         "validation_macro_f1": macro_f1,
         "minimum_per_class_f1": minimum_f1,
         "validation_accuracy": accuracy,
@@ -158,6 +171,7 @@ def candidate(
 
 def leaderboard() -> dict[str, object]:
     return {
+        "candidate_count": 3,
         "candidates": [
             candidate("candidate-0293", macro_f1=0.62, accuracy=0.63),
             candidate(
@@ -173,6 +187,77 @@ def leaderboard() -> dict[str, object]:
                 accuracy=0.61,
             ),
         ]
+    }
+
+
+def contract_leaderboard() -> dict[str, object]:
+    candidates = []
+    for index in range(1, 626):
+        item = candidate(
+            f"candidate-{index:04d}",
+            stop=1.0 + index / 1000,
+            macro_f1=0.5,
+            accuracy=0.5,
+        )
+        if index == 293:
+            item = candidate(
+                "candidate-0293",
+                macro_f1=0.62,
+                accuracy=0.63,
+            )
+        candidates.append(item)
+    return {"candidate_count": 625, "candidates": candidates}
+
+
+def valid_gate_kwargs() -> dict[str, object]:
+    leaderboard_evidence = {
+        "candidate_count_is_625": True,
+        "candidate_list_length_is_625": True,
+        "candidate_ids_unique": True,
+        "threshold_hashes_unique": True,
+        "selected_thresholds_match": True,
+        "selected_rule_thresholds_match": True,
+        "selected_threshold_sha_matches": True,
+        "selected_rule_threshold_sha_matches": True,
+    }
+    trace_contract = {
+        "baseline_name_match": True,
+        "rule_version_match": True,
+        "candidate_id_match": True,
+        "thresholds_sha256_match": True,
+        "label_rule_version_match": True,
+        "manifest_schema_version_match": True,
+        "split_mapping_sha256_match": True,
+        "split_and_is_correct_match": True,
+        "matched_record_count": 3594,
+    }
+    return {
+        "manifest_sha_matches": True,
+        "source_artifact_hashes_match": True,
+        "leaderboard_contract": leaderboard_evidence,
+        "selected_rule_contract": {"all_fields_match": True},
+        "prediction_trace_contract": trace_contract,
+        "prediction_reproduction": {
+            "source_prediction_count": 3594,
+            "all_predictions_match": True,
+        },
+        "reproduction_evidence": {
+            "metrics_reproduce_exactly": True,
+            "confusion_matrix_reproduces_exactly": True,
+            "prediction_distribution_reproduces_exactly": True,
+            "decision_reason_distribution_reproduces_exactly": True,
+        },
+        "forbidden_field_evidence": {"passed": True},
+        "test_isolation_evidence": {
+            "test_rows_absent_from_analysis": True,
+            "test_evaluation_absent": True,
+        },
+        "candidate_rank_is_one": True,
+        "all_predictions_legal": True,
+        "macro_f1_exceeds_majority": True,
+        "accuracy_exceeds_majority": True,
+        "all_actions_predicted": True,
+        "serialization_contract_passed": True,
     }
 
 
@@ -324,6 +409,246 @@ def test_candidate_stability_uses_existing_leaderboard_only() -> None:
     assert [item["candidate_id"] for item in result["local_grid_neighbours"]] == [
         "candidate-0168",
         "candidate-0418",
+    ]
+
+
+def test_leaderboard_candidate_count_must_be_625() -> None:
+    payload = contract_leaderboard()
+    payload["candidate_count"] = 624
+
+    with pytest.raises(ValueError, match="candidate_count must be 625"):
+        validate_leaderboard_contract(
+            payload,
+            selected_candidate_id="candidate-0293",
+            thresholds=thresholds(),
+            thresholds_sha256=THRESHOLD_SHA,
+            selected_rule=selected_rule_payload(),
+        )
+
+
+def test_leaderboard_candidate_list_length_must_be_625() -> None:
+    payload = contract_leaderboard()
+    payload["candidates"].pop()
+
+    with pytest.raises(ValueError, match="list length must be 625"):
+        validate_leaderboard_contract(
+            payload,
+            selected_candidate_id="candidate-0293",
+            thresholds=thresholds(),
+            thresholds_sha256=THRESHOLD_SHA,
+            selected_rule=selected_rule_payload(),
+        )
+
+
+def test_leaderboard_duplicate_candidate_id_is_rejected() -> None:
+    payload = contract_leaderboard()
+    payload["candidates"][0]["candidate_id"] = "candidate-0002"
+
+    with pytest.raises(ValueError, match="candidate_id values must be unique"):
+        validate_leaderboard_contract(
+            payload,
+            selected_candidate_id="candidate-0293",
+            thresholds=thresholds(),
+            thresholds_sha256=THRESHOLD_SHA,
+            selected_rule=selected_rule_payload(),
+        )
+
+
+def test_leaderboard_duplicate_threshold_hash_is_rejected() -> None:
+    payload = contract_leaderboard()
+    payload["candidates"][0]["thresholds_sha256"] = payload["candidates"][1][
+        "thresholds_sha256"
+    ]
+
+    with pytest.raises(ValueError, match="thresholds_sha256 values must be unique"):
+        validate_leaderboard_contract(
+            payload,
+            selected_candidate_id="candidate-0293",
+            thresholds=thresholds(),
+            thresholds_sha256=THRESHOLD_SHA,
+            selected_rule=selected_rule_payload(),
+        )
+
+
+def test_leaderboard_selected_thresholds_must_match_freeze_config() -> None:
+    payload = contract_leaderboard()
+    payload["candidates"][292]["thresholds"]["stop_speed_threshold_mps"] = 0.1
+
+    with pytest.raises(ValueError, match="selected thresholds"):
+        validate_leaderboard_contract(
+            payload,
+            selected_candidate_id="candidate-0293",
+            thresholds=thresholds(),
+            thresholds_sha256=THRESHOLD_SHA,
+            selected_rule=selected_rule_payload(),
+        )
+
+
+def test_leaderboard_selected_threshold_sha_must_match_freeze_config() -> None:
+    payload = contract_leaderboard()
+    payload["candidates"][292]["thresholds_sha256"] = "f" * 64
+
+    with pytest.raises(ValueError, match="selected threshold SHA-256"):
+        validate_leaderboard_contract(
+            payload,
+            selected_candidate_id="candidate-0293",
+            thresholds=thresholds(),
+            thresholds_sha256=THRESHOLD_SHA,
+            selected_rule=selected_rule_payload(),
+        )
+
+
+def test_leaderboard_and_selected_rule_thresholds_must_match() -> None:
+    selected_rule = selected_rule_payload()
+    selected_rule["thresholds"] = {
+        **thresholds().as_dict(),
+        "stop_speed_threshold_mps": 0.1,
+    }
+
+    with pytest.raises(ValueError, match="leaderboard and selected rule"):
+        validate_leaderboard_contract(
+            contract_leaderboard(),
+            selected_candidate_id="candidate-0293",
+            thresholds=thresholds(),
+            thresholds_sha256=THRESHOLD_SHA,
+            selected_rule=selected_rule,
+        )
+
+
+def test_prediction_baseline_name_must_match() -> None:
+    prediction = replace(source_prediction(), baseline_name="other")
+
+    with pytest.raises(ValueError, match="baseline_name"):
+        _validate_prediction_contracts(
+            (prediction,),
+            candidate_id="candidate-0293",
+            thresholds_sha256=THRESHOLD_SHA,
+            source_rule_version="phase0.2b-ego-motion-rule-v0.1",
+            label_rule_version="phase-1.6-meta-action-v0.2",
+            manifest_schema_version="phase0_trainval_dataset_manifest_v1",
+            split_mapping_sha256="a" * 64,
+        )
+
+
+def test_prediction_label_rule_version_must_match_manifest() -> None:
+    source = source_prediction()
+    prediction = replace(source, label_rule_version="wrong-label-rule")
+
+    with pytest.raises(ValueError, match="label_rule_version"):
+        reproduce_predictions(
+            (evaluation_sample(source),),
+            (prediction,),
+            thresholds(),
+            expected_label_rule_version="phase-1.6-meta-action-v0.2",
+        )
+
+
+def test_prediction_manifest_schema_version_must_match_manifest() -> None:
+    source = source_prediction()
+    prediction = replace(source, manifest_schema_version="wrong-schema")
+
+    with pytest.raises(ValueError, match="manifest_schema_version"):
+        reproduce_predictions(
+            (evaluation_sample(source),),
+            (prediction,),
+            thresholds(),
+            expected_manifest_schema_version=(
+                "phase0_trainval_dataset_manifest_v1"
+            ),
+        )
+
+
+def test_prediction_split_mapping_sha_must_match_manifest() -> None:
+    source = source_prediction()
+    prediction = replace(source, split_mapping_sha256="b" * 64)
+
+    with pytest.raises(ValueError, match="split_mapping_sha256"):
+        reproduce_predictions(
+            (evaluation_sample(source),),
+            (prediction,),
+            thresholds(),
+            expected_split_mapping_sha256="a" * 64,
+        )
+
+
+def test_prediction_trace_contract_records_3594_matches() -> None:
+    predictions = tuple(
+        source_prediction(token=f"sample-{index:04d}")
+        for index in range(3594)
+    )
+    samples = tuple(evaluation_sample(item) for item in predictions)
+
+    result = reproduce_predictions(
+        samples,
+        predictions,
+        thresholds(),
+        expected_rule_version="phase0.2b-ego-motion-rule-v0.1",
+        expected_candidate_id="candidate-0293",
+        expected_thresholds_sha256=THRESHOLD_SHA,
+        expected_label_rule_version="phase-1.6-meta-action-v0.2",
+        expected_manifest_schema_version="phase0_trainval_dataset_manifest_v1",
+        expected_split_mapping_sha256="a" * 64,
+    )
+
+    trace = result["prediction_trace_contract"]
+    assert trace["matched_record_count"] == 3594
+    assert all(
+        value is True
+        for key, value in trace.items()
+        if key != "matched_record_count"
+    )
+
+
+def test_freeze_gates_are_derived_from_evidence() -> None:
+    arguments = valid_gate_kwargs()
+    arguments["reproduction_evidence"] = {
+        **arguments["reproduction_evidence"],
+        "metrics_reproduce_exactly": False,
+    }
+
+    gates = build_freeze_gates(**arguments)
+
+    assert gates["metrics_reproduce_exactly"] is False
+
+
+@pytest.mark.parametrize("evidence_area", ("leaderboard", "trace"))
+def test_failed_trace_or_leaderboard_gate_cannot_freeze(
+    evidence_area: str,
+) -> None:
+    arguments = valid_gate_kwargs()
+    if evidence_area == "leaderboard":
+        arguments["leaderboard_contract"] = {
+            **arguments["leaderboard_contract"],
+            "candidate_ids_unique": False,
+        }
+    else:
+        arguments["prediction_trace_contract"] = {
+            **arguments["prediction_trace_contract"],
+            "label_rule_version_match": False,
+        }
+    gates = build_freeze_gates(**arguments)
+
+    with pytest.raises(ValueError, match="freeze gates failed"):
+        build_freeze_record(gates=gates, payload={})
+
+
+def test_predictor_decision_fields_only_include_used_features() -> None:
+    contract = inference_field_contract()
+
+    assert contract["predictor_decision_fields"] == [
+        "speed_mps",
+        "longitudinal_acceleration_mps2",
+        "yaw_rate_radps",
+        "availability",
+    ]
+
+
+def test_intervals_are_trace_only_fields() -> None:
+    contract = inference_field_contract()
+
+    assert contract["trace_only_fields"] == [
+        "history_interval_sec",
+        "acceleration_interval_sec",
     ]
 
 

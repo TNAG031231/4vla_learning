@@ -27,15 +27,19 @@ from src.baselines.ego_motion import (
 )
 from src.baselines.ego_motion_analysis import (
     DiagnosticMargins,
+    FORBIDDEN_FIELDS,
     SourcePrediction,
     assert_payload_equal,
     availability_analysis,
     build_failure_records,
+    build_freeze_gates,
     build_freeze_record,
     build_overall_analysis,
+    canonical_serialization_contract_passed,
     candidate_stability,
     confusion_pairs,
     decision_reason_analysis,
+    inference_field_contract,
     metrics_for_predictions,
     metrics_payload,
     read_source_predictions,
@@ -43,6 +47,7 @@ from src.baselines.ego_motion_analysis import (
     scene_error_concentration,
     threshold_boundary_analysis,
     trigger_overlap_analysis,
+    validate_leaderboard_contract,
     validate_selected_rule,
     validate_source_hashes,
 )
@@ -202,19 +207,33 @@ def _validate_source_contracts(
     candidate_id: str,
     thresholds_sha256: str,
     source_rule_version: str,
-) -> None:
-    for filename, payload in source_payloads.items():
-        if payload.get("test_evaluation_performed") is not False:
-            raise ValueError(
-                f"source artifact does not preserve test isolation: {filename}"
-            )
+) -> dict[str, bool]:
+    test_evaluation_absent = all(
+        payload.get("test_evaluation_performed") is False
+        for payload in source_payloads.values()
+    )
+    if not test_evaluation_absent:
+        raise ValueError("source artifacts do not preserve test isolation")
     selected_rule = source_payloads["selected_rule.json"]
-    if selected_rule.get("selected_candidate_id") != candidate_id:
+    selected_candidate_id_match = (
+        selected_rule.get("selected_candidate_id") == candidate_id
+    )
+    if not selected_candidate_id_match:
         raise ValueError("source selected candidate is inconsistent")
-    if selected_rule.get("thresholds_sha256") != thresholds_sha256:
+    threshold_sha_match = (
+        selected_rule.get("thresholds_sha256") == thresholds_sha256
+    )
+    if not threshold_sha_match:
         raise ValueError("source threshold SHA-256 is inconsistent")
-    if selected_rule.get("rule_version") != source_rule_version:
+    rule_version_match = selected_rule.get("rule_version") == source_rule_version
+    if not rule_version_match:
         raise ValueError("source rule version is inconsistent")
+    return {
+        "test_evaluation_absent": test_evaluation_absent,
+        "selected_candidate_id_match": selected_candidate_id_match,
+        "threshold_sha_match": threshold_sha_match,
+        "rule_version_match": rule_version_match,
+    }
 
 
 def _validate_prediction_contracts(
@@ -223,14 +242,66 @@ def _validate_prediction_contracts(
     candidate_id: str,
     thresholds_sha256: str,
     source_rule_version: str,
-) -> None:
+    label_rule_version: str,
+    manifest_schema_version: str,
+    split_mapping_sha256: str,
+) -> dict[str, object]:
+    match_counts = Counter(
+        {
+            "baseline_name": 0,
+            "rule_version": 0,
+            "candidate_id": 0,
+            "thresholds_sha256": 0,
+            "label_rule_version": 0,
+            "manifest_schema_version": 0,
+            "split_mapping_sha256": 0,
+        }
+    )
     for prediction in predictions:
-        if prediction.candidate_id != candidate_id:
-            raise ValueError("prediction candidate_id is inconsistent")
-        if prediction.thresholds_sha256 != thresholds_sha256:
-            raise ValueError("prediction thresholds_sha256 is inconsistent")
-        if prediction.rule_version != source_rule_version:
-            raise ValueError("prediction rule_version is inconsistent")
+        checks = {
+            "baseline_name": prediction.baseline_name == "ego_motion_rule",
+            "rule_version": prediction.rule_version == source_rule_version,
+            "candidate_id": prediction.candidate_id == candidate_id,
+            "thresholds_sha256": (
+                prediction.thresholds_sha256 == thresholds_sha256
+            ),
+            "label_rule_version": (
+                prediction.label_rule_version == label_rule_version
+            ),
+            "manifest_schema_version": (
+                prediction.manifest_schema_version == manifest_schema_version
+            ),
+            "split_mapping_sha256": (
+                prediction.split_mapping_sha256 == split_mapping_sha256
+            ),
+        }
+        failed = sorted(field for field, matches in checks.items() if not matches)
+        if failed:
+            raise ValueError(
+                f"prediction trace contract is inconsistent: "
+                f"{prediction.sample_token}: {failed}"
+            )
+        for field, matches in checks.items():
+            match_counts[field] += int(matches)
+    count = len(predictions)
+    return {
+        "baseline_name_match": match_counts["baseline_name"] == count,
+        "rule_version_match": match_counts["rule_version"] == count,
+        "candidate_id_match": match_counts["candidate_id"] == count,
+        "thresholds_sha256_match": (
+            match_counts["thresholds_sha256"] == count
+        ),
+        "label_rule_version_match": (
+            match_counts["label_rule_version"] == count
+        ),
+        "manifest_schema_version_match": (
+            match_counts["manifest_schema_version"] == count
+        ),
+        "split_mapping_sha256_match": (
+            match_counts["split_mapping_sha256"] == count
+        ),
+        "matched_record_count": min(match_counts.values()),
+    }
 
 
 def _comparison_payload(
@@ -315,14 +386,21 @@ def run_analysis(
         for filename in SOURCE_FILENAMES
         if filename.endswith(".json")
     }
-    validate_selected_rule(
+    selected_rule_contract = validate_selected_rule(
         source_payloads["selected_rule.json"],
         candidate_id,
         thresholds,
         thresholds_sha256,
         source_rule_version,
     )
-    _validate_source_contracts(
+    leaderboard_contract = validate_leaderboard_contract(
+        source_payloads["candidate_leaderboard.json"],
+        selected_candidate_id=candidate_id,
+        thresholds=thresholds,
+        thresholds_sha256=thresholds_sha256,
+        selected_rule=source_payloads["selected_rule.json"],
+    )
+    source_contract = _validate_source_contracts(
         source_payloads=source_payloads,
         candidate_id=candidate_id,
         thresholds_sha256=thresholds_sha256,
@@ -331,16 +409,35 @@ def run_analysis(
     predictions = read_source_predictions(
         source_dir / "validation_predictions.jsonl"
     )
-    _validate_prediction_contracts(
+    prediction_source_contract = _validate_prediction_contracts(
         predictions,
         candidate_id=candidate_id,
         thresholds_sha256=thresholds_sha256,
         source_rule_version=source_rule_version,
+        label_rule_version=validation.label_rule_version,
+        manifest_schema_version=validation.manifest_schema_version,
+        split_mapping_sha256=validation.split_mapping_sha256,
     )
     majority_samples, validation_samples = _load_manifest_samples(manifest_path)
     reproduction = reproduce_predictions(
-        validation_samples, predictions, thresholds
+        validation_samples,
+        predictions,
+        thresholds,
+        expected_rule_version=source_rule_version,
+        expected_candidate_id=candidate_id,
+        expected_thresholds_sha256=thresholds_sha256,
+        expected_label_rule_version=validation.label_rule_version,
+        expected_manifest_schema_version=validation.manifest_schema_version,
+        expected_split_mapping_sha256=validation.split_mapping_sha256,
     )
+    prediction_trace_contract = reproduction["prediction_trace_contract"]
+    comparable_trace_contract = {
+        key: value
+        for key, value in prediction_trace_contract.items()
+        if key != "split_and_is_correct_match"
+    }
+    if prediction_source_contract != comparable_trace_contract:
+        raise ValueError("prediction trace evidence paths do not agree")
 
     metrics = metrics_for_predictions(predictions)
     metrics_data = metrics_payload(metrics)
@@ -355,6 +452,38 @@ def run_analysis(
     )
     validation_metrics = source_payloads["validation_metrics.json"]
     selected_rule = source_payloads["selected_rule.json"]
+    validation_metrics_payload = validation_metrics.get("metrics")
+    selected_metrics_payload = selected_rule.get("validation_metrics")
+    if not isinstance(validation_metrics_payload, Mapping) or not isinstance(
+        selected_metrics_payload, Mapping
+    ):
+        raise ValueError("source validation metrics must be an object")
+    metrics_reproduce_exactly = (
+        metrics_data == validation_metrics_payload
+        and metrics_data == selected_metrics_payload
+    )
+    confusion_matrix_reproduces_exactly = (
+        metrics_data.get("confusion_matrix")
+        == validation_metrics_payload.get("confusion_matrix")
+        and metrics_data.get("confusion_matrix")
+        == selected_metrics_payload.get("confusion_matrix")
+    )
+    prediction_distribution_reproduces_exactly = (
+        prediction_distribution
+        == validation_metrics.get("predicted_class_distribution")
+        and prediction_distribution
+        == selected_rule.get("predicted_class_distribution")
+    )
+    decision_reason_distribution_reproduces_exactly = (
+        reason_distribution
+        == validation_metrics.get("decision_reason_distribution")
+        and reason_distribution
+        == selected_rule.get("decision_reason_distribution")
+    )
+    availability_distribution_reproduces_exactly = (
+        availability_distribution
+        == selected_rule.get("motion_availability_distribution")
+    )
     assert_payload_equal(
         metrics_data, validation_metrics.get("metrics"), "validation metrics"
     )
@@ -420,6 +549,47 @@ def run_analysis(
     failures = build_failure_records(
         predictions, thresholds, diagnostic_margins
     )
+    source_prediction_forbidden_field_count = sum(
+        bool(FORBIDDEN_FIELDS.intersection(asdict(prediction)))
+        for prediction in predictions
+    )
+    failure_output_forbidden_field_count = sum(
+        bool(FORBIDDEN_FIELDS.intersection(record)) for record in failures
+    )
+    forbidden_field_evidence = {
+        "source_prediction_forbidden_field_count": (
+            source_prediction_forbidden_field_count
+        ),
+        "failure_output_forbidden_field_count": (
+            failure_output_forbidden_field_count
+        ),
+        "passed": (
+            source_prediction_forbidden_field_count == 0
+            and failure_output_forbidden_field_count == 0
+        ),
+    }
+    test_isolation_evidence = {
+        "test_rows_absent_from_analysis": (
+            all(sample.split == "validation" for sample in validation_samples)
+            and all(prediction.split == "validation" for prediction in predictions)
+        ),
+        "test_evaluation_absent": source_contract["test_evaluation_absent"],
+    }
+    reproduction_evidence = {
+        "metrics_reproduce_exactly": metrics_reproduce_exactly,
+        "confusion_matrix_reproduces_exactly": (
+            confusion_matrix_reproduces_exactly
+        ),
+        "prediction_distribution_reproduces_exactly": (
+            prediction_distribution_reproduces_exactly
+        ),
+        "decision_reason_distribution_reproduces_exactly": (
+            decision_reason_distribution_reproduces_exactly
+        ),
+        "availability_distribution_reproduces_exactly": (
+            availability_distribution_reproduces_exactly
+        ),
+    }
     failure_analysis = {
         "analysis_schema_version": "phase0.2_rule_failure_analysis_v0.1",
         "manifest_sha256": manifest_sha256,
@@ -439,33 +609,16 @@ def run_analysis(
         ),
         "scene_error_concentration": scene_error_concentration(predictions),
         "candidate_stability": stability,
+        "leaderboard_contract": leaderboard_contract,
         "validation_failure_sample_count": len(failures),
-        "forbidden_field_check": {
-            "source_prediction_forbidden_field_count": 0,
-            "failure_output_forbidden_field_count": 0,
-            "passed": True,
-        },
+        "forbidden_field_check": forbidden_field_evidence,
         "prediction_reproduction": reproduction,
+        "prediction_trace_contract": prediction_trace_contract,
+        "reproduction_evidence": reproduction_evidence,
+        "test_isolation_evidence": test_isolation_evidence,
         "test_evaluation_performed": False,
     }
-    gates = {
-        "manifest_sha_matches": True,
-        "source_artifact_hashes_match": True,
-        "prediction_count_is_3594": len(predictions) == 3594,
-        "predictions_reproduce_exactly": reproduction["all_predictions_match"],
-        "metrics_and_distributions_reproduce": True,
-        "all_predictions_legal": metrics.invalid_prediction_count == 0,
-        "forbidden_fields_absent": True,
-        "test_evaluation_absent": True,
-        "candidate_and_thresholds_unchanged": True,
-        "candidate_rank_is_one": stability["selected_candidate_rank"] == 1,
-        "macro_f1_exceeds_majority": metrics.macro_f1 > majority_metrics.macro_f1,
-        "accuracy_exceeds_majority": metrics.accuracy > majority_metrics.accuracy,
-        "all_actions_predicted": all(
-            prediction_distribution[action] > 0 for action in ACTION_SCHEMA
-        ),
-        "deterministic_canonical_serialization": True,
-    }
+    field_contract = inference_field_contract()
     freeze_payload = {
         "freeze_schema_version": _required_string(
             config, "freeze_schema_version"
@@ -496,6 +649,11 @@ def run_analysis(
         "validation_metrics": metrics_data,
         "majority_comparison": comparison,
         "prediction_reproduction": reproduction,
+        "leaderboard_contract": leaderboard_contract,
+        "selected_rule_contract": selected_rule_contract,
+        "prediction_trace_contract": prediction_trace_contract,
+        "reproduction_evidence": reproduction_evidence,
+        "test_isolation_evidence": test_isolation_evidence,
         "known_limitations": [
             "accelerate F1 is comparatively low on validation",
             (
@@ -507,14 +665,7 @@ def run_analysis(
             "current and past ego-motion cannot fully express future driving intent",
             "this rule is a deterministic baseline, not an industrial driving policy",
         ],
-        "allowed_inference_fields": [
-            "speed_mps",
-            "longitudinal_acceleration_mps2",
-            "yaw_rate_radps",
-            "availability",
-            "history_interval_sec",
-            "acceleration_interval_sec",
-        ],
+        **field_contract,
         "forbidden_inference_fields": [
             "future_ego_trajectory",
             "nearby_agents",
@@ -529,6 +680,37 @@ def run_analysis(
         "test_evaluation_performed": False,
         "next_gate": "phase0.2d_one_shot_test",
     }
+    serialization_contract = canonical_serialization_contract_passed(
+        (failure_analysis, freeze_payload), failures
+    )
+    gates = build_freeze_gates(
+        manifest_sha_matches=(
+            manifest_sha256 == _required_string(config, "expected_manifest_sha256")
+        ),
+        source_artifact_hashes_match=(
+            source_hashes == _expected_source_hashes(config)
+        ),
+        leaderboard_contract=leaderboard_contract,
+        selected_rule_contract=selected_rule_contract,
+        prediction_trace_contract=prediction_trace_contract,
+        prediction_reproduction=reproduction,
+        reproduction_evidence=reproduction_evidence,
+        forbidden_field_evidence=forbidden_field_evidence,
+        test_isolation_evidence=test_isolation_evidence,
+        candidate_rank_is_one=stability["selected_candidate_rank"] == 1,
+        all_predictions_legal=metrics.invalid_prediction_count == 0,
+        macro_f1_exceeds_majority=(
+            metrics.macro_f1 > majority_metrics.macro_f1
+        ),
+        accuracy_exceeds_majority=(metrics.accuracy > majority_metrics.accuracy),
+        all_actions_predicted=all(
+            prediction_distribution[action] > 0 for action in ACTION_SCHEMA
+        ),
+        serialization_contract_passed=serialization_contract,
+    )
+    freeze_payload["canonical_serialization_contract_passed"] = (
+        serialization_contract
+    )
     rule_freeze = build_freeze_record(gates=gates, payload=freeze_payload)
 
     write_canonical_json(failure_analysis, output_dir / "failure_analysis.json")
@@ -543,6 +725,8 @@ def run_analysis(
         "manifest_sha256": manifest_sha256,
         "source_output_sha256": source_hashes,
         "prediction_reproduction": reproduction,
+        "leaderboard_contract": leaderboard_contract,
+        "prediction_trace_contract": prediction_trace_contract,
         "freeze_status": rule_freeze["freeze_status"],
         "selected_candidate_id": candidate_id,
         "thresholds": thresholds.as_dict(),

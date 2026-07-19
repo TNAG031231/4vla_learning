@@ -25,6 +25,17 @@ from src.phase0.protocol import (
 
 
 EXPECTED_VALIDATION_SAMPLE_COUNT: Final = 3594
+EXPECTED_LEADERBOARD_CANDIDATE_COUNT: Final = 625
+PREDICTOR_DECISION_FIELDS: Final = (
+    "speed_mps",
+    "longitudinal_acceleration_mps2",
+    "yaw_rate_radps",
+    "availability",
+)
+TRACE_ONLY_FIELDS: Final = (
+    "history_interval_sec",
+    "acceleration_interval_sec",
+)
 TRIGGER_NAMES: Final = (
     "stop_trigger",
     "left_lateral_trigger",
@@ -263,28 +274,239 @@ def validate_selected_rule(
     thresholds: EgoMotionRuleThresholds,
     thresholds_sha256: str,
     source_rule_version: str,
-) -> None:
-    if selected_rule.get("selected_candidate_id") != candidate_id:
+) -> dict[str, bool]:
+    evidence = {
+        "candidate_id_match": (
+            selected_rule.get("selected_candidate_id") == candidate_id
+        ),
+        "rule_version_match": (
+            selected_rule.get("rule_version") == source_rule_version
+        ),
+        "thresholds_match": (
+            selected_rule.get("thresholds") == thresholds.as_dict()
+        ),
+        "configured_threshold_sha_matches_values": (
+            thresholds.sha256() == thresholds_sha256
+        ),
+        "threshold_sha_match": (
+            selected_rule.get("thresholds_sha256") == thresholds_sha256
+        ),
+    }
+    if not evidence["candidate_id_match"]:
         raise ValueError("selected candidate does not match freeze config")
-    if selected_rule.get("rule_version") != source_rule_version:
+    if not evidence["rule_version_match"]:
         raise ValueError("source rule version does not match freeze config")
-    if selected_rule.get("thresholds") != thresholds.as_dict():
+    if not evidence["thresholds_match"]:
         raise ValueError("selected threshold values do not match freeze config")
-    if thresholds.sha256() != thresholds_sha256:
+    if not evidence["configured_threshold_sha_matches_values"]:
         raise ValueError("configured threshold SHA-256 does not match thresholds")
-    if selected_rule.get("thresholds_sha256") != thresholds_sha256:
+    if not evidence["threshold_sha_match"]:
         raise ValueError("selected threshold SHA-256 does not match freeze config")
+    return evidence
+
+
+def validate_leaderboard_contract(
+    leaderboard: Mapping[str, object],
+    *,
+    selected_candidate_id: str,
+    thresholds: EgoMotionRuleThresholds,
+    thresholds_sha256: str,
+    selected_rule: Mapping[str, object],
+) -> dict[str, object]:
+    candidate_count = leaderboard.get("candidate_count")
+    raw_candidates = leaderboard.get("candidates")
+    candidate_count_is_625 = (
+        candidate_count == EXPECTED_LEADERBOARD_CANDIDATE_COUNT
+    )
+    if not candidate_count_is_625:
+        raise ValueError("leaderboard candidate_count must be 625")
+    if not isinstance(raw_candidates, list):
+        raise ValueError("leaderboard candidates must be a list")
+    candidate_list_length_is_625 = (
+        len(raw_candidates) == EXPECTED_LEADERBOARD_CANDIDATE_COUNT
+    )
+    if not candidate_list_length_is_625:
+        raise ValueError("leaderboard candidates list length must be 625")
+
+    required_fields = {
+        "candidate_id",
+        "thresholds",
+        "thresholds_sha256",
+        "validation_macro_f1",
+        "minimum_per_class_f1",
+        "validation_accuracy",
+    }
+    candidates = []
+    candidate_ids = []
+    threshold_hashes = []
+    all_required_fields_present = True
+    for item in raw_candidates:
+        if not isinstance(item, Mapping):
+            raise ValueError("leaderboard candidate must be an object")
+        missing = required_fields.difference(item)
+        if missing:
+            all_required_fields_present = False
+            raise ValueError(
+                f"leaderboard candidate missing fields: {sorted(missing)}"
+            )
+        candidate_id = _required_string(item, "candidate_id")
+        threshold_hash = validate_sha256(
+            item.get("thresholds_sha256"), "candidate thresholds_sha256"
+        )
+        if not isinstance(item.get("thresholds"), Mapping):
+            raise ValueError("leaderboard candidate thresholds must be an object")
+        candidates.append(item)
+        candidate_ids.append(candidate_id)
+        threshold_hashes.append(threshold_hash)
+
+    candidate_ids_unique = len(candidate_ids) == len(set(candidate_ids))
+    if not candidate_ids_unique:
+        raise ValueError("leaderboard candidate_id values must be unique")
+    threshold_hashes_unique = len(threshold_hashes) == len(
+        set(threshold_hashes)
+    )
+    if not threshold_hashes_unique:
+        raise ValueError("leaderboard thresholds_sha256 values must be unique")
+    if selected_candidate_id != "candidate-0293":
+        raise ValueError("freeze config must select candidate-0293")
+    selected = next(
+        (
+            item
+            for item in candidates
+            if item.get("candidate_id") == selected_candidate_id
+        ),
+        None,
+    )
+    if selected is None:
+        raise ValueError("selected candidate is absent from leaderboard")
+    selected_candidate_id_match = (
+        selected.get("candidate_id") == selected_candidate_id
+    )
+    selected_thresholds_match = selected.get("thresholds") == thresholds.as_dict()
+    if not selected_thresholds_match:
+        raise ValueError("leaderboard selected thresholds do not match freeze config")
+    selected_threshold_sha_matches = (
+        selected.get("thresholds_sha256") == thresholds_sha256
+    )
+    if not selected_threshold_sha_matches:
+        raise ValueError(
+            "leaderboard selected threshold SHA-256 does not match freeze config"
+        )
+    selected_rule_thresholds_match = (
+        selected.get("thresholds") == selected_rule.get("thresholds")
+    )
+    if not selected_rule_thresholds_match:
+        raise ValueError(
+            "leaderboard and selected rule thresholds do not match"
+        )
+    selected_rule_threshold_sha_matches = (
+        selected.get("thresholds_sha256")
+        == selected_rule.get("thresholds_sha256")
+    )
+    if not selected_rule_threshold_sha_matches:
+        raise ValueError(
+            "leaderboard and selected rule threshold SHA-256 do not match"
+        )
+    return {
+        "candidate_count": candidate_count,
+        "candidate_list_length": len(candidates),
+        "candidate_count_is_625": candidate_count_is_625,
+        "candidate_list_length_is_625": candidate_list_length_is_625,
+        "all_required_fields_present": all_required_fields_present,
+        "candidate_ids_unique": candidate_ids_unique,
+        "threshold_hashes_unique": threshold_hashes_unique,
+        "selected_candidate_id_match": selected_candidate_id_match,
+        "selected_thresholds_match": selected_thresholds_match,
+        "selected_threshold_sha_matches": selected_threshold_sha_matches,
+        "selected_rule_thresholds_match": selected_rule_thresholds_match,
+        "selected_rule_threshold_sha_matches": (
+            selected_rule_threshold_sha_matches
+        ),
+    }
 
 
 def reproduce_predictions(
     samples: Sequence[EgoMotionPredictionSample],
     predictions: Sequence[SourcePrediction],
     thresholds: EgoMotionRuleThresholds,
+    *,
+    expected_baseline_name: str = "ego_motion_rule",
+    expected_rule_version: str | None = None,
+    expected_candidate_id: str | None = None,
+    expected_thresholds_sha256: str | None = None,
+    expected_label_rule_version: str | None = None,
+    expected_manifest_schema_version: str | None = None,
+    expected_split_mapping_sha256: str | None = None,
 ) -> dict[str, object]:
     if len(samples) != len(predictions):
         raise ValueError("manifest and source prediction counts differ")
     match_count = 0
+    trace_match_counts = Counter(
+        {
+            "baseline_name": 0,
+            "rule_version": 0,
+            "candidate_id": 0,
+            "thresholds_sha256": 0,
+            "label_rule_version": 0,
+            "manifest_schema_version": 0,
+            "split_mapping_sha256": 0,
+            "split_and_is_correct": 0,
+        }
+    )
     for sample, source in zip(samples, predictions, strict=True):
+        trace_checks = {
+            "baseline_name": source.baseline_name == expected_baseline_name,
+            "rule_version": (
+                expected_rule_version is None
+                or source.rule_version == expected_rule_version
+            ),
+            "candidate_id": (
+                expected_candidate_id is None
+                or source.candidate_id == expected_candidate_id
+            ),
+            "thresholds_sha256": (
+                expected_thresholds_sha256 is None
+                or source.thresholds_sha256 == expected_thresholds_sha256
+            ),
+            "label_rule_version": (
+                source.label_rule_version == sample.label_rule_version
+                and (
+                    expected_label_rule_version is None
+                    or source.label_rule_version == expected_label_rule_version
+                )
+            ),
+            "manifest_schema_version": (
+                source.manifest_schema_version == sample.manifest_schema_version
+                and (
+                    expected_manifest_schema_version is None
+                    or source.manifest_schema_version
+                    == expected_manifest_schema_version
+                )
+            ),
+            "split_mapping_sha256": (
+                source.split_mapping_sha256 == sample.split_mapping_sha256
+                and (
+                    expected_split_mapping_sha256 is None
+                    or source.split_mapping_sha256
+                    == expected_split_mapping_sha256
+                )
+            ),
+            "split_and_is_correct": (
+                source.split == sample.split == "validation"
+                and source.is_correct
+                == (source.ground_truth_action == source.predicted_action)
+            ),
+        }
+        failed_trace_fields = sorted(
+            field for field, matches in trace_checks.items() if not matches
+        )
+        if failed_trace_fields:
+            raise ValueError(
+                f"prediction trace contract differs: {sample.sample_token}: "
+                f"{failed_trace_fields}"
+            )
+        for field in trace_match_counts:
+            trace_match_counts[field] += int(trace_checks[field])
         if sample.sample_token != source.sample_token:
             raise ValueError("manifest and source prediction order differs")
         if sample.scene_token != source.scene_token:
@@ -315,11 +537,39 @@ def reproduce_predictions(
         if source_features != manifest_features:
             raise ValueError(f"source motion differs: {sample.sample_token}")
         match_count += 1
+    trace_contract = {
+        "baseline_name_match": (
+            trace_match_counts["baseline_name"] == len(predictions)
+        ),
+        "rule_version_match": (
+            trace_match_counts["rule_version"] == len(predictions)
+        ),
+        "candidate_id_match": (
+            trace_match_counts["candidate_id"] == len(predictions)
+        ),
+        "thresholds_sha256_match": (
+            trace_match_counts["thresholds_sha256"] == len(predictions)
+        ),
+        "label_rule_version_match": (
+            trace_match_counts["label_rule_version"] == len(predictions)
+        ),
+        "manifest_schema_version_match": (
+            trace_match_counts["manifest_schema_version"] == len(predictions)
+        ),
+        "split_mapping_sha256_match": (
+            trace_match_counts["split_mapping_sha256"] == len(predictions)
+        ),
+        "split_and_is_correct_match": (
+            trace_match_counts["split_and_is_correct"] == len(predictions)
+        ),
+        "matched_record_count": min(trace_match_counts.values()),
+    }
     return {
         "source_prediction_count": len(predictions),
         "manifest_validation_sample_count": len(samples),
         "match_count": match_count,
         "all_predictions_match": match_count == len(predictions),
+        "prediction_trace_contract": trace_contract,
     }
 
 
@@ -860,6 +1110,156 @@ def assert_payload_equal(
 ) -> None:
     if actual != expected:
         raise ValueError(f"reproduced {description} does not match source output")
+
+
+def inference_field_contract() -> dict[str, list[str]]:
+    return {
+        "predictor_decision_fields": list(PREDICTOR_DECISION_FIELDS),
+        "trace_only_fields": list(TRACE_ONLY_FIELDS),
+    }
+
+
+def canonical_serialization_contract_passed(
+    json_payloads: Sequence[Mapping[str, object]],
+    jsonl_records: Sequence[Mapping[str, object]],
+) -> bool:
+    first_json = tuple(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for payload in json_payloads
+    )
+    reconstructed_payloads = tuple(
+        json.loads(serialized.decode("utf-8")) for serialized in first_json
+    )
+    second_json = tuple(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for payload in reconstructed_payloads
+    )
+    first_jsonl = b"".join(
+        (
+            json.dumps(record, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        for record in jsonl_records
+    )
+    reconstructed_records = tuple(
+        json.loads(line)
+        for line in first_jsonl.decode("utf-8").splitlines()
+    )
+    second_jsonl = b"".join(
+        (
+            json.dumps(record, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        for record in reconstructed_records
+    )
+    return first_json == second_json and first_jsonl == second_jsonl
+
+
+def _boolean_evidence_passed(evidence: Mapping[str, object]) -> bool:
+    boolean_values = tuple(
+        value for value in evidence.values() if isinstance(value, bool)
+    )
+    return bool(boolean_values) and all(boolean_values)
+
+
+def build_freeze_gates(
+    *,
+    manifest_sha_matches: bool,
+    source_artifact_hashes_match: bool,
+    leaderboard_contract: Mapping[str, object],
+    selected_rule_contract: Mapping[str, object],
+    prediction_trace_contract: Mapping[str, object],
+    prediction_reproduction: Mapping[str, object],
+    reproduction_evidence: Mapping[str, bool],
+    forbidden_field_evidence: Mapping[str, object],
+    test_isolation_evidence: Mapping[str, bool],
+    candidate_rank_is_one: bool,
+    all_predictions_legal: bool,
+    macro_f1_exceeds_majority: bool,
+    accuracy_exceeds_majority: bool,
+    all_actions_predicted: bool,
+    serialization_contract_passed: bool,
+) -> dict[str, bool]:
+    return {
+        "manifest_sha_matches": manifest_sha_matches,
+        "source_artifact_hashes_match": source_artifact_hashes_match,
+        "leaderboard_candidate_count_is_625": bool(
+            leaderboard_contract.get("candidate_count_is_625")
+        ),
+        "leaderboard_candidate_list_length_is_625": bool(
+            leaderboard_contract.get("candidate_list_length_is_625")
+        ),
+        "leaderboard_candidate_ids_unique": bool(
+            leaderboard_contract.get("candidate_ids_unique")
+        ),
+        "leaderboard_threshold_hashes_unique": bool(
+            leaderboard_contract.get("threshold_hashes_unique")
+        ),
+        "leaderboard_selected_thresholds_match": bool(
+            leaderboard_contract.get("selected_thresholds_match")
+            and leaderboard_contract.get("selected_rule_thresholds_match")
+        ),
+        "leaderboard_selected_threshold_sha_matches": bool(
+            leaderboard_contract.get("selected_threshold_sha_matches")
+            and leaderboard_contract.get("selected_rule_threshold_sha_matches")
+        ),
+        "selected_rule_contract_matches": _boolean_evidence_passed(
+            selected_rule_contract
+        ),
+        "prediction_trace_contracts_match": (
+            _boolean_evidence_passed(prediction_trace_contract)
+            and prediction_trace_contract.get("matched_record_count")
+            == EXPECTED_VALIDATION_SAMPLE_COUNT
+        ),
+        "prediction_count_is_3594": (
+            prediction_reproduction.get("source_prediction_count")
+            == EXPECTED_VALIDATION_SAMPLE_COUNT
+        ),
+        "predictions_reproduce_exactly": bool(
+            prediction_reproduction.get("all_predictions_match")
+        ),
+        "metrics_reproduce_exactly": reproduction_evidence.get(
+            "metrics_reproduce_exactly", False
+        ),
+        "confusion_matrix_reproduces_exactly": reproduction_evidence.get(
+            "confusion_matrix_reproduces_exactly", False
+        ),
+        "prediction_distribution_reproduces_exactly": (
+            reproduction_evidence.get(
+                "prediction_distribution_reproduces_exactly", False
+            )
+        ),
+        "decision_reason_distribution_reproduces_exactly": (
+            reproduction_evidence.get(
+                "decision_reason_distribution_reproduces_exactly", False
+            )
+        ),
+        "forbidden_fields_absent": bool(
+            forbidden_field_evidence.get("passed")
+        ),
+        "test_rows_absent_from_analysis": test_isolation_evidence.get(
+            "test_rows_absent_from_analysis", False
+        ),
+        "test_evaluation_absent": test_isolation_evidence.get(
+            "test_evaluation_absent", False
+        ),
+        "candidate_rank_is_one": candidate_rank_is_one,
+        "all_predictions_legal": all_predictions_legal,
+        "macro_f1_exceeds_majority": macro_f1_exceeds_majority,
+        "accuracy_exceeds_majority": accuracy_exceeds_majority,
+        "all_actions_predicted": all_actions_predicted,
+        "canonical_serialization_contract_passed": (
+            serialization_contract_passed
+        ),
+    }
 
 
 def build_freeze_record(
