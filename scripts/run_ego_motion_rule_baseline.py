@@ -191,6 +191,24 @@ def build_selected_rule_payload(
     }
 
 
+def build_validation_metrics_artifact_payload(
+    rule_version: str,
+    selected: EgoMotionCandidateEvaluation,
+    decision_reason_distribution: Mapping[str, int],
+) -> dict[str, object]:
+    return {
+        "rule_version": rule_version,
+        "selected_candidate_id": selected.candidate_id,
+        "thresholds_sha256": selected.thresholds_sha256,
+        "metrics": _metrics_payload(selected.metrics),
+        "predicted_class_distribution": (
+            selected.predicted_class_distribution
+        ),
+        "decision_reason_distribution": dict(decision_reason_distribution),
+        "test_evaluation_performed": False,
+    }
+
+
 def _load_samples(
     manifest_path: Path,
 ) -> tuple[tuple[ManifestSample, ...], tuple[EgoMotionPredictionSample, ...]]:
@@ -350,18 +368,13 @@ def run_baseline(
     )
     write_canonical_json(selected_rule, output_dir / "selected_rule.json")
     write_jsonl_records(records, output_dir / "validation_predictions.jsonl")
+    validation_metrics = build_validation_metrics_artifact_payload(
+        rule_version,
+        selected,
+        decision_reasons,
+    )
     write_canonical_json(
-        {
-            "rule_version": rule_version,
-            "selected_candidate_id": selected.candidate_id,
-            "thresholds_sha256": selected.thresholds_sha256,
-            "metrics": _metrics_payload(selected.metrics),
-            "predicted_class_distribution": (
-                selected.predicted_class_distribution
-            ),
-            "decision_reason_distribution": dict(decision_reasons),
-            "test_evaluation_performed": False,
-        },
+        validation_metrics,
         output_dir / "validation_metrics.json",
     )
     write_canonical_json(

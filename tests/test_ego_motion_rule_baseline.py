@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from scripts.run_ego_motion_rule_baseline import (
     build_selected_rule_payload,
     build_selection_objective,
+    build_validation_metrics_artifact_payload,
     run_baseline,
 )
 from src.actions.schema import ACTION_SCHEMA
@@ -370,6 +371,32 @@ def test_selected_rule_records_no_test_evaluation() -> None:
 
     assert payload["test_evaluation_performed"] is False
     assert payload["selection_objective"]["test_used_for_selection"] is False
+
+
+def test_validation_metrics_payload_uses_frozen_producer_schema() -> None:
+    sample = prediction_sample()
+    selected = evaluate_rule_candidate((sample,), "candidate", thresholds())
+
+    payload = build_validation_metrics_artifact_payload(
+        "rule-v0",
+        selected,
+        {"default_keep": 1},
+    )
+
+    assert tuple(payload) == (
+        "rule_version",
+        "selected_candidate_id",
+        "thresholds_sha256",
+        "metrics",
+        "predicted_class_distribution",
+        "decision_reason_distribution",
+        "test_evaluation_performed",
+    )
+    assert payload["metrics"] == asdict(selected.metrics)
+    assert payload["predicted_class_distribution"] == (
+        selected.predicted_class_distribution
+    )
+    assert payload["test_evaluation_performed"] is False
 
 
 def test_manifest_sha_mismatch_fails_before_output(tmp_path: Path) -> None:

@@ -98,6 +98,7 @@ source_audit_record
 
 - exact-grid interpolation v1.1 是可选数据增强 backlog；如后续评估，应保持现有 v1 manifest、sidecar 与 test split 不变，并单独提升协议版本。
 - Phase 0.2d 状态为 `consumed_failed`；后续必须新增独立的 validation-artifact schema adapter 和真实 artifact-shape regression test。该修复仅适用于未来协议，不得用于重跑当前 test。
+- validation artifact adapter 与 producer-shape regression 已完成，但仅适用于未来协议，不授权重跑已消费 test。
 
 ## Next Gate
 

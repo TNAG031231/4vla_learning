@@ -24,6 +24,15 @@
 - If a task does not require documentation changes, do not modify any `.md` files.
 - If creating a new documentation file seems necessary, stop and ask the user for confirmation before doing so.
 
+### Contract-First Irreversible Workflows
+
+- 对不可逆工作流，Codex 只负责最小实现，不得同时充当需求分析者、接口定义者和唯一测试者。
+- 跨模块 artifact 在修改前必须完成 producer artifact → consumer intake，核对真实字段层级、命名、类型、provenance 与 SHA。
+- contract fixture 必须由真实 producer helper 或经核验的 golden artifact 生成，禁止手写猜测 consumer schema。
+- 修复 contract mismatch 前必须先增加可复现历史失败的 regression test，并确认其在修复前失败。
+- 不可逆正式执行前必须完成不访问 sealed data 的 full shadow execution，覆盖真实 producer shape、adapter、consumer、输出持久化与 rerun guard。
+- 测试数量不能替代真实 artifact shape 核验与 producer → adapter → consumer 端到端证据。
+
 ## Environment Rules
 
 - 本项目默认使用 conda 环境 `codex4vla_env`。
