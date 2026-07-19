@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 import hashlib
 import inspect
@@ -191,6 +192,12 @@ def valid_preflight_receipt() -> dict[str, object]:
         "candidate_id": source.candidate_id,
         "thresholds": source.thresholds.as_dict(),
         "thresholds_sha256": source.thresholds_sha256,
+        "test_sample_count": 3799,
+        "test_scene_count": 150,
+        "test_manifest_rows_parsed": True,
+        "test_label_value_accessed_by_application_logic": False,
+        "test_motion_value_accessed_by_application_logic": False,
+        "declared_outputs": list(DECLARED_OUTPUTS),
         "evaluator_source_sha256": evaluator_source_sha256(),
         "formal_result_schema": dict(FORMAL_RESULT_SCHEMA),
     }
@@ -203,13 +210,38 @@ def formal_output_sha256() -> dict[str, str]:
     }
 
 
+def canonical_receipt_bytes(receipt: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        receipt,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def build_valid_one_shot_receipt(
     **overrides: object,
 ) -> dict[str, object]:
+    preflight_receipt = overrides.pop(
+        "preflight_receipt", valid_preflight_receipt()
+    )
+    if not isinstance(preflight_receipt, Mapping):
+        raise TypeError("test preflight receipt must be a mapping")
+    preflight_receipt_bytes = overrides.pop(
+        "preflight_receipt_bytes",
+        canonical_receipt_bytes(preflight_receipt),
+    )
+    if not isinstance(preflight_receipt_bytes, bytes):
+        raise TypeError("test preflight receipt bytes must be bytes")
+    preflight_receipt_sha256 = overrides.pop(
+        "preflight_receipt_sha256",
+        hashlib.sha256(preflight_receipt_bytes).hexdigest(),
+    )
     arguments: dict[str, object] = {
         "protocol": protocol(),
-        "preflight_receipt": valid_preflight_receipt(),
-        "preflight_receipt_sha256": "c" * 64,
+        "preflight_receipt_bytes": preflight_receipt_bytes,
+        "preflight_receipt": preflight_receipt,
+        "preflight_receipt_sha256": preflight_receipt_sha256,
         "actual_evaluator_source_sha256": evaluator_source_sha256(),
         "execution_source_sha256": "d" * 64,
         "manifest_sha256": "a" * 64,
@@ -665,15 +697,135 @@ def test_progress_document_has_no_worktree_change() -> None:
 
 
 def test_preflight_receipt_sha_must_be_valid() -> None:
+    receipt = valid_preflight_receipt()
     with pytest.raises(ValueError, match="actual_preflight_receipt_sha256"):
         validate_preflight_receipt_for_execution(
-            valid_preflight_receipt(),
+            canonical_receipt_bytes(receipt),
+            receipt,
             actual_preflight_receipt_sha256="invalid",
             actual_evaluator_source_sha256=evaluator_source_sha256(),
             protocol=protocol(),
             manifest_sha256="a" * 64,
             freeze_sha256="b" * 64,
         )
+
+
+def test_modified_receipt_bytes_fail_against_original_sha() -> None:
+    receipt = valid_preflight_receipt()
+    receipt_bytes = canonical_receipt_bytes(receipt)
+
+    with pytest.raises(ValueError, match="bytes do not match"):
+        build_valid_one_shot_receipt(
+            preflight_receipt=receipt,
+            preflight_receipt_bytes=receipt_bytes + b"\n",
+            preflight_receipt_sha256=hashlib.sha256(receipt_bytes).hexdigest(),
+        )
+
+
+def test_receipt_mapping_must_match_parsed_receipt_bytes() -> None:
+    original = valid_preflight_receipt()
+    receipt_bytes = canonical_receipt_bytes(original)
+    changed = dict(original)
+    changed["test_scene_count"] = 149
+
+    with pytest.raises(ValueError, match="mapping does not match receipt bytes"):
+        build_valid_one_shot_receipt(
+            preflight_receipt=changed,
+            preflight_receipt_bytes=receipt_bytes,
+            preflight_receipt_sha256=hashlib.sha256(receipt_bytes).hexdigest(),
+        )
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    (
+        "src/baselines/ego_motion_analysis.py",
+        "src/baselines/majority.py",
+        "src/phase0/manifest.py",
+    ),
+)
+@pytest.mark.parametrize("mutation", ("missing", "changed"))
+def test_transitive_evaluator_source_is_frozen(
+    source_path: str,
+    mutation: str,
+) -> None:
+    actual_sources = evaluator_source_sha256()
+    if mutation == "missing":
+        actual_sources.pop(source_path)
+        expected_error = "complete frozen file set"
+    else:
+        actual_sources[source_path] = "e" * 64
+        expected_error = "differ from preflight"
+
+    with pytest.raises(ValueError, match=expected_error):
+        build_valid_one_shot_receipt(
+            actual_evaluator_source_sha256=actual_sources
+        )
+
+
+def test_evaluator_source_paths_have_complete_stable_order() -> None:
+    assert EVALUATOR_SOURCE_PATHS == (
+        "configs/phase0_2_one_shot_test_v0_1.yaml",
+        "src/actions/schema.py",
+        "src/baselines/ego_motion.py",
+        "src/baselines/ego_motion_analysis.py",
+        "src/baselines/ego_motion_test.py",
+        "src/baselines/majority.py",
+        "src/phase0/manifest.py",
+        "src/phase0/protocol.py",
+        "scripts/prepare_ego_motion_one_shot_test.py",
+    )
+
+
+def test_preflight_test_sample_count_must_be_3799() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["test_sample_count"] = 3798
+
+    with pytest.raises(ValueError, match="test_sample_count"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_test_scene_count_must_be_150() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["test_scene_count"] = 149
+
+    with pytest.raises(ValueError, match="test_scene_count"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_label_access_flag_must_be_false() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["test_label_value_accessed_by_application_logic"] = True
+
+    with pytest.raises(ValueError, match="test_label_value_accessed"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_motion_access_flag_must_be_false() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["test_motion_value_accessed_by_application_logic"] = True
+
+    with pytest.raises(ValueError, match="test_motion_value_accessed"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_preflight_declared_outputs_must_match_frozen_contract() -> None:
+    receipt = valid_preflight_receipt()
+    receipt["declared_outputs"] = list(DECLARED_OUTPUTS[:-1])
+
+    with pytest.raises(ValueError, match="declared_outputs"):
+        build_valid_one_shot_receipt(preflight_receipt=receipt)
+
+
+def test_formal_test_sample_count_must_match_preflight() -> None:
+    with pytest.raises(ValueError, match="preflight count 3799"):
+        build_valid_one_shot_receipt(test_sample_count=3798)
+
+
+def test_formal_receipt_records_frozen_test_scene_count() -> None:
+    receipt = build_valid_one_shot_receipt()
+
+    assert receipt["test_scene_count"] == 150
 
 
 def test_preflight_status_must_be_passed() -> None:
@@ -821,9 +973,14 @@ def test_formal_receipt_records_no_rule_modification_from_test() -> None:
 
 
 def test_preflight_validator_returns_complete_provenance_evidence() -> None:
+    receipt = valid_preflight_receipt()
+    receipt_bytes = canonical_receipt_bytes(receipt)
     evidence = validate_preflight_receipt_for_execution(
-        valid_preflight_receipt(),
-        actual_preflight_receipt_sha256="c" * 64,
+        receipt_bytes,
+        receipt,
+        actual_preflight_receipt_sha256=hashlib.sha256(
+            receipt_bytes
+        ).hexdigest(),
         actual_evaluator_source_sha256=evaluator_source_sha256(),
         protocol=protocol(),
         manifest_sha256="a" * 64,

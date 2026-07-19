@@ -16,7 +16,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.audit_ego_motion_inputs import load_config, sha256_file
 from src.baselines.ego_motion import EgoMotionRuleThresholds
 from src.baselines.ego_motion_test import (
+    DECLARED_TEST_OUTPUTS,
     EVALUATOR_SOURCE_PATHS,
+    EXPECTED_TEST_SAMPLE_COUNT,
+    EXPECTED_TEST_SCENE_COUNT,
     FORMAL_RESULT_SCHEMA,
     FrozenRuleTestProtocol,
     validate_frozen_rule_contract,
@@ -25,16 +28,7 @@ from src.phase0.manifest import write_canonical_json
 from src.phase0.protocol import iter_manifest_rows, validate_sha256
 
 
-EXPECTED_TEST_SAMPLE_COUNT = 3799
-EXPECTED_TEST_SCENE_COUNT = 150
-DECLARED_OUTPUTS = (
-    "test_predictions.jsonl",
-    "test_metrics.json",
-    "majority_test_metrics.json",
-    "validation_to_test_comparison.json",
-    "test_diagnostics.json",
-    "one_shot_test_receipt.json",
-)
+DECLARED_OUTPUTS = DECLARED_TEST_OUTPUTS
 PREFLIGHT_OUTPUTS = ("one_shot_preflight_receipt.json",)
 FREEZE_SOURCE_FILENAMES = (
     "failure_analysis.json",

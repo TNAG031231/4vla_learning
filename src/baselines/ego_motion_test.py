@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
 from typing import Final
 
@@ -33,9 +35,22 @@ EVALUATOR_SOURCE_PATHS: Final = (
     "configs/phase0_2_one_shot_test_v0_1.yaml",
     "src/actions/schema.py",
     "src/baselines/ego_motion.py",
+    "src/baselines/ego_motion_analysis.py",
     "src/baselines/ego_motion_test.py",
+    "src/baselines/majority.py",
+    "src/phase0/manifest.py",
     "src/phase0/protocol.py",
     "scripts/prepare_ego_motion_one_shot_test.py",
+)
+EXPECTED_TEST_SAMPLE_COUNT: Final = 3799
+EXPECTED_TEST_SCENE_COUNT: Final = 150
+DECLARED_TEST_OUTPUTS: Final = (
+    "test_predictions.jsonl",
+    "test_metrics.json",
+    "majority_test_metrics.json",
+    "validation_to_test_comparison.json",
+    "test_diagnostics.json",
+    "one_shot_test_receipt.json",
 )
 FORMAL_RESULT_SCHEMA: Final = {
     "test_predictions": "phase0.2_test_predictions_v0.1",
@@ -558,6 +573,7 @@ def _validated_sha_mapping(
 
 
 def validate_preflight_receipt_for_execution(
+    preflight_receipt_bytes: bytes,
     preflight_receipt: Mapping[str, object],
     *,
     actual_preflight_receipt_sha256: str,
@@ -567,11 +583,27 @@ def validate_preflight_receipt_for_execution(
     freeze_sha256: str,
 ) -> dict[str, bool]:
     validate_frozen_rule_contract(protocol)
+    if not isinstance(preflight_receipt_bytes, bytes):
+        raise ValueError("preflight receipt bytes must be bytes")
     if not isinstance(preflight_receipt, Mapping):
         raise ValueError("preflight receipt must be a mapping")
-    validate_sha256(
+    actual_preflight_receipt_sha256 = validate_sha256(
         actual_preflight_receipt_sha256, "actual_preflight_receipt_sha256"
     )
+    calculated_preflight_sha256 = hashlib.sha256(
+        preflight_receipt_bytes
+    ).hexdigest()
+    preflight_receipt_sha_matches = (
+        calculated_preflight_sha256 == actual_preflight_receipt_sha256
+    )
+    if not preflight_receipt_sha_matches:
+        raise ValueError("preflight receipt bytes do not match the supplied SHA-256")
+    try:
+        parsed_receipt = json.loads(preflight_receipt_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("preflight receipt bytes must contain valid JSON") from error
+    if parsed_receipt != preflight_receipt:
+        raise ValueError("preflight receipt mapping does not match receipt bytes")
     manifest_sha256 = validate_sha256(manifest_sha256, "manifest_sha256")
     freeze_sha256 = validate_sha256(freeze_sha256, "freeze_sha256")
 
@@ -589,6 +621,12 @@ def validate_preflight_receipt_for_execution(
         "candidate_id": protocol.candidate_id,
         "thresholds": protocol.thresholds.as_dict(),
         "thresholds_sha256": protocol.thresholds_sha256,
+        "test_sample_count": EXPECTED_TEST_SAMPLE_COUNT,
+        "test_scene_count": EXPECTED_TEST_SCENE_COUNT,
+        "test_manifest_rows_parsed": True,
+        "test_label_value_accessed_by_application_logic": False,
+        "test_motion_value_accessed_by_application_logic": False,
+        "declared_outputs": list(DECLARED_TEST_OUTPUTS),
         "formal_result_schema": FORMAL_RESULT_SCHEMA,
     }
     for field_name, expected in expected_fields.items():
@@ -609,7 +647,7 @@ def validate_preflight_receipt_for_execution(
         raise ValueError("evaluator source SHA-256 values differ from preflight")
 
     return {
-        "preflight_receipt_sha_matches": True,
+        "preflight_receipt_sha_matches": preflight_receipt_sha_matches,
         "preflight_status_matches": True,
         "ready_for_execution": True,
         "execution_not_previously_performed": True,
@@ -628,6 +666,7 @@ def validate_preflight_receipt_for_execution(
 def build_one_shot_receipt(
     protocol: FrozenRuleTestProtocol,
     *,
+    preflight_receipt_bytes: bytes,
     preflight_receipt: Mapping[str, object],
     preflight_receipt_sha256: str,
     actual_evaluator_source_sha256: Mapping[str, str],
@@ -638,6 +677,7 @@ def build_one_shot_receipt(
     test_sample_count: int,
 ) -> dict[str, object]:
     provenance = validate_preflight_receipt_for_execution(
+        preflight_receipt_bytes,
         preflight_receipt,
         actual_preflight_receipt_sha256=preflight_receipt_sha256,
         actual_evaluator_source_sha256=actual_evaluator_source_sha256,
@@ -653,12 +693,12 @@ def build_one_shot_receipt(
         expected_keys=FORMAL_RESULT_SHA_FILENAMES,
         field_name="output_sha256",
     )
-    if (
-        not isinstance(test_sample_count, int)
-        or isinstance(test_sample_count, bool)
-        or test_sample_count <= 0
+    if test_sample_count != EXPECTED_TEST_SAMPLE_COUNT or isinstance(
+        test_sample_count, bool
     ):
-        raise ValueError("test_sample_count must be a positive integer")
+        raise ValueError("test_sample_count must match preflight count 3799")
+    if test_sample_count != preflight_receipt.get("test_sample_count"):
+        raise ValueError("test_sample_count does not match preflight receipt")
     preflight_sources = preflight_receipt["evaluator_source_sha256"]
     if not isinstance(preflight_sources, Mapping):
         raise ValueError("preflight evaluator_source_sha256 must be a mapping")
@@ -675,6 +715,7 @@ def build_one_shot_receipt(
         "thresholds": protocol.thresholds.as_dict(),
         "thresholds_sha256": protocol.thresholds_sha256,
         "test_sample_count": test_sample_count,
+        "test_scene_count": EXPECTED_TEST_SCENE_COUNT,
         "formal_result_schema": dict(FORMAL_RESULT_SCHEMA),
         "output_sha256": output_hashes,
         "preflight_receipt_sha256": preflight_receipt_sha256,
