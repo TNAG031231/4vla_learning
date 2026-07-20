@@ -19,7 +19,7 @@
 - 论文结果、模型官方能力和外部 benchmark 不得写成本项目结果。
 - 尚未实现或未核验的入口、指标、资源开销和能力必须标为 `planned`、`conditional`、`stretch` 或“待验证”。
 - 阶段状态、contract、rule 或 evaluation protocol 变化时，必须记录版本与 provenance；不得覆盖 frozen artifact。
-- Phase 0.3 及后续阶段必须按第 5.2 节统一模板补全。本轮只建立章节骨架，不授权实现后续阶段代码或执行实验。
+- Phase 0.3 及后续阶段必须按第 5.2 节统一模板补全；尚未在本文展开的阶段只保留骨架，不得用概述冒充可执行规格。
 
 ## 1. 项目使命、最终目标与非目标
 
@@ -51,45 +51,59 @@ right_lateral
 
 六类动作是 **coarse behavior representation**，不是最终动作空间。`left_lateral` / `right_lateral` 只表示稳定的左右横向运动，不能直接解释为 turn、lane change 或其原因。coarse action 在长期系统中继续作为辅助监督、可解释输出、baseline 与 action-trajectory 一致性检查接口，不通过不断增加互斥类别来承担完整规划任务。
 
-### 1.3 Phase 1—6：完整自动驾驶 VLA
+### 1.3 核心实施原则：面向最终系统，而不是制作多个临时产品
 
-长期主线为：
+从 Phase 0.3 开始，所有阶段都服务于同一个最终 VLA：
 
 ```text
-temporal multi-camera images
+historical camera images
 + current/past ego state
-+ route / map context
++ optional multi-camera calibration
         ↓
 VLM semantic branch
 + BEV/OCC geometry branch
         ↓
-multimodal fusion
+temporal semantic-geometric fusion
         ↓
-hierarchical action heads
-+ multimodal candidate trajectories
+coarse action auxiliary head
++ continuous future waypoint head
         ↓
-predicted occupancy / geometry scorer
+geometric / occupancy safety scorer
         ↓
-safety-aware trajectory reranker
+trajectory selection
         ↓
-controller / simulator
+quasi-closed-loop environment
+        ↓
+reinforcement fine-tuning
 ```
 
-- Phase 1 开始输出连续 future trajectory；
-- Phase 2 引入 multi-camera 与 learned BEV/OCC geometry；
-- Phase 3 引入 map、route 和 fine-grained maneuver；
-- Phase 4 进入 quasi-closed-loop / closed-loop evaluation；
-- Phase 5 处理 robustness、latency、fallback 与 efficiency；
-- Phase 6 是 optional RL / world-model research extension，不阻塞完整项目的核心完成。
+后续不是先完成一个纯分类产品，再推倒重做一个轨迹产品，随后再重做一个 BEV 产品。Coarse action、continuous trajectory、BEV/OCC、safety scorer 和 reinforcement learning 是同一架构的不同模块：Phase 0.3 验证 VLM 接入，Phase 0.4 建立最终核心模型骨架，Phase 0.5—0.8 在该骨架上依次增加空间建模、安全约束、准闭环评测和 reinforcement fine-tuning。
 
-上述路线是目标架构，不代表相关模块已经实现。BEV/OCC geometry 可以是经验证的 learned spatial representation，不要求把完整 occupancy prediction 产品化为基础完成条件。
+阶段划分只用于控制调试范围、建立最少必要 baseline、完成模块级消融并确认每个模块是否有效。已完成模块应通过稳定接口继续复用，不做无必要的推倒重写；每个阶段必须交付可复用的数据、feature、model、evaluator 或 environment contract，而不是只交付一次性实验数字。全过程继续遵守 inference/GT information boundary、坐标与时间合同、scene-level split 和 train/validation/test 防泄漏规则。
 
-### 1.4 非目标
+### 1.4 最终 VLA 主路线
+
+核心路线统一为：
+
+```text
+Phase 0.3  Qwen3-VL data interface and rapid visual baseline
+→ Phase 0.4 temporal vision + ego state + continuous trajectory VLA core
+→ Phase 0.5 BEV/OCC-aware semantic-geometric fusion
+→ Phase 0.6 trajectory safety scorer and safety-aware selection
+→ Phase 0.7 quasi-closed-loop evaluation and controller/interface
+→ Phase 0.8 reinforcement fine-tuning
+→ Final robustness, latency, fallback, Demo and reproducibility evidence
+```
+
+Phase 0.3 是快速 baseline，不是长期主线终点；Phase 0.4 开始直接建设后续模块共用的最终模型。Phase 0.5—0.8 都扩展 Phase 0.4 的 shared driving representation 和 trajectory interface。RL 是核心阶段；world model 仍是 optional。完整 fine-grained maneuver taxonomy、多候选轨迹、大规模 preference/DPO、完整 future occupancy prediction 和双仿真平台均不阻塞主线。
+
+### 1.5 非目标
 
 本项目的基础完成条件不包括：
 
 - 量产级、实车或 real-time 部署；
-- 以 RL 或 world model 作为必经路线；
+- world model、复杂 DPO 或完整 fine-grained maneuver taxonomy；
+- 同时完成 NAVSIM 与 Bench2Drive 两个平台；
 - 完整 occupancy prediction 系统；
 - 仅依靠更多 `stop` 预测获得表面上的安全指标改善；
 - 将 oracle GT scorer 冒充在线 camera-only safety capability；
@@ -114,24 +128,27 @@ Trajectory VLA 必须同时满足：
 
 - 模型真实输出带坐标、时间、horizon 与 valid mask 合同的 future waypoints；
 - 在同一协议下超过 constant-velocity 与 ego-history baselines；
-- coarse/fine action 与 predicted trajectory 的语义一致性可度量；
-- 多候选轨迹具有有效 diversity，而不是数值近似的重复候选；
+- coarse action 与 predicted trajectory 的语义一致性可度量；
 - safety reranking 在规划性能与风险之间取得可验证改进，并报告失败案例与 trade-off。
+
+多候选轨迹若被启用，还必须验证有效 diversity；它不是第一版 trajectory VLA 的核心完成条件。
 
 ### 2.3 Full project success
 
 完整项目的核心完成要求包括：
 
-- temporal multi-camera input；
-- learned BEV/OCC geometry；
-- map / route conditioning；
-- hierarchical behavior heads；
-- multimodal trajectory generation；
-- quasi-closed-loop 或 closed-loop evaluation；
+- 时序视觉和 current/past ego state 输入；
+- VLM semantic representation；
+- continuous future waypoint prediction；
+- BEV/OCC-aware geometry representation；
+- semantic-geometric feature fusion；
+- trajectory safety scoring；
+- quasi-closed-loop planning evaluation；
+- reinforcement fine-tuning；
 - robustness、latency 与 fallback evidence；
-- 每项能力均有可定位的代码、配置、artifact 和指标证据。
+- 完整 Demo、可复现配置，以及每项能力可定位的代码、artifact 和指标证据。
 
-RL、world model、完整 occupancy prediction 和实车部署均不是基础完成条件；对应工作只能在证据充分时作为 extension 报告。
+完整 fine-grained maneuver taxonomy、多候选轨迹生成、大规模 preference/DPO、完整 future occupancy prediction、Bench2Drive 与 NAVSIM 双平台和 world model 均为 optional；实车部署不在本项目范围。RL 不属于 optional；它必须在 quasi-closed-loop reward 与保护边界建立后作为 Phase 0.8 完成并报告。
 
 ## 3. 推理输入、训练 target 和 offline evaluator 的信息边界
 
@@ -331,18 +348,13 @@ contract / regression tests
 | Phase 0.2b | rule candidate search | `completed` | validation candidate selection |
 | Phase 0.2c | failure analysis 与 rule freeze | `frozen` | `phase0.2-ego-motion-rule-v0.1` |
 | Phase 0.2d | sealed one-shot evaluation | `consumed_failed` | 无正式 test metrics；原 test 永久消费 |
-| Phase 0.3 | Qwen3-VL zero/few-shot | `planned` | VLM baseline |
-| Phase 0.4 | LoRA / action adapter | `planned` | supervised VLM |
-| Phase 0.5a | geometric safety scorer | `planned` | oracle safety evaluator |
-| Phase 0.5b | offline reranker | `conditional` | safety-aware selection |
-| Phase 0.6 | preference audit / optional DPO | `conditional` | preference learning |
-| Phase 0.7 | coarse MVP freeze | `planned` | MVP final report 与独立评估 |
-| Phase 1 | temporal trajectory VLA | `planned` | future waypoints |
-| Phase 2 | multi-camera BEV/OCC VLA | `planned` | learned geometry |
-| Phase 3 | map / route / hierarchical behavior | `planned` | fine maneuver planning |
-| Phase 4 | quasi/closed-loop evaluation | `planned` | simulation evidence |
-| Phase 5 | robustness and efficiency | `planned` | deployability evidence |
-| Phase 6 | RL / world model | `stretch` | optional research extension |
+| Phase 0.3 | Qwen3-VL 数据接口与快速视觉 baseline | `planned` | 可复用 VLM 接入层与视觉 baseline |
+| Phase 0.4 | 时序视觉 + ego state + continuous trajectory | `planned` | 最终 VLA 核心模型骨架 |
+| Phase 0.5 | BEV/OCC-aware semantic-geometric fusion | `planned` | 空间表示与融合接口 |
+| Phase 0.6 | trajectory safety scorer 与 safety-aware selection | `planned` | 显式安全评价与轨迹选择 |
+| Phase 0.7 | quasi-closed-loop evaluation 与 controller/interface | `planned` | 累计规划表现与环境接口证据 |
+| Phase 0.8 | reinforcement fine-tuning | `planned` | 基于准闭环 reward 的最终策略优化 |
+| Final | robustness、latency、fallback、Demo 与复现 | `planned` | 完整工程与展示证据闭环 |
 
 ### 6.2 依赖关系与 Gate
 
@@ -354,23 +366,23 @@ flowchart TD
     P02a --> P02b["Phase 0.2b completed"]
     P02b --> P02c["Phase 0.2c frozen"]
     P02c --> P02d["Phase 0.2d consumed_failed"]
-    P02d --> P03["Phase 0.3 planned: train/validation development only"]
-    P03 --> P04["Phase 0.4 planned"]
-    P04 --> P05a["Phase 0.5a planned: scorer gate"]
-    P05a -->|"scorer gate passes"| P05b["Phase 0.5b conditional"]
-    P05a -->|"gate fails"| FixScorer["stop and repair scorer"]
-    P05b -->|"risk improves without stop inflation"| P06["Phase 0.6 conditional"]
-    P05b -->|"skip DPO or retain negative result"| P07["Phase 0.7 planned"]
-    P06 --> P07
-    P07 --> P1["Phase 1 planned"]
-    P1 --> P2["Phase 2 planned"]
-    P2 --> P3["Phase 3 planned"]
-    P3 --> P4["Phase 4 planned"]
-    P4 --> P5["Phase 5 planned"]
-    P5 -.->|"optional"| P6["Phase 6 stretch"]
+    P02d --> P03["Phase 0.3 rapid Qwen3-VL baseline<br/>train/validation only"]
+    P03 --> P04["Phase 0.4 final VLA core<br/>temporal trajectory"]
+    P04 --> P05["Phase 0.5 BEV/OCC fusion"]
+    P05 --> P06["Phase 0.6 trajectory safety"]
+    P06 --> P07["Phase 0.7 quasi-closed-loop"]
+    P07 --> P08["Phase 0.8 RL"]
+    P08 --> PF["Final engineering evaluation"]
+
+    P03 -.-> OPrompt["optional bounded few-shot search"]
+    P04 -.-> OMulti["optional multimodal trajectories"]
+    P05 -.-> OFutureOcc["optional full future occupancy"]
+    P06 -.-> ODPO["optional DPO"]
+    P07 -.-> OPlatform["optional second simulation platform"]
+    P08 -.-> OWorld["optional world model"]
 ```
 
-Scorer gate 未通过时不得进入 reranker；reranker 未证明风险改善且不过度增加 `stop` 时不得进入 preference learning。DPO 可跳过，Phase 0.5b 的正结果或诚实负结果均可进入 Phase 0.7 做 coarse MVP freeze。Phase 6 不阻塞 Phase 5 后的核心完成判定。
+Phase 0.3 的 baseline 结果无论强弱都必须诚实保留，但不把 prompt engineering 变成长期主线。Phase 0.4 建立唯一的最终 VLA core；Phase 0.5—0.8 必须复用其 feature 与 trajectory contract。Optional 分支只能旁路增加研究证据，不能阻塞主线；其中 DPO 不得替代 Phase 0.8 RL，world model 也不属于核心完成条件。
 
 ## 7. Phase -1：数据闭环与 coarse label freeze 简要回顾
 
@@ -451,97 +463,646 @@ Validation macro-F1 / accuracy 为 `0.615681 / 0.623817`；同协议 Majority Ba
 
 因此 Phase 0.2d 不能写成 test completed，也不能报告任何正式 test performance。
 
-## 10. Phase 0.3 及后续阶段章节骨架
+## 10. 面向最终 VLA 的执行阶段
 
-以下章节仅建立完整项目计划的结构。每个阶段的详细步骤、代码/config contract、实验矩阵、Gate 和失败分支将在后续子任务按第 5.2 节模板补充。
+### 10.1 Phase 0.3：Qwen3-VL 数据接口与快速视觉 baseline
 
-### 10.1 Phase 0.3：Qwen3-VL zero-shot / few-shot baseline
+> Phase 0.3 不是最终模型，也不是长时间 prompt engineering 阶段。它只负责验证 Qwen3-VL 能否正确读取项目数据、输出统一 action schema，并为 Phase 0.4 trajectory VLA 提供可复用的视觉语言模型接入层。
 
-- **阶段目标：** 在统一 coarse-action protocol 下建立 image 与获批 ego-state 输入的 Qwen3-VL zero/few-shot baseline。
+#### 10.1.1 阶段状态、目的与边界
+
+- **阶段状态：** `planned`。
+- **阶段目的：** 打通 frozen manifest → image/text processor → Qwen3-VL → strict action parser → sample-level prediction 的完整链路。
+- **为什么需要：** 在引入时序和 trajectory head 前，先隔离数据加载、模型依赖、prompt serialization、generation 和输出解析问题，避免把接入错误误判为规划模型错误。
+- **前置条件：** Phase 0.1b trainval manifest 与六类 schema 已冻结；Phase 0.2d 的 consumed-test 边界保持不变；开发只允许 train/validation。
+
+本阶段验证：
+
+- frozen manifest 中的 `CAM_FRONT` 图像能否正确加载；
+- Qwen3-VL processor、tokenizer 与 model 能否在项目环境稳定运行；
+- driving instruction 与 current/past ego-motion summary 如何确定性序列化；
+- 生成结果能否被统一 action parser 严格解析；
+- zero-shot 与轻量 LoRA 是否能形成可复现的快速视觉 baseline；
+- VLM hidden states / visual tokens 是否能通过稳定 feature interface 供 Phase 0.4 复用。
+
+本阶段不解决：
+
+```text
+continuous trajectory prediction
+temporal multi-frame fusion
+BEV/OCC
+safety scorer
+closed-loop evaluation
+reinforcement learning
+unbounded prompt search
+large-scale DPO
+```
+
+#### 10.1.2 输入、允许数据与禁止数据
+
+模型输入限定为：
+
+```text
+CAM_FRONT image
+current/past ego-motion summary
+fixed driving instruction template
+```
+
+`coarse meta-action target` 只用于 supervised LoRA target 或离线评测；train/validation split 用于训练、模型选择和报告。必须分别运行 `image-only` 与 `image + ego state` 两组独立实验，以判断 ego state 的增益。
+
+禁止：
+
+- future ego trajectory 作为模型输入或 prompt 内容；
+- GT nearby agents、GT boxes 或 GT occupancy 作为模型输入；
+- 已消费 test 的图像、motion、label 或派生统计；
+- validation label 进入 prompt；
+- 任何 future-derived 数值通过 ego-state serialization 间接泄漏。
+
+#### 10.1.3 数据样本与 artifact contract
+
+概念样本合同如下：
+
+```json
+{
+  "sample_token": "...",
+  "image_path": "...",
+  "instruction": "根据前视图像和当前车辆状态判断驾驶行为。",
+  "ego_state": {
+    "speed_mps": 0.0,
+    "longitudinal_acceleration_mps2": 0.0,
+    "yaw_rate_radps": 0.0,
+    "availability": "full"
+  },
+  "target_action": "keep"
+}
+```
+
+该 JSON 只是计划中的字段合同示例，不代表仓库当前已有对应训练文件。`image_path` 必须由 manifest 相对路径和受控 data root 解析；`target_action` 永远不进入 inference prompt。Instruction template、ego-state serialization 与 sample adapter schema 必须分别版本化。
+
+Model-ready record 和 sample-level prediction 至少保留：
+
+```text
+sample_token
+split
+source_manifest_schema_version
+source_manifest_sha256
+label_rule_version
+input_variant
+prompt_version
+parser_version
+model_revision
+processor_revision
+generation_config_sha256
+target_action
+raw_output
+parsed_action
+is_valid_output
+```
+
+VLM feature interface 必须记录 feature source、tensor shape、dtype、attention/valid mask、model/processor revision 与 extraction policy；不得假设未核验的 token 数或 hidden dimension。
+
+#### 10.1.4 Prompt、generation 与输出合同
+
+Prompt 只使用少量预定义模板，不进行无边界搜索。正式实验必须选择并冻结一种 canonical 输出格式，例如：
+
+```text
+ACTION: keep
+```
+
+或：
+
+```json
+{"action": "keep"}
+```
+
+合同要求：
+
+- 输出 action 只能是 `keep / accelerate / decelerate / stop / left_lateral / right_lateral`；
+- parser 只接受当前 `parser_version` 声明的严格格式，不通过模糊匹配猜测非法输出；
+- invalid output 单独计数，并保留原始输出；
+- prompt、parser 和 generation config 均版本化；
+- temperature、top-p、max new tokens、sampling 开关和 stop conditions 必须进入配置；
+- validation 可用于从预先声明的有限模板中选择一次正式方案，但不得以反复试探形成无边界 prompt search。
+
+#### 10.1.5 详细执行步骤
+
+##### Phase 0.3a：环境与模型预检
+
+1. 在 `codex4vla_env` 检查 PyTorch、Transformers、图像 processor 与目标模型依赖。
+2. 确认 model/processor revision、下载来源和许可证信息。
+3. 根据真实硬件执行显存、内存、dtype 与 batch-size 预检，不提前承诺资源数字。
+4. 只加载少量 train/validation 样本，不扫描或访问 test。
+5. 验证单图输入与 instruction 文本输入。
+6. 验证 raw generation、strict parsing 与 invalid-output 路径。
+7. 保存 smoke-run metadata、依赖版本、硬件摘要与失败原因。
+
+##### Phase 0.3b：dataset adapter
+
+1. 从 frozen trainval manifest streaming 读取 train/validation sample。
+2. 解析并校验相对 `CAM_FRONT` 路径。
+3. 构造 image-only prompt。
+4. 构造 image + ego-state prompt。
+5. 为 `full / partial / unavailable` ego state 定义显式、确定性的文本格式。
+6. 输出 model-ready records，不在 adapter 中执行模型推理。
+7. 保留 `sample_token`、split、target、manifest 和 rule provenance。
+8. 在读取入口设置 test split guard，并证明 adapter 不访问 test。
+
+##### Phase 0.3c：zero-shot baseline
+
+只运行有限、预定义的 prompt templates，至少比较：
+
+```text
+image-only
+image + ego state
+```
+
+两组实验使用同一 model revision、generation config、parser 和 validation protocol，输出 sample-level predictions 与完整 action metrics。Zero-shot 较弱不触发无限 prompt 调参。
+
+##### Phase 0.3d：轻量 LoRA smoke baseline
+
+该子阶段不是最终模型训练，只验证：
+
+- supervised conversation format 与 action target placement；
+- label masking 只对 assistant target 计算监督；
+- collator 和 processor 输出可组成 batch；
+- LoRA injection points 与 trainable parameter report 可核验；
+- loss 在小样本上下降，且少量样本可以 overfit；
+- checkpoint 可以保存、加载并走通相同 parser 推理。
+
+只使用小规模 train subset 和 validation smoke，不进行大规模超参数搜索，也不以它替代 Phase 0.4 trajectory model。
+
+##### Phase 0.3e：failure analysis 与接口冻结
+
+至少分析：
+
+```text
+visual ambiguity
+class imbalance
+output-format errors
+model ignores ego state
+keep / decelerate confusion
+left / right lateral confusion
+insufficient image evidence
+```
+
+最终冻结：
+
+```text
+model revision
+processor revision
+prompt schema and version
+ego-state serialization
+action output schema
+parser version
+dataset adapter interface
+VLM feature interface
+```
+
+这些是 Phase 0.4 复用的 producer contracts。冻结前必须以真实 adapter record 和真实 processor output 核验 shape，不能手写猜测 consumer schema。
+
+#### 10.1.6 涉及实现、配置、artifact 与 provenance
+
+本阶段计划新增 dataset adapter、prompt/output contract、strict parser、Qwen inference/LoRA smoke entrypoint 及对应测试；具体文件名在实施子任务中确定，本文不把 planned 文件写成已存在入口。参数必须进入版本化配置，不散落在代码中。
+
+本地 artifact 至少包括：environment preflight、model/processor metadata、adapter summary、prompt/parser/generation config、zero-shot predictions/metrics、LoRA smoke metadata/checkpoint provenance、failure cases 和 frozen interface receipt。模型权重、checkpoint、派生 records 和正式输出不进入 Git。
+
+每个 artifact 至少记录 Git commit、manifest/schema/rule version、split mapping SHA-256、model/processor revision、prompt/parser version、config SHA-256、sample count、input variant 与生成时间。
+
+#### 10.1.7 测试、真实数据 smoke test 与人工审核
+
+自动测试至少覆盖：
+
+- 相对图像路径解析和绝对路径泄漏拒绝；
+- 六类合法 action 的 parser；
+- 非法、额外文本和缺字段输出显式失败；
+- test split guard；
+- `partial / unavailable` ego-state serialization；
+- sample-level prediction 字段完整性；
+- processor input keys 与 tensor shape；
+- deterministic generation config serialization；
+- assistant target label masking；
+- VLM feature interface contract。
+
+真实数据 smoke test 只从 train/validation 各取少量样本，验证图像可读、prompt 可见、processor/model 可运行、输出可解析、结果可落盘和 rerun provenance 稳定。人工审核随机查看 image、prompt、GT action 与 prediction，确认 prompt 无 future 泄漏、ego state 单位正确、左右方向未在文本中写反。
+
+#### 10.1.8 实验矩阵与指标
+
+| 实验 | 输入 | 训练 | 作用 |
+|---|---|---|---|
+| Zero-shot A | image-only | 无 | 纯视觉快速参考 |
+| Zero-shot B | image + ego state | 无 | 检查 ego state 增益 |
+| LoRA smoke | image + ego state | 小规模 train subset | 验证 supervised 接口，不作最终性能结论 |
+
+Zero-shot 正式 baseline 至少报告：
+
+```text
+macro-F1
+per-class F1
+accuracy
+confusion matrix
+invalid-output rate
+action parsing success rate
+target and predicted class distribution
+sample-level predictions
+```
+
+LoRA smoke 额外报告训练/验证 sample count、loss 曲线、trainable parameter summary、overfit 结果和 checkpoint save/load 结果，但不得用 smoke 指标冒充正式训练结论。
+
+#### 10.1.9 Gate、失败分支与停止条件
+
+Phase 0.3 通过条件：
+
+- Qwen 数据与模型链路可复现；
+- strict action parser 稳定，invalid output 可审计；
+- image-only 和 image + ego-state zero-shot baseline 完成；
+- 轻量 LoRA smoke run 完成；
+- dataset adapter 与 VLM feature interface 可供 Phase 0.4 使用；
+- 所有 artifact 具有版本与 provenance；
+- 没有访问已消费 test。
+
+Zero-shot 不要求超过 frozen ego-motion rule；较弱结果不阻塞 Phase 0.4，但必须保留并分析。若 processor shape、图像路径、parser 或 label masking 未通过，停止模型扩展并先修复相应 contract。若硬件不支持目标配置，先缩小 batch、分辨率或可训练范围并重新做 resource preflight，不静默改用未经记录的模型。
+
+本阶段没有不可逆 test 操作。任何脚本都必须默认拒绝原 project test；Phase 0.2d 的 claim、preflight 和 consumed artifact 不得读取、恢复或修改。
+
+#### 10.1.10 阶段学习目标与证据
+
+本阶段可展示：多模态数据适配、prompt/output protocol、VLM inference、LoRA 基础训练、invalid output handling、传统 rule 与 VLM 对照，以及 sample-level failure analysis。可交付的 Demo 是 `CAM_FRONT + optional ego-state text → raw output → strict parsed coarse action`，并展示输入边界、版本和代表性失败案例。
+
+### 10.2 Phase 0.4：最终 VLA 核心——时序视觉、ego state 与连续轨迹预测
+
+> Phase 0.4 不是新的临时版本，而是后续 BEV/OCC、安全 scorer、准闭环环境和 RL 共用的最终核心模型骨架。
+
+#### 10.2.1 阶段状态、目的与边界
+
+- **阶段状态：** `planned`。
+- **阶段目的：** 从静态六分类升级为以 continuous future waypoints 为主要输出的 planning model，同时保留 coarse action auxiliary head。
+- **为什么需要：** 单帧 coarse action 不能表达未来路径和累计规划误差；时序图像与 ego motion 是动态理解和轨迹预测的最小核心输入。
+- **前置条件：** Phase 0.3 的 dataset adapter、model/processor revision、VLM feature interface、ego-state serialization 与 action parser 已冻结。
+
+本阶段解决：
+
+- 使用历史图像理解动态变化；
+- 使用 current/past ego motion 提供运动状态；
+- 输出固定 horizon 的 continuous future waypoints；
+- 将 coarse action 保留为辅助监督与可解释输出；
+- 建立 Phase 0.5 BEV tokens、Phase 0.6 scorer、Phase 0.7 environment 和 Phase 0.8 RL 可复用的 model/policy interface。
+
+本阶段暂不要求：
+
+```text
+full multi-camera BEV
+full occupancy prediction
+complex map / route
+multimodal candidate trajectories
+DPO
+world model
+closed-loop RL
+```
+
+多候选轨迹是 optional；第一版以可靠单轨迹输出为主。模型 contract 必须预留 geometry tokens 和 policy optimization 接口，但不得把它们写成已经实现。
+
+#### 10.2.2 最终核心架构
+
+```text
+historical CAM_FRONT frames
++ current/past ego state
+        ↓
+Qwen3-VL semantic / visual features
+        ↓
+temporal fusion
+        ↓
+shared driving representation
+        ├── coarse meta-action auxiliary head
+        └── continuous waypoint head
+```
+
+Phase 0.5 在 shared fusion 前或内部接入 BEV/OCC geometry tokens；Phase 0.6 消费 trajectory output；Phase 0.7 通过稳定 inference/controller interface 调用模型；Phase 0.8 在同一 policy/model 上执行 reinforcement fine-tuning。不得为这些阶段分别重建不兼容的 backbone 或 trajectory schema。
+
+#### 10.2.3 输入、target 与张量合同
+
+建议的模块边界为：
+
+```text
+historical_images:      [B, T_hist, 3, H, W]
+ego_motion_history:     [B, T_hist, E]
+history_valid_mask:     [B, T_hist]
+future_waypoints:       [B, K, 2]
+trajectory_valid_mask: [B, K]
+coarse_action:          [B]
+```
+
+- `B`：batch size；
+- `T_hist`：历史帧数；
+- `E`：版本化 ego-motion feature dimension；
+- `K`：future waypoint 数；
+- `H, W`：processor 接收的图像尺寸。
+
+`T_hist`、`H/W`、history interval、`K` 和 batch size 都是配置项，必须通过数据可用性与资源预检确定，不在计划中硬编码未经验证的最终值。Future waypoints 全部位于当前 ego frame，单位为米；轴方向、transform 顺序、采样间隔和 horizon 必须进入 temporal manifest contract。第一版优先继承现有 3 秒 future trajectory 语义，任何采样或 horizon 变化都必须提升版本。
+
+Future waypoint 和 coarse action 只作为 target；模型输入只允许 current/past 图像和 ego state。缺失历史帧与 future target 分别由 `history_valid_mask` 和 `trajectory_valid_mask` 显式处理，loss 不得在 invalid position 上计算。
+
+#### 10.2.4 Temporal dataset contract
+
+时序数据构建依次执行：
+
+1. 以当前 sample 为 anchor，沿同一 scene 的历史链查找 past samples。
+2. 读取 historical `CAM_FRONT`，不跨 scene 补帧。
+3. 记录每帧 sensor timestamp 与相对当前时刻的 time offset。
+4. 将历史 ego state 对齐到对应图像的 `CAM_FRONT_sample_data` timestamp。
+5. 检查 history 中是否存在 future timestamp、重复 token 或顺序反转。
+6. 对历史不足样本应用单一、版本化策略并生成 `history_valid_mask`。
+7. 复用 frozen future trajectory producer 生成 waypoint target，不另写猜测式轨迹解析器。
+8. 根据 future availability 生成 `trajectory_valid_mask`。
+9. 保持现有 scene-level train/validation mapping；原 test 永久拒绝读取。
+10. 构建新的 temporal manifest schema version，不覆盖 Phase 0.1b frozen manifest。
+11. 对随机 train/validation 样本生成时序与 waypoint 可视化。
+12. 人工审核 past → current → future 的时间、坐标与左右方向。
+
+历史不足策略必须在 shadow data 上比较：
+
+```text
+exclude sample
+repeat earliest valid frame
+zero / learned padding + valid mask
+```
+
+正式协议只能选择其中一种并版本化；不能按样本或实验临时切换。选择依据至少包括有效样本保留率、时间一致性、mask 正确性与 validation baseline，不使用 test。
+
+Temporal manifest / batch 至少追溯：anchor token、ordered history tokens/paths/timestamps、ego motion values/availability、history mask、future waypoint source、trajectory mask、coordinate metadata、split、schema version、source manifest SHA-256 与 split mapping SHA-256。
+
+#### 10.2.5 必做 baseline
+
+| Baseline | 作用 |
+|---|---|
+| constant-position | 最弱静止参考，检查模型是否至少学会非零位移 |
+| constant-velocity | 经典运动学参考，检查神经模型是否超过简单外推 |
+| ego-history MLP | 隔离 ego motion 本身的预测能力，判断视觉是否带来增益 |
+| single-frame visual trajectory head | 判断单帧视觉贡献，并作为时序增益对照 |
+| temporal visual trajectory head | 判断历史图像中的动态信息是否有效 |
+| temporal visual + ego trajectory head | 最终核心输入组合 |
+
+所有 baseline 必须共享相同 waypoint target、mask、坐标、train/validation split 和 metrics。最少必要 baseline 先于复杂模型执行；若简单 baseline 异常，停止并检查数据合同。
+
+#### 10.2.6 模型模块合同
+
+##### Visual semantic encoder
+
+```text
+historical images
+→ shared Qwen3-VL visual encoder
+→ per-frame visual tokens
+```
+
+第一版复用 Phase 0.3 的 model/processor revision，优先冻结大部分 VLM，通过 LoRA 或上层 adapter 控制可训练范围，不从零训练视觉 backbone。每帧使用同一 encoder 和 extraction policy。
+
+##### Temporal fusion
+
+候选模块包括 temporal transformer、temporal attention pooling、GRU / lightweight sequence encoder。模块接口必须统一接收 per-frame features、relative timestamps 与 `history_valid_mask`。第一版默认优先实现结构简单、便于 shape/mask 调试的 lightweight temporal attention pooling；其他方案只作为后续消融，不同时并行实现全部候选。若 resource preflight 或 smoke evidence 否定默认方案，必须记录替换原因并提升 config/version。
+
+##### Ego-state encoder
+
+```text
+speed
+longitudinal acceleration
+yaw rate
+availability / valid mask
+→ MLP projection
+→ ego token / ego embedding
+```
+
+输入 normalization statistics 只从 train 计算并持久化；validation 只用于评估。Missing values 不得被无记录地替换为真实零运动。
+
+##### Shared fusion
+
+```text
+temporal visual representation
++ ego representation
+→ shared driving feature
+```
+
+Shared fusion 输出稳定 feature contract，包括 shape、dtype、mask、normalization 与 feature version。Phase 0.5 可将 geometry tokens 作为额外输入接入该模块，而不改写 Phase 0.4 trajectory target/output contract。
+
+##### Output heads
+
+```text
+coarse action head:
+shared feature → 6 logits
+
+trajectory head:
+shared feature → K × 2 waypoint coordinates
+```
+
+Trajectory 是主要任务；coarse action 是 auxiliary task。两个 head 必须能单独启停以完成消融，但共享相同 backbone/fusion contract。
+
+#### 10.2.7 Training target、loss 与 consistency
+
+基础训练目标为：
+
+```text
+L_total
+= lambda_traj * L_trajectory
++ lambda_action * L_action
+```
+
+其中：
+
+```text
+L_trajectory = masked SmoothL1 / Huber waypoint regression
+L_action     = 6-class cross entropy
+```
+
+正式实现时在 SmoothL1/Huber 的等价配置中选择并版本化一个方案。`L_trajectory` 只在 `trajectory_valid_mask` 为真处计算；`L_action` 使用 frozen coarse label。Loss weights、learning rate、early stopping 与 checkpoint selection 只用 train/validation 决定。
+
+本阶段不把不可微 safety rule 写进 loss，也不把 action-trajectory consistency 直接加入训练。以下 consistency 先作为诊断指标：
+
+```text
+stop
+→ terminal displacement should be small
+
+left_lateral
+→ terminal lateral displacement should be leftward
+
+right_lateral
+→ terminal lateral displacement should be rightward
+
+accelerate
+→ longitudinal progress / speed trend should increase
+
+decelerate
+→ longitudinal progress / speed trend should decrease
+```
+
+具体阈值必须由 train/validation protocol 版本化，不在计划中猜测。Action 与 trajectory 冲突时保留 sample-level failure case，不修改 GT label 来迁就模型输出。`L_consistency`、`L_occupancy` 和 RL objective 属于后续可接入目标，本阶段不得标为已实现。
+
+#### 10.2.8 详细训练步骤
+
+##### Phase 0.4a：temporal dataset contract
+
+完成 temporal manifest、history/trajectory masks、时间/坐标 contract、真实 producer intake、随机可视化与人工审核。该子阶段未通过不得开始模型训练。
+
+##### Phase 0.4b：trajectory baselines
+
+先运行 constant-position、constant-velocity、ego-history MLP 和 single-frame visual trajectory head，确认 target、mask、metrics 与训练路径正确，再引入 temporal fusion。
+
+##### Phase 0.4c：VLA core smoke training
+
+使用小规模 train subset：
+
+- 检查 model forward 和所有 tensor shapes；
+- 检查 history/trajectory mask；
+- 检查 loss 数值、梯度路径与 trainable parameters；
+- 检查少量样本 overfit；
+- 检查 checkpoint save/load；
+- 检查 inference waypoint/action 输出与坐标反归一化。
+
+##### Phase 0.4d：正式 train/validation training
+
+- 使用正式 train split；
+- 只根据 validation 选择 checkpoint 和超参数；
+- 保存 model、optimizer、scheduler、normalization 与 training config；
+- 记录 manifest、split、代码 commit、model/processor revision 与 checkpoint SHA-256；
+- 保存训练曲线、sample-level validation predictions 和 failure cases；
+- 不访问原 project test。
+
+##### Phase 0.4e：消融与 failure analysis
+
+至少比较：
+
+```text
+ego-only
+single-frame image
+single-frame image + ego
+temporal image
+temporal image + ego
+temporal image + ego + action auxiliary
+```
+
+每项消融只改变一个模块，复用同一数据、trajectory head contract、训练预算和 validation protocol。分析直行、加减速、停止、横向运动、history partial/unavailable 和图像信息不足等 failure modes。
+
+#### 10.2.9 配置、artifact 与 provenance
+
+本阶段计划新增 temporal data builder/validator、trajectory baselines、模块化 VLA core、masked losses、metrics、visualization 与 tests；具体文件名和 CLI 由实施子任务确定，本文不声称它们已经存在。
+
+本地 artifact 至少包括：temporal manifest/sidecar、contract validation receipt、normalization statistics、baseline predictions/metrics、training configs/curves、checkpoint provenance、sample-level action/trajectory predictions、ablation matrix、visualizations 和 failure cases。派生数据、checkpoint、日志和正式输出不进入 Git，frozen manifest 不得覆盖。
+
+Artifact 至少记录 temporal schema/version、history policy、coordinate/time contract、source manifest/split SHA-256、model/processor/feature revision、config/Git SHA、checkpoint SHA-256、random seed、train/validation sample count 与 metric protocol version。
+
+#### 10.2.10 指标、自动测试与人工审核
+
+至少报告：
+
+```text
+ADE
+FDE
+per-horizon displacement error
+terminal lateral error
+trajectory valid rate
+coarse action macro-F1
+per-class F1
+action-trajectory consistency rate
+performance by action class
+performance by speed range
+performance by VRU presence
+```
+
+VRU presence 只作为 offline stratification metadata，不得进入模型输入。若本阶段尚无经过验证的 collision evaluator，不报告或推断 collision/safety 结果；正式 safety metrics 在 Phase 0.6 建立。
+
+自动测试至少覆盖：
+
+- historical sample retrieval 与禁止跨 scene；
+- past/current/future 时间顺序；
+- history mask 与 trajectory mask；
+- current ego frame transform 和左右轴方向；
+- waypoint shape、单位与 collator batch；
+- model forward shapes 与 feature contract；
+- masked loss 忽略 invalid positions；
+- normalization 只由 train 生成；
+- checkpoint save/load 与 deterministic small fixture；
+- action/trajectory head 输出；
+- test split guard。
+
+真实数据 smoke test 只用 train/validation，覆盖 temporal record → batch → forward → loss → prediction → metrics → persistence 全链路。人工审核至少查看历史图像排列、当前帧、GT/predicted trajectory、coarse GT/prediction 与 consistency，覆盖典型直行、加减速、停止和左右横向运动样本。
+
+#### 10.2.11 Gate、失败分支、停止条件与下一阶段
+
+Phase 0.4 通过条件：
+
+- temporal dataset、mask、坐标与时间 contract 完整且审核通过；
+- 模型可稳定训练、保存、加载和推理；
+- predicted trajectory 的 current ego frame 与单位正确；
+- 正式模型超过 constant-position；
+- 力争超过 constant-velocity 与 ego-history MLP，差异有完整 validation evidence；
+- temporal input 对至少部分场景产生可解释增益；
+- action auxiliary 不显著损害 trajectory metrics；
+- 所有结果只来自 train/validation；
+- model/feature/trajectory interface 可供 Phase 0.5—0.8 复用。
+
+如果模型未超过 constant-position，停止后续扩展，优先检查坐标、normalization、mask、target 和 metric 实现。如果超过 constant-position 但未超过 constant-velocity 或 ego-history MLP，不得直接扩大模型或训练预算；先审计数据质量、时间对齐、视觉 feature 与消融。允许进入 Phase 0.5 的轻量 BEV/OCC 增益实验，但必须保留 Phase 0.4 负结果，且不能宣称 trajectory VLA success 已通过。
+
+若 action auxiliary 损害 trajectory，保留 shared representation 与 trajectory head，降低权重或关闭 auxiliary 做消融，不删除 coarse contract。任何未来独立 evaluation 都必须使用新的 untouched protocol；本阶段没有访问或恢复 Phase 0.2d test 的权限。
+
+#### 10.2.12 阶段学习目标与可交付证据
+
+本阶段可展示：时序多模态数据构建、VLM feature extraction、ego-state fusion、trajectory regression、multi-task learning、mask/坐标处理、baseline 设计、消融实验与 failure analysis。
+
+核心 Demo：
+
+```text
+historical CAM_FRONT sequence
++ current/past ego state
+→ coarse action auxiliary output
++ 3-second future trajectory
+→ GT / prediction comparison visualization
+```
+
+Demo 必须展示模型真实输入、target 与 offline metadata 的边界，并附带 config、checkpoint 和 sample provenance。
+
+### 10.3 Phase 0.5：BEV/OCC-aware semantic-geometric fusion
+
+- **阶段目标：** 在 Phase 0.4 shared driving representation 中加入可学习的 BEV/OCC-aware geometry representation 与 semantic-geometric fusion。
 - **状态：** `planned`。
-- **前置阶段：** Phase 0.2d 边界已记录；开发仅使用 train/validation。
-- **后续补充：** 详细执行规格将在后续子任务补充。
+- **前置阶段：** Phase 0.4 temporal/trajectory contract 稳定，并保留完整 baseline 与负结果。
+- **后续补充：** 详细执行规格将在后续子任务补充；本轮不定义具体 BEV/OCC 网络、loss 或数据步骤。
 
-### 10.2 Phase 0.4：coarse meta-action LoRA / action adapter
+### 10.4 Phase 0.6：trajectory safety scorer 与 safety-aware selection
 
-- **阶段目标：** 在 frozen trainval contract 上建立 supervised coarse-action VLM。
+- **阶段目标：** 对 Phase 0.4/0.5 predicted trajectory 建立显式 safety scoring 与可审计 selection，在规划质量与风险之间验证增益。
 - **状态：** `planned`。
-- **前置阶段：** Phase 0.3 baseline 与协议 Gate。
-- **后续补充：** 详细执行规格将在后续子任务补充。
+- **前置阶段：** Phase 0.5 geometry interface 通过 Gate，且 inference input 与 oracle offline evaluator 边界已冻结。
+- **后续补充：** 详细执行规格将在后续子任务补充；DPO 保持 optional，不在本轮展开。
 
-### 10.3 Phase 0.5a：GT-derived geometric safety scorer
+### 10.5 Phase 0.7：quasi-closed-loop evaluation 与 controller/interface
 
-- **阶段目标：** 建立以 candidate rollout / predicted trajectory 和 GT geometry 为输入的 oracle offline safety evaluator。
+- **阶段目标：** 将同一 VLA policy 接入可复现的 controller/environment interface，评估滚动规划与累计误差。
 - **状态：** `planned`。
-- **前置阶段：** Phase 0.4 输出合同稳定。
-- **后续补充：** 详细执行规格将在后续子任务补充。
+- **前置阶段：** Phase 0.6 trajectory/safety output contract 稳定。
+- **后续补充：** 详细执行规格将在后续子任务补充；本轮不选择或实现仿真平台。
 
-### 10.4 Phase 0.5b：offline safety reranker
+### 10.6 Phase 0.8：reinforcement fine-tuning
 
-- **阶段目标：** 在固定 candidate set 上验证 safety-aware selection 是否真实降低风险且不依赖 stop inflation。
-- **状态：** `conditional`。
-- **前置阶段：** Phase 0.5a scorer gate 通过。
-- **后续补充：** 详细执行规格将在后续子任务补充。
+- **阶段目标：** 使用 Phase 0.7 的准闭环 reward 和 safety feedback 优化 Phase 0.4 起建立的同一最终 VLA policy。
+- **状态：** `planned`，属于核心主线而非 `optional` 或 `stretch`。
+- **前置阶段：** Phase 0.7 environment、reward、fallback、offline/online metric 与 rollback contract 通过 Gate。
+- **后续补充：** 详细执行规格将在后续子任务补充；world model 仍为 optional。
 
-### 10.5 Phase 0.6：preference pair audit 与 optional DPO
+### 10.7 Final：robustness、latency、fallback、Demo 与复现证据
 
-- **阶段目标：** 在 reranker 有效时构建可审计 preference pairs，并条件性评估 coarse-action DPO。
-- **状态：** `conditional`。
-- **前置阶段：** Phase 0.5b 证明风险改善且不过度增加 `stop`。
-- **后续补充：** 详细执行规格将在后续子任务补充。
-
-### 10.6 Phase 0.7：coarse-action MVP freeze 与独立评估
-
-- **阶段目标：** 冻结 coarse MVP 的协议、artifact、诚实结论与新的 untouched independent evaluation。
+- **阶段目标：** 汇总核心路线的 robustness、latency、fallback、完整 Demo、复现实验矩阵和诚实 portfolio statement。
 - **状态：** `planned`。
-- **前置阶段：** Phase 0.5b 完成；Phase 0.6 可完成或按 Gate 跳过。
-- **后续补充：** 详细执行规格将在后续子任务补充。
+- **前置阶段：** Phase 0.8 完成并具有可核查的训练、准闭环与安全证据。
+- **后续补充：** 详细执行规格将在后续子任务补充；实车和量产部署不属于项目目标。
 
-### 10.7 Phase 1：temporal single-camera trajectory VLA
+## 11. Optional 项目清单
 
-- **阶段目标：** 引入 temporal single-camera context 并输出 continuous future waypoints 与多候选轨迹。
-- **状态：** `planned`。
-- **前置阶段：** Phase 0.7 coarse MVP freeze。
-- **后续补充：** 详细执行规格将在后续子任务补充。
+Optional 项目只能在对应主线模块稳定后评估，不得挤占核心 Gate，也不得把未完成的 optional 能力写入主线结论。
 
-### 10.8 Phase 2：multi-camera BEV/OCC-aware VLA
-
-- **阶段目标：** 引入 multi-camera 与 learned BEV/OCC geometry branch，服务于轨迹预测和安全评估。
-- **状态：** `planned`。
-- **前置阶段：** Phase 1 trajectory contract 与 baseline Gate。
-- **后续补充：** 详细执行规格将在后续子任务补充。
-
-### 10.9 Phase 3：map、route 与 hierarchical behavior
-
-- **阶段目标：** 融合 map/route，建立 coarse-to-fine hierarchical behavior 与 trajectory planning。
-- **状态：** `planned`。
-- **前置阶段：** Phase 2 geometry contract 与消融证据。
-- **后续补充：** 详细执行规格将在后续子任务补充。
-
-### 10.10 Phase 4：quasi-closed-loop / closed-loop evaluation
-
-- **阶段目标：** 在可核验 simulator/evaluator 中评估滚动决策、误差累积和交互风险。
-- **状态：** `planned`。
-- **前置阶段：** Phase 3 planning interface 稳定。
-- **后续补充：** 详细执行规格将在后续子任务补充。
-
-### 10.11 Phase 5：robustness、latency、fallback 与 efficiency
-
-- **阶段目标：** 建立扰动鲁棒性、端到端 latency、fallback 和资源效率证据。
-- **状态：** `planned`。
-- **前置阶段：** Phase 4 evaluation loop 可复现。
-- **后续补充：** 详细执行规格将在后续子任务补充。
-
-### 10.12 Phase 6：optional RL 与 world model
-
-- **阶段目标：** 条件性研究 RL 或 world model 是否在既有系统上提供额外收益。
-- **状态：** `stretch`。
-- **前置阶段：** Phase 5 核心项目证据完成；本阶段不阻塞核心完成。
-- **后续补充：** 详细执行规格将在后续子任务补充。
-
-### 10.13 最终实验矩阵、Demo 和 portfolio statement
-
-- **阶段目标：** 汇总跨阶段可复现实验、代表性 Demo、失败边界与只基于本项目证据的 portfolio statement。
-- **状态：** `planned`。
-- **前置阶段：** 对应能力阶段完成并具有代码、配置、artifact 与指标证据。
-- **后续补充：** 详细执行规格将在后续子任务补充。
+| Optional 项目 | 何时考虑 | 为什么不是主线必做 |
+|---|---|---|
+| few-shot prompt 深度搜索 | zero-shot 输出格式仍不稳定时 | 面试与工程价值低于 trajectory core |
+| DPO | safety pairs 已稳定时 | Phase 0.8 RL 已是主线 |
+| 多候选轨迹 | 单轨迹模型稳定后 | 第一版调试和评测成本高 |
+| fine-grained maneuver taxonomy | map/route 数据稳定后 | 标注与协议成本高 |
+| 完整 future occupancy prediction | current BEV/OCC fusion 已证明有效后 | 算力和工程成本高 |
+| Bench2Drive | NAVSIM 或其他准闭环主平台完成后 | 双平台成本高 |
+| world model | RL 与准闭环 policy 稳定后 | 研究扩展，不是核心 Gate |
+| 实车部署 | 不在本项目范围 | 风险与资源不匹配 |
