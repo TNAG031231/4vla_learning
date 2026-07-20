@@ -1,8 +1,44 @@
-# 融合 BEV/OCC-aware 空间评估的 Safety-Aware VLA：分阶段项目计划
+# Safety-Aware VLA for Autonomous Driving：完整项目执行计划
 
-**项目定位：** Safety-Aware VLA for Autonomous Driving with BEV/OCC-aware Spatial Evaluation。项目从 single-camera、open-loop、6 类 coarse meta-action MVP 起步，长期扩展为 coarse-to-fine、共享多模态 backbone 的多任务 VLA；BEV/OCC-aware layer 是 GT-derived 的离线空间评估层，不是完整 occupancy prediction 网络，也不代表闭环控制或量产部署。
+## 0. 文档说明与维护规则
 
-当前固定 coarse action schema：
+### 0.1 文档职责
+
+本文是项目阶段规格、依赖关系、信息合同与执行 Gate 的唯一主来源。其他长期文档各自只承担一种职责：
+
+- `docs/progress.md`：记录已经确认的实际状态、指标、artifact 与 open questions；
+- `AGENTS.md`：记录 agent 和开发者不得违反的仓库规则；
+- `README.md`：负责外部项目介绍、能力边界和复现入口；
+- `project_mvp_plan.md`：定义项目要做什么、按什么顺序做、满足什么条件才能继续。
+
+实际进度变化时，先用真实执行证据更新 `docs/progress.md`，再同步本文的阶段状态。禁止在多个文件中维护互相冲突的阶段事实；若出现冲突，已核验的实际状态以 `docs/progress.md` 为准，阶段目标、Gate 和依赖以本文为准。
+
+### 0.2 维护规则
+
+- 只有代码、配置、测试、真实数据 smoke test、人工审核和持久化 artifact 共同支持的能力，才可标为 `completed` 或 `frozen`。
+- 论文结果、模型官方能力和外部 benchmark 不得写成本项目结果。
+- 尚未实现或未核验的入口、指标、资源开销和能力必须标为 `planned`、`conditional`、`stretch` 或“待验证”。
+- 阶段状态、contract、rule 或 evaluation protocol 变化时，必须记录版本与 provenance；不得覆盖 frozen artifact。
+- Phase 0.3 及后续阶段必须按第 5.2 节统一模板补全。本轮只建立章节骨架，不授权实现后续阶段代码或执行实验。
+
+## 1. 项目使命、最终目标与非目标
+
+### 1.1 项目使命
+
+本项目研究 **Safety-Aware VLA for Autonomous Driving with BEV/OCC-aware Spatial Evaluation**：从可审计的 coarse meta-action MVP 出发，逐步建立能够利用时序多相机视觉、ego state、map/route 与几何表示，生成多模态未来轨迹并接受安全评估的自动驾驶 VLA。
+
+### 1.2 Phase 0：coarse meta-action MVP
+
+Phase 0 验证以下最小证据链：
+
+```text
+数据和标签是否可信
+→ 视觉模型能否预测 coarse action
+→ 安全 scorer 能否评价候选行为
+→ reranker / preference learning 是否提供增益
+```
+
+固定六类 coarse action 为：
 
 ```text
 keep
@@ -13,273 +49,499 @@ left_lateral
 right_lateral
 ```
 
-当前 6 类是第一阶段的 coarse behavior representation、baseline 和辅助监督，不是最终固定动作空间。`left_lateral` / `right_lateral` 只表示未来轨迹中稳定的左右横向运动；当前不区分 lane change、turn、follow-road-curve 或其他横向运动原因，不能直接解释为左/右变道或左/右转。
+六类动作是 **coarse behavior representation**，不是最终动作空间。`left_lateral` / `right_lateral` 只表示稳定的左右横向运动，不能直接解释为 turn、lane change 或其原因。coarse action 在长期系统中继续作为辅助监督、可解释输出、baseline 与 action-trajectory 一致性检查接口，不通过不断增加互斥类别来承担完整规划任务。
 
-## 1. 信息边界与总体数据流
+### 1.3 Phase 1—6：完整自动驾驶 VLA
 
-### 1.1 Inference inputs
+长期主线为：
 
-推理时模型只可使用：
+```text
+temporal multi-camera images
++ current/past ego state
++ route / map context
+        ↓
+VLM semantic branch
++ BEV/OCC geometry branch
+        ↓
+multimodal fusion
+        ↓
+hierarchical action heads
++ multimodal candidate trajectories
+        ↓
+predicted occupancy / geometry scorer
+        ↓
+safety-aware trajectory reranker
+        ↓
+controller / simulator
+```
 
-- `CAM_FRONT` image；
-- driving instruction；
-- current `ego_state`，可包含当前速度、加速度、yaw rate。
+- Phase 1 开始输出连续 future trajectory；
+- Phase 2 引入 multi-camera 与 learned BEV/OCC geometry；
+- Phase 3 引入 map、route 和 fine-grained maneuver；
+- Phase 4 进入 quasi-closed-loop / closed-loop evaluation；
+- Phase 5 处理 robustness、latency、fallback 与 efficiency；
+- Phase 6 是 optional RL / world-model research extension，不阻塞完整项目的核心完成。
 
-推理时不得使用 future ego trajectory、GT meta-action、GT boxes、GT BEV/OCC raster、未来 GT agents 或 test labels。
+上述路线是目标架构，不代表相关模块已经实现。BEV/OCC geometry 可以是经验证的 learned spatial representation，不要求把完整 occupancy prediction 产品化为基础完成条件。
+
+### 1.4 非目标
+
+本项目的基础完成条件不包括：
+
+- 量产级、实车或 real-time 部署；
+- 以 RL 或 world model 作为必经路线；
+- 完整 occupancy prediction 系统；
+- 仅依靠更多 `stop` 预测获得表面上的安全指标改善；
+- 将 oracle GT scorer 冒充在线 camera-only safety capability；
+- 在没有 map、lane topology、route 或必要时序信息时，把 coarse lateral 标签解释为 turn 或 lane change。
+
+## 2. MVP 和完整项目的成功定义
+
+### 2.1 Coarse-action MVP success
+
+Coarse-action MVP 必须同时满足：
+
+- 数据、标签、split、预测和评测结果具备 sample-level provenance；
+- train、validation、test 按 scene-level split，且经过无泄漏验证；
+- Majority、ego-motion、VLM、LoRA/action adapter 与 reranker 使用统一 action schema、parser 和 evaluation protocol；
+- 每种方法保存可回溯的 sample-level predictions，并报告 macro-F1、per-class F1、confusion matrix、class distribution、invalid output rate 与 parsing success rate；
+- safety 改善不能仅来自 `stop` 增加，必须联合报告风险、`unnecessary_stop` 与 action quality；
+- 最终结论基于新的 untouched evaluation protocol。Phase 0.2d 已消费的原 project test 不再具备这一资格。
+
+### 2.2 Trajectory VLA success
+
+Trajectory VLA 必须同时满足：
+
+- 模型真实输出带坐标、时间、horizon 与 valid mask 合同的 future waypoints；
+- 在同一协议下超过 constant-velocity 与 ego-history baselines；
+- coarse/fine action 与 predicted trajectory 的语义一致性可度量；
+- 多候选轨迹具有有效 diversity，而不是数值近似的重复候选；
+- safety reranking 在规划性能与风险之间取得可验证改进，并报告失败案例与 trade-off。
+
+### 2.3 Full project success
+
+完整项目的核心完成要求包括：
+
+- temporal multi-camera input；
+- learned BEV/OCC geometry；
+- map / route conditioning；
+- hierarchical behavior heads；
+- multimodal trajectory generation；
+- quasi-closed-loop 或 closed-loop evaluation；
+- robustness、latency 与 fallback evidence；
+- 每项能力均有可定位的代码、配置、artifact 和指标证据。
+
+RL、world model、完整 occupancy prediction 和实车部署均不是基础完成条件；对应工作只能在证据充分时作为 extension 报告。
+
+## 3. 推理输入、训练 target 和 offline evaluator 的信息边界
+
+### 3.1 Model inference inputs
+
+经对应阶段 contract 批准后，模型推理输入可以包括：
+
+```text
+current / historical camera images
+current / past ego state
+driving instruction
+route command
+map / lane topology
+predicted BEV / occupancy
+```
+
+具体传感器、历史长度、缺帧策略和坐标约定由阶段 contract 冻结。尚未进入对应阶段的输入不得提前接入并冒充当前能力。
+
+### 3.2 Training targets
+
+训练路径可使用与任务对应的监督 target：
+
+```text
+coarse meta-action
+fine-grained actions
+future ego trajectory
+future waypoints
+GT occupancy
+consistency targets
+```
+
+Training target 必须与 inference input 分离；target 的存在不代表推理时可访问同源 GT 信息。
+
+### 3.3 Offline evaluator inputs
+
+Offline evaluator 可按阶段 contract 使用：
+
+```text
+GT current/future agent boxes
+GT-derived temporal occupancy
+ego pose
+optional map
+candidate action rollout
+predicted candidate trajectories
+```
+
+这些输入只用于 oracle offline scoring、failure analysis、reranking 或 evaluator validation。在线能力必须另以 predicted geometry 与真实 inference path 验证。
+
+### 3.4 永久禁止的信息泄漏
+
+- future ego trajectory 不得进入模型推理；
+- GT meta-action 不得进入模型推理；
+- GT boxes、future agents 或 GT occupancy 不得进入模型 test-time inference；
+- test labels 不得用于 prompt、threshold、candidate、model、architecture 或 checkpoint 选择；
+- 不得以 GT ego trajectory 替代模型 candidate trajectory 进行 collision check；
+- 不得将 oracle GT scorer 的结果表述为在线 camera-only safety capability。
 
 ```mermaid
 flowchart LR
-    subgraph Inference
-        A["CAM_FRONT image"] --> D["VLM backbone"]
-        B["driving instruction"] --> D
-        C["current ego_state"] --> D
-        D --> E["candidate coarse actions (Phase 0.1+)"]
-        D --> F["neural action / waypoint / fine heads (planned)"]
-    end
-
-    subgraph Training targets
-        G["versioned derived targets"] --> H["coarse / fine action losses"]
-        I["GT future ego trajectory"] --> J["trajectory loss (planned)"]
-    end
-
-    subgraph Offline safety evaluation
-        E --> M["configured short-horizon ego rollout"]
-        K["GT 3D boxes or GT-derived temporal BEV occupancy"] --> L["oracle geometry scorer backend v1"]
-        M --> L
-        L --> N["decomposed safety costs → reranker → pair audit"]
-        O["predicted BEV / occupancy (planned)"] --> P["scorer backend v2 comparison"]
-    end
+    A["Inference inputs"] --> B["VLA model"]
+    B --> C["Actions / candidate trajectories"]
+    D["Versioned training targets"] --> E["Training losses only"]
+    C --> F["Offline evaluator"]
+    G["GT boxes / temporal occupancy / optional map"] --> F
+    F --> H["Metrics / reranking / failure analysis"]
 ```
 
-`GT meta-action` 与 GT future trajectory 仅是训练 target；GT boxes、GT-derived occupancy、ego pose 与 optional map 仅进入 oracle offline evaluator。模型 backbone、action candidate generator 和推理输入之间不接收任何 future 或 GT safety 信息。当前已实现的是 coarse label/data protocol；coarse neural action head、LoRA、action adapter、waypoint 与 fine-grained heads 均为 planned。
+## 4. 数据、坐标、时间、版本和 artifact 总合同
 
-### 1.2 Sample-level reproducibility contract
+### 4.1 长期基础字段
 
-基础数据提取结果应长期稳定并可复用：
+Manifest family 的长期基础合同为：
 
 ```text
 sample_token
 scene_token
 timestamp
-cam_front_path
+sensor_paths
 current_ego_pose
 current_ego_motion
 coordinate_metadata
+history_valid_mask
 future_ego_trajectory
+future_waypoints
+trajectory_valid_mask
 nearby_agents
+map_route_metadata
 split
+official_split
 manifest_schema_version
 ```
 
-当前 audited seed-subset schema 的派生与追溯字段为：
+字段按阶段逐步启用：当前已实现的 `cam_front_path` 是 single-camera `sensor_paths` 的现行字段；`history_valid_mask`、`future_waypoints`、`trajectory_valid_mask` 和 `map_route_metadata` 尚未全部进入当前 frozen schema，必须在使用它们的阶段提升 schema version 后加入。不得把长期合同字段误写为当前已完成能力。
+
+### 4.2 版本化 targets 与实验字段
 
 ```text
 meta_action
 label_rule_version
+fine_action_rule_version
 safety_rule_version
-source_audit_record
+raster_config_version
+prompt_version
+parser_version
+model_revision
+checkpoint_sha256
+split_mapping_sha256
+evaluation_protocol_version
 ```
 
-当前 schema version 为 `phase0_audited_seed_subset_v1`，`label_rule_version=phase-1.6-meta-action-v0.2`。`current_ego_pose` 至少包含 `frame`、`translation_m`、`rotation_wxyz`、`timestamp_us` 与 `timestamp_source`；`current_ego_motion` 至少包含 `speed_mps`、`longitudinal_acceleration_mps2`、`yaw_rate_radps`、`source`、`timestamp_source`、`availability`、`history_interval_sec`、`acceleration_interval_sec` 与 `unavailable_reason`。两者 timestamp source 均为 `CAM_FRONT_sample_data`，motion 只使用当前和历史 pose，不使用 future pose 或 future trajectory。当前 `meta_action` / `label_rule_version` 分别承担 coarse action 与其 rule version 角色；不得提前重命名为 `meta_action_coarse` / `meta_action_rule_version`。该 schema 是 audited seed-subset schema，不是正式 trainval manifest v1；Phase 0.1b 才生成后者。动作规则变化必须提升对应 rule version，不同 label version、coarse 与 fine 标签不得静默混用。新增输出 head 时优先扩展 targets，并继续使用固定的 scene-level train/validation/test split；test split 不因标签、prompt 或模型结果反复调整。安全评估、rollout 或 preference 产物还必须记录 `raster_config_version`、坐标系/单位/transform 顺序、候选 action 或 trajectory、时间步、`motion_assumption`（如有）、分项 safety cost 与触发对象。
+基础字段与派生 target 必须分离。Schema 变化必须提升 `manifest_schema_version`；rule 变化必须提升对应 rule version 并重新生成受影响 target；coarse 与 fine labels、不同版本 labels 均不得静默混用。
 
-## 2. 为什么保留 coarse meta-action
+### 4.3 坐标与时间合同
 
-coarse meta-action 将连续 ego trajectory 转换成 VLA 可学习、人工可审核的行为语义，使首版先成为可控的 6 类分类任务；它支持 class distribution、confusion matrix、per-class F1 和 failure case analysis，也是 action reranker 与 chosen/rejected preference pairs 的固定比较单位。它保留为长期 baseline、可解释输出和后续多任务模型的辅助监督，而非不断扩展的互斥类别集合。
+- 坐标数据必须记录 source frame、target frame、轴方向、单位和 transform 顺序；
+- 时间数据必须记录 timestamp 单位、timestamp source、采样间隔、history/future horizon、tolerance 与缺帧策略；
+- 当前 `current_ego_pose` / `current_ego_motion` 的 timestamp source 固定为 `CAM_FRONT_sample_data`；motion 只由 current/past pose 推导；
+- future trajectory、waypoints、agents 与 occupancy 必须显式对齐离散时间步，不能只凭数组下标假设同步。
 
-真实驾驶动作可组合，例如“左转+减速”“右变道+保持速度”“直行+加速”。长期方案因此采用层级/多头表示：
+### 4.4 Split、provenance 与存储规则
+
+- train、validation、test 必须按 scene-level split，禁止相邻帧跨 split；
+- 数据、模型、配置、代码版本和结果必须具备 provenance 与必要 SHA-256；
+- frozen artifact 不得覆盖、就地改写或以改名方式复用；
+- 原始数据、派生数据、checkpoint、正式输出、日志和缓存不进入 Git；
+- Git 只保存代码、配置模板、schema、允许公开的小型测试 fixture、测试和文档；
+- 不可逆 evaluation 的 durable claim、访问状态、输出持久化状态与 rerun policy 必须单独记录。
+
+## 5. 全局状态定义与统一执行规范
+
+### 5.1 全局状态定义
+
+| 状态 | 定义 |
+|---|---|
+| `completed` | 阶段目标和 Gate 已由可复现证据满足，但其输出仍可能在后续阶段被版本化扩展。 |
+| `frozen` | 阶段已完成，关键 contract、rule、split 或 artifact 被锁定；后续不得静默修改。 |
+| `active` | 当前正在执行，尚未满足全部 Gate。 |
+| `blocked` | 前置条件或外部依赖未满足，当前不得继续。 |
+| `planned` | 已进入路线图，但尚未开始实现或验收。 |
+| `conditional` | 只有前序实验满足指定增益或质量 Gate 时才执行。 |
+| `stretch` | 可选研究扩展，不阻塞核心项目完成。 |
+| `retired` | 协议或方案已停止使用；保留历史证据，但不得作为当前有效方案。 |
+| `consumed_failed` | 不可逆正式评估已访问 sealed evaluation data，但因执行或 artifact 持久化失败而没有形成可发布结果；该 evaluation source 仍视为已消费，永久不得重跑。 |
+
+状态只描述证据与 Gate，不描述主观完成度。`completed` 不等于 `frozen`，`consumed_failed` 也绝不等于“未执行”。
+
+### 5.2 Phase 0.3 及后续阶段统一模板
+
+后续每个阶段必须严格包含：
 
 ```text
-shared multimodal backbone
-├── coarse meta-action head                 (planned)
-├── longitudinal action head                (planned)
-├── lateral direction head                  (planned)
-├── maneuver type head                      (planned)
-├── continuous waypoint head                (planned)
-└── optional BEV / occupancy auxiliary head (planned)
+阶段状态
+阶段目的
+为什么需要
+前置条件
+本阶段不解决什么
+
+输入
+允许使用的数据
+禁止使用的数据
+字段和 artifact contract
+
+详细执行步骤
+涉及代码与配置
+生成的本地 artifact
+版本和 provenance
+
+单元测试
+contract / regression tests
+真实数据 smoke test
+人工审核
+
+实验矩阵
+评测指标
+通过 Gate
+失败分支
+停止条件
+不可逆操作与保护措施
+进入下一阶段的条件
+
+阶段学习目标
+可形成的代码、图表、Demo 和简历证据
 ```
 
-后续 `longitudinal_action` 可为 `keep / accelerate / decelerate / stop`，`lateral_direction` 可为 `none / left / right`；引入必要上下文后，`maneuver_type` 才可为 `lane_change / turn / follow_road_curve / other`。只有引入 map、lane topology、intersection topology、route command 或 short temporal context 的至少一部分后，才能可靠区分 turn 与 lane change；届时保留 coarse lateral label，新增并重新抽检 fine-grained maneuver label。原有基础数据管线、轨迹、scene split 与 backbone 可复用，但 fine-grained classification head 和相关 preference data 需要重建。
+测试数量不能替代真实 producer artifact → consumer intake 的 shape 核验。不可逆操作前必须完成不访问 sealed data 的 full shadow execution，并验证 adapter、输出持久化与 rerun guard。
 
-## 3. BEV / occupancy 与 geometric safety scorer
+## 6. 完整项目阶段总览和依赖关系
 
-### 3.1 表征与信息来源
+### 6.1 阶段状态总表
 
-BEV / occupancy 是场景空间表示，不直接等于 safety decision；candidate rollout 与 geometric scorer 必须保留。第一版的 oracle scorer backend 可以使用 ego-frame temporal occupancy：
-
-```text
-occupancy[T, C, H, W]
-```
-
-- `T`：离散时间步，与 candidate rollout 或 predicted trajectory 的 horizon 对齐；
-- `C`：至少 vehicle 与 VRU 类别通道；可验证时再细分 pedestrian/cyclist，并可加入 drivable/non-drivable channel；
-- `H, W`：配置化的 BEV 网格大小与分辨率。
-
-**Scorer backend v1（planned）：** 使用 nuScenes GT 3D boxes，或由 GT annotation 构造的 ego-centric temporal BEV occupancy，作为 oracle offline evaluator，以先验证几何规则本身是否合理。current agent boxes 只能构造 current occupancy；future occupancy 优先由对应未来 annotation 构造。若暂时只能使用 constant-velocity 或 static-agent fallback，必须记录 `motion_assumption`、参数和版本。它不代表真实 camera-only occupancy prediction，也不能成为模型 test-time inference input。
-
-**Scorer backend v2（planned）：** 使用 predicted BEV / occupancy，以评估感知误差下 scorer 是否仍有效，并与 v1 oracle backend 对照。v2 不是用 occupancy 替代 geometric scorer；仍以 candidate rollout 与几何关系产生可分解的 safety costs。
-
-### 3.2 Candidate rollout 与 collision check
-
-```text
-CAM_FRONT / model
-→ candidate coarse actions
-→ short-horizon ego rollout
-→ GT-box or occupancy scorer backend
-→ decomposed safety costs
-→ offline reranker
-→ audited preference pairs
-→ optional DPO
-```
-
-candidate rollout 只用于 offline 候选动作比较，不冒充真实车辆动力学、在线规划器或闭环控制。每个 rollout 必须记录 action 参数、时间步、source/target frame、轴方向、单位、horizon 与规则版本；collision/near-miss check 必须使用 candidate ego rollout 或模型 predicted trajectory，不能直接用 GT ego trajectory 代替候选行为。
-
-### 3.3 能力边界
-
-Phase 0.5a 不训练 BEVFormer、OccNet、SurroundOcc 或完整 occupancy network。GT-derived evaluator 只负责 offline metrics、reranking、preference pair construction、failure analysis 和可视化；不能删除 geometric scorer 并将 occupancy 直接当作 safety score。这使项目既保留 VLA 的输入/输出主线，也能以可验证的 occupancy-style 空间接口对齐 BEV/OCC 岗位关键词。
-
-## 4. Phase -1：数据闭环与 coarse 标签核验（当前）
-
-| 项目 | 定义 |
-|---|---|
-| 输入 | nuScenes `sample_token`、`CAM_FRONT`、future ego trajectory、nearby 3D agents、人工审核记录 |
-| 输出 | one-page visualization、版本化 coarse meta-action、审核证据、待冻结 manifest 前置检查 |
-| 核心脚本（已存在） | `data/inspect_nuscenes_sample.py`、`data/derive_meta_action.py`、`data/verify_labels.py`、`data/select_manual_review_samples.py` |
-| 核心测试（已存在） | `tests/test_inspect_nuscenes_sample.py`、`tests/test_verify_labels.py`、`tests/test_meta_action.py`、`tests/test_phase_1_7_manual_audit.py` |
-
-已确认事实：`CAM_FRONT`、future ego trajectory 与 nearby agents 已可读取并可视化；已派生 6 类 coarse meta-action；108 个样本已人工审核，且 6 类 action 已有审核覆盖。VRU presence 是本阶段 gate 的必需覆盖维度，需与规则冻结一并核验。当前 `safety_rule_version=not_available`，因此本阶段不把 collision、near miss、safe/unsafe 或 `safety_score_reasonable` 作为审核完成条件。
-
-**Gate：** 图像、future trajectory 与 nearby agents 对齐；6 类 coarse meta-action、VRU presence 和 action boundary cases 已覆盖；`label_rule_version=phase-1.6-meta-action-v0.2` 已冻结；manifest audit 前置检查可核验。该 gate 已通过。
-
-## 5. Phase 0.1：manifest 协议、scene-level split 与 Majority Baseline（completed）
-
-| 项目 | 定义 |
-|---|---|
-| 输入 | 冻结后的 coarse label、audited seed-subset manifest、固定 seed 的 scene-level split |
-| 输出 | sample-level predictions、macro-F1、per-class F1、confusion matrix、class distribution、invalid prediction 指标、failure cases |
-| 核心脚本/测试 | `data/build_phase0_manifest.py`、`src/phase0/protocol.py`、`src/baselines/majority.py` 与对应 manifest/protocol/majority tests |
-
-Phase 0.1 已完成：冻结数据版本与 coarse rule version → 固定 seed 的 scene-level train/val/test split → 完整 manifest contract validation → 六类统一指标与 invalid prediction 处理 → Majority Baseline。所有方案共享同一固定 test split 与 action vocabulary；few-shot examples 不得来自 test scene。
-
-**Gate：** Phase -1 freeze gate 已通过；manifest 与 sample-level 输出可追溯，scene split 无泄漏，Majority Baseline 在统一协议下可复现。majority accuracy 高但 macro-F1 低时先诊断类别失衡。
-
-## 6. Phase 0.1b：nuScenes mini → trainval scale-up（planned）
-
-mini 用于数据链路 smoke test、快速回归、人工审核和小规模调试，不作为正式 LoRA、DPO 或最终性能结论的数据规模。本阶段在任何正式 LoRA、action adapter 或 DPO 前发生：扩展到 trainval，生成正式 dataset manifest v1，重新统计类别分布并抽检边界样本。
-
-**Gate：** trainval manifest v1、scene-level split、类别统计与边界样本审核均可追溯。完成前只允许 mini smoke run，不进入正式训练或 DPO。
-
-## 7. Phase 0.2：ego-motion rule baseline（planned）
-
-rule-based baseline 只可使用 inference-time current/past ego state，禁止读取 future ego trajectory、derived meta-action 或任何 test label。它与后续视觉模型共享 Phase 0.1b 固定 test split、action vocabulary 和指标协议。
-
-**Gate：** current/past ego-state 输入字段经过审计，sample-level 输出可复现；若 rule baseline 优于视觉模型，先评估视觉增益。
-
-## 8. Phase 0.3：Qwen3-VL zero-shot / few-shot baseline（planned）
-
-评估 image-only 与 image + current ego-state 的 zero-shot / few-shot VLM；few-shot examples 不得来自 test scene。所有输出必须经过同一 action parser，并报告 invalid output rate。
-
-**Gate：** 与 Phase 0.1b/0.2 在相同固定 test split 和指标协议下比较，不以 prompt 或模型结果调整 test split。
-
-## 9. Phase 0.4：coarse meta-action LoRA / action adapter（planned）
-
-正式训练必须基于 trainval manifest；mini 上只允许 smoke run。coarse checkpoint 可作为未来多任务模型的初始化或对照，但旧分类 head 不保证直接适用于扩展后的 target 空间。
-
-**Gate：** 相同数据协议下的 LoRA/action adapter 对照可复现；若无提升，先复核数据与标签，不扩容训练。
-
-## 10. Phase 0.5a：GT-derived geometric safety scorer（planned）
-
-| 项目 | 定义 |
-|---|---|
-| 输入 | candidate action rollout 或 predicted trajectory；GT 3D boxes 或 GT-derived temporal BEV occupancy；ego pose、optional map |
-| 输出 | collision / near-miss、VRU distance violation、infeasibility、unnecessary stop、harsh action / jerk、分项 safety cost、可视化 |
-| 核心脚本/测试 | planned：candidate rollout、geometric scorer、optional BEV raster backend；scorer synthetic tests 与 scorer audit |
-
-**Gate：** scorer 在确定性合成案例上可复现；真实样本的对象、时间步和坐标可回溯；future occupancy 的 annotation 或 fallback 假设完整记录；collision、near-miss、safe/unsafe 与 scorer reasonableness 的人工审核通过。若 map 数据链路不可验证，off-road 项保持 optional。未通过 scorer gate，不进入 Phase 0.5b。
-
-## 11. Phase 0.5b：offline safety reranker（planned）
-
-| 项目 | 定义 |
-|---|---|
-| 输入 | 固定 candidate set、模型分数与通过 Phase 0.5a 的分项 safety costs |
-| 输出 | rerank 前后 action macro-F1、VRU / near-collision、unnecessary stop、scorer failure cases 与可追溯的 chosen/rejected 候选 |
-| 核心脚本/测试 | planned：reranker、candidate-set consistency test、rerank metric test、scorer failure-case audit |
-
-reranker 以 candidate rollout 与已验证 scorer backend 比较同一固定 candidate set。若风险改善主要来自 `stop` 增加，不得写成安全能力提升。reranker 未证明风险改善且不过度增加 stop，不构造 DPO pairs。
-
-## 12. Phase 0.6：preference pair audit 与可选 coarse-action DPO（planned）
-
-在输出协议稳定、trainval 数据完成、scorer 与 reranker gate 通过后，才可构建 chosen/rejected preference pairs；chosen 必须更安全且符合场景/轨迹约束，rejected 必须存在可解释风险。每个 pair 记录 margin、完整 cost、版本与审核状态，并先通过 preference pair audit。
-
-DPO 是 conditional milestone 和第一版 MVP 的可选终点，不是整个项目的最终终点。若 DPO 不优于 reranker，则保留 reranker；GRPO 与闭环 RL 不作预设承诺。若后续扩展为 fine maneuver 或 continuous waypoint，相关 preference pairs 需要重新构造，六类 DPO checkpoint 仅可作为初始化或对照。
-
-## 13. 后续扩展：分层多任务 VLA 与评测（planned）
-
-后续路线为：short temporal input → map / route / lane topology → hierarchical fine-grained maneuver → continuous waypoint head → BEV / occupancy auxiliary supervision → closed-loop or quasi-closed-loop evaluation。共享 VLM backbone 在相同 inference inputs 上输出 coarse meta-action 与后续多任务 head；coarse action 是辅助监督与语义解释层，continuous waypoint 才是更接近 planning 的输出。
-
-默认训练目标为：
-
-```text
-L_total = L_action + lambda * L_traj + gamma * L_consistency
-```
-
-`L_consistency` 约束动作与轨迹语义，例如 `stop` 不应对应明显持续前进的 trajectory。Phase 0.5 的 safety scorer 默认只用于 offline metrics、reranking、pair construction 与 failure analysis；只有真实实现并验证 differentiable soft occupancy 或 distance-field surrogate 后，才可额外引入可反向传播的 `beta * L_safety`，并必须单独报告其实现、梯度路径和消融。
-
-| 项目 | 定义 |
-|---|---|
-| 输入 | 与 Phase 0.1 相同的 inference-time image / instruction / current ego state，并在相应扩展阶段引入经批准的 temporal / map / route 输入 |
-| target | coarse meta-action、fine-grained targets（planned）、GT future ego trajectory |
-| 输出 | coarse action、fine-grained heads（planned）、K predicted waypoints（planned）、trajectory metrics 与 consistency analysis |
-| 核心脚本/测试 | planned：shared-head model、trajectory metric evaluator、action-trajectory consistency test |
-
-**Gate：** waypoint target、坐标变换、horizon、轨迹 metrics、collision evaluation 与对照实验均真实实现并验证后，才能报告 trajectory-level 结果。
-
-multi-camera、预训练 BEVFormer/OccNet/SurroundOcc 的受控复现均为 optional/stretch，不阻塞前述 MVP gate，也不得写作已完成能力。
-
-## 14. 实验表模板
-
-### Data statistics
-
-| Split | Samples | Six-action distribution | VRU presence | Boundary cases | Rule version |
-|---|---:|---|---:|---:|---|
-| Train / Val / Test | — | — | — | — | — |
-
-### Action baseline
-
-| Method | Inputs | Macro-F1 | Per-class F1 | Invalid output | Notes |
-|---|---|---:|---|---:|---|
-| Majority / ego-state rule / image-only VLM / image+ego VLM / LoRA | — | — | — | — | — |
-
-### Safety / reranker
-
-| Method | Candidate set | Collision | VRU | Off-road | Unnecessary stop | Macro-F1 |
-|---|---|---:|---:|---:|---:|---:|
-| Base / reranked / DPO conditional | — | — | — | — | — | — |
-
-### Trajectory metrics
-
-| Method | ADE/FDE or configured metric | Collision / near-miss | Consistency | Notes |
-|---|---:|---:|---:|---|
-| Trajectory head (planned) | — | — | — | — |
-
-### Failure cases
-
-| Error type | Representative `sample_token` | Root cause | Evidence / limitation |
+| 阶段 | 目标 | 状态 | 主要输出 |
 |---|---|---|---|
-| label / action / safety / trajectory | — | — | — |
+| Phase -1 | 数据闭环与 coarse label freeze | `frozen` | 数据对齐、标签、108-sample 人工审核、freeze gate |
+| Phase 0.1 | manifest、split、metrics、Majority | `completed` | audited seed subset 与统一评测协议 |
+| Phase 0.1b | trainval scale-up | `frozen` | 正式 manifest v1 与 scene mapping |
+| Phase 0.2a | past-only ego-motion audit | `completed` | inference input audit |
+| Phase 0.2b | rule candidate search | `completed` | validation candidate selection |
+| Phase 0.2c | failure analysis 与 rule freeze | `frozen` | `phase0.2-ego-motion-rule-v0.1` |
+| Phase 0.2d | sealed one-shot evaluation | `consumed_failed` | 无正式 test metrics；原 test 永久消费 |
+| Phase 0.3 | Qwen3-VL zero/few-shot | `planned` | VLM baseline |
+| Phase 0.4 | LoRA / action adapter | `planned` | supervised VLM |
+| Phase 0.5a | geometric safety scorer | `planned` | oracle safety evaluator |
+| Phase 0.5b | offline reranker | `conditional` | safety-aware selection |
+| Phase 0.6 | preference audit / optional DPO | `conditional` | preference learning |
+| Phase 0.7 | coarse MVP freeze | `planned` | MVP final report 与独立评估 |
+| Phase 1 | temporal trajectory VLA | `planned` | future waypoints |
+| Phase 2 | multi-camera BEV/OCC VLA | `planned` | learned geometry |
+| Phase 3 | map / route / hierarchical behavior | `planned` | fine maneuver planning |
+| Phase 4 | quasi/closed-loop evaluation | `planned` | simulation evidence |
+| Phase 5 | robustness and efficiency | `planned` | deployability evidence |
+| Phase 6 | RL / world model | `stretch` | optional research extension |
 
-## 15. 风险、Demo 与简历边界
+### 6.2 依赖关系与 Gate
 
-| 风险 | 验证与处置 |
-|---|---|
-| future/GT leakage | 固定 inference contract；对 baseline 输入做字段审计 |
-| future occupancy 不可得 | 优先 annotations；fallback 记录 `motion_assumption`，不冒充预测 |
-| safety 偏向 `stop` | reranker 同时报 `unnecessary_stop` 与 macro-F1 |
-| 单帧 lateral 不足 | 保留 coarse lateral baseline；后续引入时序/地图/route 前不生成 turn 或 lane-change 标签 |
+```mermaid
+flowchart TD
+    Pm1["Phase -1 frozen"] --> P01["Phase 0.1 completed"]
+    P01 --> P01b["Phase 0.1b frozen"]
+    P01b --> P02a["Phase 0.2a completed"]
+    P02a --> P02b["Phase 0.2b completed"]
+    P02b --> P02c["Phase 0.2c frozen"]
+    P02c --> P02d["Phase 0.2d consumed_failed"]
+    P02d --> P03["Phase 0.3 planned: train/validation development only"]
+    P03 --> P04["Phase 0.4 planned"]
+    P04 --> P05a["Phase 0.5a planned: scorer gate"]
+    P05a -->|"scorer gate passes"| P05b["Phase 0.5b conditional"]
+    P05a -->|"gate fails"| FixScorer["stop and repair scorer"]
+    P05b -->|"risk improves without stop inflation"| P06["Phase 0.6 conditional"]
+    P05b -->|"skip DPO or retain negative result"| P07["Phase 0.7 planned"]
+    P06 --> P07
+    P07 --> P1["Phase 1 planned"]
+    P1 --> P2["Phase 2 planned"]
+    P2 --> P3["Phase 3 planned"]
+    P3 --> P4["Phase 4 planned"]
+    P4 --> P5["Phase 5 planned"]
+    P5 -.->|"optional"| P6["Phase 6 stretch"]
+```
 
-最小 demo（Phase 0.5b 后）展示 `CAM_FRONT`、inference inputs、GT action/trajectory（明确为 target）、候选 action rollout、scorer backend、碰撞触发对象、rerank 前后行为与版本信息；不得把 GT target、GT boxes 或 GT occupancy 显示为模型推理输入。
+Scorer gate 未通过时不得进入 reranker；reranker 未证明风险改善且不过度增加 `stop` 时不得进入 preference learning。DPO 可跳过，Phase 0.5b 的正结果或诚实负结果均可进入 Phase 0.7 做 coarse MVP freeze。Phase 6 不阻塞 Phase 5 后的核心完成判定。
 
-简历中当前只能写已完成的 `CAM_FRONT` / future ego trajectory / nearby agents 对齐、meta-action derivation、108 样本人工审核及已存在脚本和测试。BEV/OCC-aware evaluator、reranker、DPO、trajectory head 与 occupancy prediction 必须标为 planned，直至有对应代码、配置和可核查结果。
+## 7. Phase -1：数据闭环与 coarse label freeze 简要回顾
 
-## 16. 当前下一步
+**状态：`frozen`。** Phase -1 建立并核验了：
 
-Phase -1 freeze gate 与 Phase 0.1 均已完成。下一步是 Phase 0.1b trainval scale-up；之后才可进入 Phase 0.2 rule-based、Phase 0.3 Qwen3-VL、Phase 0.4 LoRA/action adapter、Phase 0.5a scorer、Phase 0.5b reranker 或 Phase 0.6 optional DPO。本计划修订不授权 trainval scale-up 实施、训练、DPO、完整 occupancy network 或 trajectory-level 模型实施。
+```text
+sample_token → CAM_FRONT
+sample_token → future ego trajectory
+sample_token → nearby 3D agents
+→ one-page visualization
+→ meta-action derivation
+→ 108-sample manual audit
+→ label regression freeze
+→ real-data freeze gate
+```
+
+取得的核心结果是图像、3 秒 future trajectory 与 nearby agents 可在 sample level 对齐和可视化；六类 coarse meta-action 已派生，108 个样本覆盖六类 action 并完成人工审核，alignment 为 108/108；label regression 与 real-data freeze gate 均为 108/108。
+
+本阶段冻结了六类 action schema、`label_rule_version=phase-1.6-meta-action-v0.2`、基于 `CAM_FRONT_sample_data` 的时间源、ego-frame 坐标约定和 audit provenance。`safety_rule_version=not_available` 是历史事实；Phase -1 没有完成 safety scorer，也没有训练模型。
+
+## 8. Phase 0.1 / 0.1b 简要回顾
+
+### 8.1 Phase 0.1：audited seed-subset 与统一评测协议
+
+**状态：`completed`。** Phase 0.1 将 frozen labels 转为 `phase0_audited_seed_subset_v1`，建立固定 seed 的 scene-level split、统一六类 action schema、完整 manifest validator、Majority Baseline 与 unified metrics。协议要求 sample-level predictions、macro-F1、per-class F1、confusion matrix、class distribution 和 invalid prediction 可追溯，并验证 scene split 无泄漏。
+
+### 8.2 Phase 0.1b：正式 trainval manifest v1
+
+**状态：`frozen`。** Phase 0.1b 已从 mini smoke 数据扩展到完整 nuScenes trainval，冻结：
+
+- `manifest_schema_version=phase0_trainval_dataset_manifest_v1`；
+- `horizon_sec=3.0`、`sample_interval_sec=0.5`、`time_tolerance_sec=0.075`；
+- `label_rule_version=phase-1.6-meta-action-v0.2`；
+- `split_strategy_version=official_train_scene_label_stratified_v1`、`split_seed=20260710`；
+- official train 的 700 scenes 按 scene-level stratified split 为 project train/validation `560/140`；official validation 的 150 scenes 固定为当时的 project test；
+- 扫描 34,149 samples，纳入 21,646 条：train 14,253、validation 3,594、test 3,799；排除 12,503 条；
+- 正式 manifest、mapping sidecar、内部 mapping 与 scene histogram 均有固定 SHA-256 和 provenance，且不得覆盖。
+
+完整 validator、rare-class constraints、排除原因诊断及 train/validation 视觉审核已通过。Mini 此后只用于 smoke test、快速回归和小规模调试，不用于正式 LoRA/action adapter/DPO 结论。这里的原 project test 后来在 Phase 0.2d 被永久消费，不能继续作为 untouched evaluation source。
+
+## 9. Phase 0.2a—0.2d 简要回顾
+
+### 9.1 Phase 0.2a：current/past-only ego-motion audit
+
+**状态：`completed`。** 输入合同只包含 speed、longitudinal acceleration、yaw rate、availability 与对应 past interval；禁止 future trajectory、derived meta-action 或 test labels 作为 baseline 输入。Train/validation/test 的 `full/partial/unavailable` 分别为 `13476/392/385`、`3401/99/94`、`3594/106/99`。该审计未使用 test label 做统计或调参。
+
+### 9.2 Phase 0.2b：deterministic rule candidate search
+
+**状态：`completed`。** 固定 625-candidate grid 只在 validation 上选择 deterministic rule candidate。入选阈值为：
+
+```text
+stop speed              = 0.2 m/s
+lateral yaw rate        = 0.05 rad/s
+accelerate acceleration = 0.5 m/s²
+decelerate acceleration = 0.3 m/s²
+```
+
+Validation macro-F1 / accuracy 为 `0.615681 / 0.623817`；同协议 Majority Baseline 为 `0.087186 / 0.354201`。这些是参与 candidate selection 的 validation 结果，不是无偏 test 结果。
+
+### 9.3 Phase 0.2c：failure analysis 与 rule freeze
+
+**状态：`frozen`。** `phase0.2-ego-motion-rule-v0.1` 冻结为 `candidate-0293`，validation predictions 复现为 `3594/3594`。主要错误为 `keep → decelerate`（260）和 `decelerate → keep`（181）。Candidate、thresholds、rule version 与 failure analysis 已冻结；不得利用后续 evaluation 反馈修改这一版本。
+
+### 9.4 Phase 0.2d：sealed one-shot evaluation
+
+**状态：`consumed_failed`。** Sealed one-shot formal execution 已且仅已调用一次。Durable execution claim 写入后，执行访问了 test label/motion；随后在正式 test result 持久化前，于 `build_formal_outputs → build_validation_to_test_comparison` 失败。
+
+失败原因是跨模块 artifact schema mismatch：正式 `validation_metrics.json` 使用嵌套 `metrics` 和顶层 `predicted_class_distribution`，consumer 当时却期望顶层扁平 metrics 和 `prediction_class_distribution`。执行 exit code 为 `1`，没有生成可发布的正式 test outputs 或正式 test metrics；rule 与 thresholds 也未按 test 信息修改。
+
+不可逆边界如下：
+
+- execution claim 状态为 `consumed_failed`，`rerun_permitted=false`；
+- 原 project test 已永久消费，禁止重跑、恢复、重算、重新切分、改名复用或以任何方式重新取得结果；
+- 该 split 不得再用于 prompt、threshold、candidate、model、architecture 或 checkpoint 选择；
+- 后续 validation artifact adapter 和 producer-shape regression 已修复，但只适用于未来协议，不授权重跑本次 test；
+- Phase 0.3 及后续阶段只能使用 train/validation 开发与模型选择；
+- 最终无偏评价必须使用新的 external held-out dataset，或新的、从未访问过的 evaluation protocol。
+
+因此 Phase 0.2d 不能写成 test completed，也不能报告任何正式 test performance。
+
+## 10. Phase 0.3 及后续阶段章节骨架
+
+以下章节仅建立完整项目计划的结构。每个阶段的详细步骤、代码/config contract、实验矩阵、Gate 和失败分支将在后续子任务按第 5.2 节模板补充。
+
+### 10.1 Phase 0.3：Qwen3-VL zero-shot / few-shot baseline
+
+- **阶段目标：** 在统一 coarse-action protocol 下建立 image 与获批 ego-state 输入的 Qwen3-VL zero/few-shot baseline。
+- **状态：** `planned`。
+- **前置阶段：** Phase 0.2d 边界已记录；开发仅使用 train/validation。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.2 Phase 0.4：coarse meta-action LoRA / action adapter
+
+- **阶段目标：** 在 frozen trainval contract 上建立 supervised coarse-action VLM。
+- **状态：** `planned`。
+- **前置阶段：** Phase 0.3 baseline 与协议 Gate。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.3 Phase 0.5a：GT-derived geometric safety scorer
+
+- **阶段目标：** 建立以 candidate rollout / predicted trajectory 和 GT geometry 为输入的 oracle offline safety evaluator。
+- **状态：** `planned`。
+- **前置阶段：** Phase 0.4 输出合同稳定。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.4 Phase 0.5b：offline safety reranker
+
+- **阶段目标：** 在固定 candidate set 上验证 safety-aware selection 是否真实降低风险且不依赖 stop inflation。
+- **状态：** `conditional`。
+- **前置阶段：** Phase 0.5a scorer gate 通过。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.5 Phase 0.6：preference pair audit 与 optional DPO
+
+- **阶段目标：** 在 reranker 有效时构建可审计 preference pairs，并条件性评估 coarse-action DPO。
+- **状态：** `conditional`。
+- **前置阶段：** Phase 0.5b 证明风险改善且不过度增加 `stop`。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.6 Phase 0.7：coarse-action MVP freeze 与独立评估
+
+- **阶段目标：** 冻结 coarse MVP 的协议、artifact、诚实结论与新的 untouched independent evaluation。
+- **状态：** `planned`。
+- **前置阶段：** Phase 0.5b 完成；Phase 0.6 可完成或按 Gate 跳过。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.7 Phase 1：temporal single-camera trajectory VLA
+
+- **阶段目标：** 引入 temporal single-camera context 并输出 continuous future waypoints 与多候选轨迹。
+- **状态：** `planned`。
+- **前置阶段：** Phase 0.7 coarse MVP freeze。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.8 Phase 2：multi-camera BEV/OCC-aware VLA
+
+- **阶段目标：** 引入 multi-camera 与 learned BEV/OCC geometry branch，服务于轨迹预测和安全评估。
+- **状态：** `planned`。
+- **前置阶段：** Phase 1 trajectory contract 与 baseline Gate。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.9 Phase 3：map、route 与 hierarchical behavior
+
+- **阶段目标：** 融合 map/route，建立 coarse-to-fine hierarchical behavior 与 trajectory planning。
+- **状态：** `planned`。
+- **前置阶段：** Phase 2 geometry contract 与消融证据。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.10 Phase 4：quasi-closed-loop / closed-loop evaluation
+
+- **阶段目标：** 在可核验 simulator/evaluator 中评估滚动决策、误差累积和交互风险。
+- **状态：** `planned`。
+- **前置阶段：** Phase 3 planning interface 稳定。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.11 Phase 5：robustness、latency、fallback 与 efficiency
+
+- **阶段目标：** 建立扰动鲁棒性、端到端 latency、fallback 和资源效率证据。
+- **状态：** `planned`。
+- **前置阶段：** Phase 4 evaluation loop 可复现。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.12 Phase 6：optional RL 与 world model
+
+- **阶段目标：** 条件性研究 RL 或 world model 是否在既有系统上提供额外收益。
+- **状态：** `stretch`。
+- **前置阶段：** Phase 5 核心项目证据完成；本阶段不阻塞核心完成。
+- **后续补充：** 详细执行规格将在后续子任务补充。
+
+### 10.13 最终实验矩阵、Demo 和 portfolio statement
+
+- **阶段目标：** 汇总跨阶段可复现实验、代表性 Demo、失败边界与只基于本项目证据的 portfolio statement。
+- **状态：** `planned`。
+- **前置阶段：** 对应能力阶段完成并具有代码、配置、artifact 与指标证据。
+- **后续补充：** 详细执行规格将在后续子任务补充。
