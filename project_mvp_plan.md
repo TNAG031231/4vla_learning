@@ -98,12 +98,12 @@ Phase 0.3  Qwen3-VL data interface and rapid visual baseline
 → Phase 0.4 temporal vision + ego state + continuous trajectory VLA core
 → Phase 0.5 BEV/OCC-aware semantic-geometric fusion
 → Phase 0.6 trajectory safety scorer and safety-aware selection
-→ Phase 0.7 quasi-closed-loop evaluation and controller/interface
+→ Phase 0.7 quasi-closed-loop evaluation and planning interface
 → Phase 0.8 reinforcement fine-tuning
 → Final robustness, latency, fallback, Demo and reproducibility evidence
 ```
 
-Phase 0.3 是快速 baseline，不是长期主线终点；Phase 0.4 开始直接建设后续模块共用的最终模型。Phase 0.5—0.8 都扩展 Phase 0.4 的 shared driving representation 和 trajectory interface。RL 是核心阶段；world model 仍是 optional。完整 fine-grained maneuver taxonomy、多候选轨迹、大规模 preference/DPO、完整 future occupancy prediction 和双仿真平台均不阻塞主线。
+Phase 0.3 是快速 baseline，不是长期主线终点；Phase 0.4 开始直接建设后续模块共用的最终模型。Phase 0.5—0.8 都扩展 Phase 0.4 的 shared driving representation 和 trajectory interface。RL 是核心阶段；world model 仍是 optional。完整 fine-grained maneuver taxonomy、learned 多候选轨迹生成、大规模 preference/DPO、完整 future occupancy prediction 和双仿真平台均不阻塞主线。
 
 ### 1.5 非目标
 
@@ -157,7 +157,7 @@ Trajectory VLA 必须同时满足：
 - robustness、latency 与 fallback evidence；
 - 完整 Demo、可复现配置，以及每项能力可定位的代码、artifact 和指标证据。
 
-完整 fine-grained maneuver taxonomy、多候选轨迹生成、大规模 preference/DPO、完整 future occupancy prediction、Bench2Drive 与 NAVSIM 双平台和 world model 均为 optional；实车部署不在本项目范围。RL 不属于 optional；它必须在 quasi-closed-loop reward 与保护边界建立后作为 Phase 0.8 完成并报告。
+完整 fine-grained maneuver taxonomy、learned 多候选轨迹生成、大规模 preference/DPO、完整 future occupancy prediction、Bench2Drive 与 NAVSIM 双平台和 world model 均为 optional；Phase 0.6 从单条 raw trajectory 确定性派生的 safety fallback candidate bank 属于核心 safety contract，不等同于 learned multimodal trajectory generation。实车部署不在本项目范围。RL 不属于 optional；它必须在 quasi-closed-loop reward 与保护边界建立后作为 Phase 0.8 完成并报告。
 
 ## 3. 推理输入、训练 target 和 offline evaluator 的信息边界
 
@@ -361,8 +361,8 @@ contract / regression tests
 | Phase 0.3 | Qwen3-VL 数据接口与快速视觉 baseline | `planned` | 可复用 VLM 接入层与视觉 baseline |
 | Phase 0.4 | 时序视觉 + ego state + continuous trajectory | `planned` | 最终 VLA 核心模型骨架 |
 | Phase 0.5 | BEV/OCC-aware semantic-geometric fusion | `planned` | multi-camera/calibration adapter、current occupancy、融合与 trajectory ablation |
-| Phase 0.6 | trajectory safety scorer 与 safety-aware selection | `planned` | 显式安全评价与轨迹选择 |
-| Phase 0.7 | quasi-closed-loop evaluation 与 controller/interface | `planned` | 累计规划表现与环境接口证据 |
+| Phase 0.6 | trajectory safety scorer 与 safety-aware selection | `planned` | deterministic candidate bank、oracle/deployable scorer 与可审计 selector |
+| Phase 0.7 | quasi-closed-loop evaluation 与 planning interface | `planned` | 平台兼容性结论、rollout/reward contract 与累计规划证据 |
 | Phase 0.8 | reinforcement fine-tuning | `planned` | 基于准闭环 reward 的最终策略优化 |
 | Final | robustness、latency、fallback、Demo 与复现 | `planned` | 完整工程与展示证据闭环 |
 
@@ -787,7 +787,7 @@ shared driving representation
         └── continuous waypoint head
 ```
 
-Phase 0.5 在 shared fusion 前或内部接入 BEV/OCC geometry tokens；Phase 0.6 消费 trajectory output；Phase 0.7 通过稳定 inference/controller interface 调用模型；Phase 0.8 在同一 policy/model 上执行 reinforcement fine-tuning。不得为这些阶段分别重建不兼容的 backbone 或 trajectory schema。
+Phase 0.5 在 shared fusion 前或内部接入 BEV/OCC geometry tokens；Phase 0.6 消费 trajectory output；Phase 0.7 通过稳定 inference/planning interface 调用模型；Phase 0.8 在同一 policy/model 上执行 reinforcement fine-tuning。不得为这些阶段分别重建不兼容的 backbone 或 trajectory schema。
 
 #### 10.2.3 输入、target 与张量合同
 
@@ -1117,7 +1117,7 @@ large-scale from-scratch BEVFormer reproduction
 SurroundOcc-scale 3D occupancy
 map / route conditioning
 fine-grained maneuver taxonomy
-multi-candidate trajectory generation
+learned multi-candidate trajectory generation
 closed-loop simulation
 reinforcement learning
 world model
@@ -1673,17 +1673,551 @@ Demo 至少显示六相机缩略图、current GT occupancy（明确为 training/
 
 ### 10.4 Phase 0.6：trajectory safety scorer 与 safety-aware selection
 
-- **阶段目标：** 对 Phase 0.4/0.5 predicted trajectory 建立显式 safety scoring 与可审计 selection，在规划质量与风险之间验证增益。
-- **状态：** `planned`。
-- **前置阶段：** Phase 0.5 geometry interface 通过 Gate，且 inference input 与 oracle offline evaluator 边界已冻结。
-- **后续补充：** 详细执行规格将在后续子任务补充；DPO 保持 optional，不在本轮展开。
+> Phase 0.6 不是另起一个 safety model 项目，而是在 Phase 0.4/0.5 同一 VLA policy 的真实预测轨迹之后增加确定性候选、双 scorer 与可审计 selector：oracle scorer 只用于离线校准和上界，deployable scorer 才代表可部署信息边界。
 
-### 10.5 Phase 0.7：quasi-closed-loop evaluation 与 controller/interface
+#### 10.4.1 阶段状态、目的、前置条件与主链路
 
-- **阶段目标：** 将同一 VLA policy 接入可复现的 controller/environment interface，评估滚动规划与累计误差。
-- **状态：** `planned`。
-- **前置阶段：** Phase 0.6 trajectory/safety output contract 稳定。
-- **后续补充：** 详细执行规格将在后续子任务补充；本轮不选择或实现仿真平台。
+- **阶段状态：** `planned`。
+- **阶段目的：** 对 Phase 0.4/0.5 生成的 raw trajectory 及其确定性 fallback candidates 分解风险、进度、舒适性和 policy deviation，在不改写候选轨迹的前提下选择一条输出，并验证风险下降是否以过度停车或明显进度损失为代价。
+- **前置条件：** Phase 0.4 trajectory coordinate/time/mask contract 已冻结；Phase 0.5 predicted occupancy probabilities、BEV grid metadata、threshold/config 与 model/checkpoint provenance 已通过 Gate；oracle 与 deployable 信息边界已冻结。
+- **后续消费者：** Phase 0.7 必须调用同一 policy、candidate generator、deployable scorer 和 selector；Phase 0.8 在 Phase 0.7 冻结的 rollout/reward contract 上 fine-tune 同一 policy，不重建另一套 safety pipeline。
+
+完整顺序固定为：
+
+```text
+Phase 0.4 / 0.5 policy raw trajectory
+→ Phase 0.6 raw + deterministic fallback candidate bank
+→ oracle offline scorer calibration and deployable predicted-geometry scoring
+→ deterministic safety-aware selection
+→ Phase 0.7 same policy + same selector quasi-closed-loop rollout
+→ Phase 0.8 same policy reinforcement fine-tuning
+```
+
+本阶段不训练新的端到端 safety model，不生成 learned multimodal trajectories，不把 GT future geometry 送入在线选择，不实现 controller/simulator，也不展开 DPO 或 RL。DPO 继续为 optional；核心交付是可审计的 trajectory-level safety layer。
+
+#### 10.4.2 Candidate bank 与张量合同
+
+每个 raw trajectory 至少确定性派生以下候选类型：
+
+```text
+raw policy trajectory
+mild speed reduction
+strong speed reduction
+controlled braking
+stationary / emergency fallback
+```
+
+候选数量、速度缩放比例、制动 profile、stationary 判定和 emergency margin 必须进入版本化配置，不在计划中硬编码最终数值。候选生成器只能使用 raw trajectory、其 valid mask、current ego state 和已冻结的 kinematic config；不得读取 GT future trajectory、GT future agents、oracle score 或 test feedback。所有候选必须保持 raw trajectory 的 current ego frame、单位、horizon 和 waypoint sampling contract。
+
+批量接口为：
+
+```text
+candidate_trajectories: [B, M, K, 2]
+candidate_valid_masks:  [B, M, K]
+candidate_types:        [B, M]
+candidate_metadata:     [B, M]
+selected_index:         [B]
+selected_trajectory:    [B, K, 2]
+selected_valid_mask:    [B, K]
+```
+
+- `M` 是配置决定的固定 candidate bank 大小，必须包含 raw candidate 和至少一种可停止 fallback；
+- `candidate_metadata` 至少记录 source raw prediction、生成参数、fallback severity、generator version 与 rejection reason；
+- 候选顺序固定并版本化，`selected_index` 必须能唯一回溯到 candidate type 和全部 component score；
+- selector 只能选择候选，不能在 scoring 后再次平滑、裁剪、插值或修改轨迹；任何轨迹变换都必须发生在 candidate generation 阶段并留下 provenance。
+
+#### 10.4.3 Kinematic validation 与 invalid candidate policy
+
+每条候选在评分前必须验证：
+
+- waypoint、导出速度、加速度、jerk 与 curvature 均为 finite；
+- timestamp、sampling interval、horizon 和 valid mask 一致；
+- 速度、加速度、jerk、curvature、lateral acceleration 与 reverse motion 满足版本化 feasibility bounds；
+- 有效点数量足以计算所需项，invalid tail 不得作为零坐标参与评分；
+- raw trajectory 与派生候选均没有坐标系、轴方向或单位漂移。
+
+Invalid candidate 必须被拒绝或赋予确定性高代价，并保存具体原因；不得 clamp、修正或推断非法值。若 raw candidate invalid，selector 只能从通过验证的 fallback 中选择；若所有候选 invalid，必须返回显式 failure/fallback state，不能伪造正常 selected trajectory。
+
+#### 10.4.4 Ego footprint 与几何冲突语义
+
+风险计算必须使用沿候选轨迹 rollout 的 oriented ego footprint，而不是把 waypoint 当作无面积的点。Footprint contract 至少记录 vehicle length/width、reference point、front/rear offset、safety margin、heading derivation、orientation convention 与 footprint version。若 waypoint 不直接提供 heading，必须采用单一、经 synthetic test 验证的导出策略，并对低速或重复点定义稳定行为。
+
+车辆与 VRU 使用独立 margin；VRU margin 可以更保守，但必须由 validation 与安全审计选择并版本化。Oriented overlap、clearance 和 near-miss 都必须尊重同一 BEV axis、cell boundary 和时间对齐合同。没有 map/route contract 时，不得凭空报告 off-road、lane 或 traffic-rule violation。
+
+#### 10.4.5 Oracle temporal-geometry scorer
+
+Oracle scorer 是 offline evaluator 和校准上界，只允许使用 validation 上的 GT current/future boxes 或由其构建的 temporal occupancy；它不属于模型 inference path，也不能写成 camera-only 安全能力。建议的 temporal geometry 形状为：
+
+```text
+oracle_temporal_geometry: [B, T_score, C, H_bev, W_bev]
+```
+
+Oracle contract 必须版本化：score horizon、time interval/tolerance、vehicle/VRU class mapping、box interpolation 或 nearest-time policy、missing-frame policy、BEV grid/raster config、unknown/ignored semantics 与 source provenance。时间不满足 tolerance、future annotation 缺失或 transform 不可靠时必须标为 unavailable，不能用当前 box 静态复制冒充真实 future geometry。
+
+Oracle risk decomposition 至少包括：
+
+```text
+vehicle collision / overlap
+VRU collision / overlap
+vehicle minimum clearance
+VRU minimum clearance
+near-miss indicator / severity
+time-to-collision or time-to-conflict
+```
+
+Collision、clearance、near-miss 与 TTC 的阈值、聚合和 invalid behavior 只由 train/validation synthetic/real audit 确认。Oracle selected result 只能作为 upper-bound reference，不得进入 deployable result 或 Phase 0.7 online selection。
+
+#### 10.4.6 Deployable predicted-geometry scorer
+
+Deployable scorer 的输入严格限制为：
+
+```text
+current predicted occupancy probabilities
+BEV grid metadata
+candidate trajectories and masks
+current ego state
+ego footprint contract
+```
+
+它不读取 GT boxes、GT occupancy、future agents、future occupancy、future ego trajectory 或 test labels。由于 Phase 0.5 核心只预测 current occupancy，本阶段不得将其描述为未来 occupancy prediction；正式做法是在候选时间轴上采用版本化、保守且随时间增长的 uncertainty inflation / occupancy dilation，表达感知与运动未知性，而不是伪造未来对象轨迹。
+
+Predicted occupancy 的概率必须保留，不能先硬阈值化后丢失概率信息。Deployable risk 至少包括沿 oriented footprint 的 integrated occupancy probability、maximum footprint risk、predicted clearance、time-weighted risk、VRU-weighted risk 与 inflation 后 conflict indicator。Occupancy threshold 可以服务离散审计指标，但 total cost 应保留概率风险项；dilation radius、time weighting、VRU weighting 与 aggregation 全部只用 validation 选择并进入 scorer version。
+
+如果 Phase 0.5 predicted occupancy artifact 缺失、字段/版本不符、概率非法或 BEV metadata 不匹配，deployable selection 必须 fail closed；允许独立完成 oracle scorer 开发和审计，但不得以 GT geometry 替代 deployable input 后继续宣称在线 selector 可用。
+
+#### 10.4.7 Oracle 与 deployable scorer 校准
+
+同一 validation candidate bank 上必须比较：
+
+```text
+candidate rank agreement
+unsafe-candidate recall
+safe-candidate precision
+vehicle-conflict recall
+VRU-conflict recall
+false-alarm rate
+final selection agreement
+```
+
+校准优先保证 unsafe recall，尤其是 VRU conflict recall，同时显式报告 false alarm、过度保守和 rank disagreement。不得只报告平均相关性，也不得用 oracle-selected trajectory 代替 predicted-selected trajectory 形成项目最终结论。阈值、权重和 inflation policy 只能在 validation 上冻结；新的 untouched evaluation protocol 需另行建立后才能用于最终泛化结论。
+
+#### 10.4.8 Risk、comfort、progress、deviation 与 fallback cost
+
+每条候选保存以下独立 component，不得只持久化 total score：
+
+```text
+J_risk
+J_comfort
+J_progress
+J_policy_deviation
+J_fallback_severity
+```
+
+- `J_risk`：由 oracle 或 deployable backend 产生的 collision、VRU、clearance、near-miss、TTC 与 occupancy probability 风险分解；
+- `J_comfort`：速度、加速度、jerk、curvature 与 lateral acceleration 的平滑性/边界代价；
+- `J_progress`：terminal progress、path progress、低速和 stopped duration，防止总是停车获得伪安全；
+- `J_policy_deviation`：候选相对 raw policy 的 waypoint、terminal position、heading 与 progress reduction；
+- `J_fallback_severity`：对 mild reduction、strong reduction、controlled braking 与 emergency/stationary 的有序惩罚。
+
+`unnecessary_stop` 必须定义为：selector 选择最终导致停车的 controlled-braking、stationary 或 emergency fallback，但同一样本的 raw candidate 在 oracle temporal geometry 下没有超过冻结冲突阈值。具体停车速度、持续时间和冲突阈值只用 validation 冻结。该指标仅用于 validation/offline audit；它不要求推断 reason 与 action 的对应关系，也不得在 deployable inference 时读取 oracle。若 oracle geometry unavailable，该样本的 `unnecessary_stop` 必须标为 unavailable，不能推断为 false。
+
+#### 10.4.9 Total cost 与确定性 selection
+
+正式选择目标为：
+
+```text
+J_total = w_risk      * J_risk
+        + w_comfort   * J_comfort
+        + w_progress  * J_progress
+        + w_deviation * J_policy_deviation
+        + w_fallback  * J_fallback_severity
+```
+
+权重、component normalization、阈值和 backend version 只用 train-derived statistics 与 validation 选择；不得根据 test 或未来正式 evaluation 调整。Selector 取有限候选中的最小可行 `J_total`，使用冻结的 deterministic tie-break order；risk/feasibility 优先级、浮点 tolerance 与完全相同分数时的候选顺序必须进入 selector version。
+
+输出至少包括 selected index/trajectory/mask、candidate types、所有 component/total scores、oracle/deployable backend 标识、selection reason、fallback state、invalid/rejected candidates、scorer/selector/candidate-generator version 和完整 provenance。`selection reason` 必须来自有限、版本化 reason taxonomy，不能由自由文本覆盖真实分项。
+
+#### 10.4.10 详细子阶段
+
+##### Phase 0.6a：contract 与 synthetic geometry
+
+冻结 candidate、mask、footprint、score decomposition、selector output 与 version contract；用直行、横向、制动、静止、旋转 box、VRU、边界相切、空场景、invalid candidate 等人工案例验证几何和确定性。
+
+##### Phase 0.6b：oracle temporal geometry
+
+建立 GT boxes → temporal geometry producer，核对时间、坐标、类别、插值/缺帧与 BEV grid，完成真实 train/validation 可视化和人工审核；oracle artifact 与 inference artifact 必须物理和语义分离。
+
+##### Phase 0.6c：oracle scorer baseline
+
+在固定 candidate bank 上完成 oracle risk decomposition、raw-vs-fallback 比较、threshold audit 与 oracle-selected upper bound，报告 collision、near-miss、VRU、clearance、TTC、progress、comfort 与 unnecessary-stop。
+
+##### Phase 0.6d：deployable scorer
+
+接入 Phase 0.5 current predicted occupancy probabilities，冻结 uncertainty inflation 与概率风险聚合；比较 oracle/deployable rank、unsafe recall、false alarm 与 selection agreement。
+
+##### Phase 0.6e：safety-aware selector
+
+加入 progress、comfort、policy deviation 与 fallback severity，冻结 normalization、weights、tie-break 和 invalid policy；完成同输入重复运行一致性与 sample-level selection reason 审核。
+
+##### Phase 0.6f：消融、failure analysis 与接口冻结
+
+至少比较：
+
+```text
+Phase 0.4 raw trajectory
+Phase 0.5 raw fused trajectory
+oracle-selected candidates (upper bound only)
+deployable predicted-geometry selected candidates
+risk-only selection
+risk + progress selection
+risk + progress + comfort + policy-deviation selection
+```
+
+每项消融共享相同 candidate bank、footprint、validation samples 和 metric protocol。最终冻结供 Phase 0.7 使用的 raw trajectory、candidate bank、selected trajectory、fallback state、risk decomposition、candidate-generator version、deployable scorer version 与 selector version。
+
+#### 10.4.11 指标、分组与 baseline
+
+Planning quality 继续报告 ADE、FDE、per-horizon error、valid rate、terminal progress 与 action-trajectory consistency。Oracle safety 至少报告 collision/near-miss、vehicle/VRU violation、minimum clearance、TTC 和 oracle unsafe rate。Deployable scorer 至少报告 unsafe recall、safe precision、vehicle/VRU recall、false alarm、rank/selection agreement 与 calibration by risk bin。
+
+Selector behavior 至少报告 risk reduction、selected candidate distribution、raw retention rate、fallback rate/severity、unnecessary-stop rate、progress loss、comfort/jerk、policy deviation、invalid/rejected rate 和 reason distribution。所有指标必须按 VRU presence、nearby-agent density、speed range、coarse action、occupancy quality 与 raw/fallback candidate type 分组；安全提升若主要来自 stationary/emergency 增加，必须明确判为失败模式。
+
+#### 10.4.12 自动测试、真实数据 smoke 与人工审核
+
+自动测试至少覆盖：candidate shape/order/version、速度缩放与制动终点、mask 传播、finite/kinematic validation、oriented footprint、vehicle/VRU overlap、clearance、TTC、时间对齐、probability-preserving risk、uncertainty inflation、component normalization、deterministic tie-break、invalid/all-invalid behavior、selector 不修改候选、GT 信息隔离和 test guard。
+
+真实数据 smoke 只使用 train/validation，必须走通：
+
+```text
+Phase 0.4 / 0.5 prediction artifact
+→ contract validation
+→ deterministic candidate bank
+→ oracle and deployable scoring
+→ safety-aware selection
+→ component metrics and sample-level persistence
+```
+
+人工审核至少覆盖 raw safe/raw unsafe、车辆/VRU conflict、near miss、低速拥堵、横向运动、急刹、stationary fallback、predicted/oracle disagreement、false alarm、unnecessary stop 与 all-invalid failure。可视化必须区分 raw/selected trajectory、GT oracle geometry 与 predicted occupancy，不能把 oracle 图层画成在线输入。
+
+#### 10.4.13 Gate、失败分支与停止条件
+
+Phase 0.6 通过条件：
+
+- candidate/footprint/time/coordinate contract 通过 synthetic、real-data smoke 和人工审核；
+- oracle scorer 对人工构造冲突与真实抽检表现正确；
+- deployable scorer 在 validation 达到冻结的 unsafe/VRU recall Gate，且 false alarm 有明确上限；
+- predicted-selected trajectory 相对 Phase 0.5 raw trajectory 降低风险，同时没有超过 Gate 的 unnecessary stop、progress loss、comfort degradation 或 invalid rate；
+- selector 确定性、可复现，且每次选择都能回溯到 component scores、reason 与版本；
+- inference path 不读取 GT geometry、future agents、future occupancy 或 test；
+- Phase 0.7 handoff contract 已冻结。
+
+失败分支：
+
+- **Candidate/kinematic contract 错误：** 停止 scoring，先修复坐标、时间、mask、footprint 或 feasibility。
+- **Oracle scorer 错误：** 停止 deployable calibration，先修复 temporal geometry、class mapping 与 synthetic cases。
+- **Predicted occupancy 无效或缺失：** 阻塞 deployable selector；oracle audit 可以继续，但不能用 GT 替代在线输入。
+- **Unsafe recall 不足：** 回到 Phase 0.5 occupancy quality、inflation 或 scorer calibration；不得降低安全 Gate 以换取通过。
+- **风险下降依赖过度停车：** 调整 validation-only progress/deviation/fallback cost，重新报告全量 trade-off；若仍失败，保留 raw policy 并阻塞 Phase 0.7 selected rollout。
+- **Comfort/feasibility 退化：** 修复 candidate generator 或 selector weights；不得让 scorer 在选择后修改轨迹。
+
+本阶段不访问或恢复 Phase 0.2d consumed test；任何未来不可逆 evaluation 必须另建 untouched protocol、shadow execution、durable claim 和 rerun guard。
+
+#### 10.4.14 阶段学习目标、Demo 与面试证据
+
+本阶段可证明：trajectory rollout geometry、oriented footprint collision checking、oracle/deployable information boundary、probabilistic occupancy risk、deterministic fallback generation、多目标 selection、calibration、safety-progress-comfort trade-off、failure analysis 与可追溯 artifact 设计。
+
+阶段 Demo：
+
+```text
+raw VLA trajectory
+→ deterministic candidate bank
+→ predicted occupancy risk heatmap
+→ per-candidate risk / progress / comfort / deviation
+→ selected trajectory and fallback reason
+→ oracle overlay for offline audit only
+```
+
+Demo 必须同时展示 raw 与 selected trajectory、候选类型、component scores、predicted/oracle disagreement 和 unnecessary-stop 案例，不得只展示成功样本或把 oracle-selected upper bound 当成 deployable 结果。
+
+### 10.5 Phase 0.7：quasi-closed-loop evaluation 与 planning interface
+
+> 本阶段不声称真实 closed-loop 或完全 reactive simulation；它将 Phase 0.4—0.6 的同一 policy 与 selector 放入可复现的 quasi-closed-loop protocol，观察滚动执行、累计误差、安全、fallback 和进度，并冻结 Phase 0.8 可直接消费的 environment/reward/baseline/rollback contract。
+
+#### 10.5.1 阶段状态、目的、边界与核心流程
+
+- **阶段状态：** `planned`。
+- **阶段目的：** 将同一 VLA policy、Phase 0.5 perception/geometry 输出和 Phase 0.6 deployable selector 接入一个版本化环境与 planning adapter，比较 raw policy 和 safety-selected policy 在相同 scenarios 下的滚动表现。
+- **前置条件：** Phase 0.6 candidate、deployable scorer、selector、fallback 和 output contract 通过 Gate；Phase 0.4/0.5 model checkpoint 与 inference interface 已冻结。
+- **核心边界：** 本阶段不把 logged replay 写成 fully reactive closed loop，不要求实现低层车辆控制，不同时建设两个平台，不使用 GT future geometry 驱动在线 selector，也不展开 Phase 0.8 的 RL 算法。
+
+核心流程为：
+
+```text
+environment observation
+→ sensor / dataset adapter
+→ Phase 0.5 VLA policy
+→ raw trajectory
+→ Phase 0.6 candidate bank + deployable scorer + selector
+→ selected trajectory
+→ planning interface
+→ rollout state + reward components + metrics
+→ next observation
+```
+
+Raw rollout 与 selected rollout 必须使用相同 model checkpoint、observation history、scenario、initial state、step budget、timeout 和 environment version；唯一允许的差异是 Phase 0.6 selection 是否启用。
+
+#### 10.5.2 平台选择、compatibility spike 与唯一 fallback
+
+主平台优先级为 **NAVSIM-compatible quasi-closed-loop protocol**，但必须先完成有限 compatibility spike，不能因名称相近而预设兼容。Spike 必须检查：
+
+```text
+license and data access
+camera set and temporal history
+ego-state fields
+trajectory coordinate frame
+horizon and sampling interval
+map / route availability
+metric and submission API
+runtime and hardware requirements
+official split semantics
+reproducible scenario reset
+```
+
+结论只能是 `compatible`、`compatible_with_adapter` 或 `blocked`。若 NAVSIM-compatible 路径满足许可证、数据、sensor、trajectory、metric API 和资源 Gate，则冻结它为唯一主平台；若被阻塞，则冻结 **controlled logged-replay quasi-closed-loop** 为唯一 fallback。Fallback 必须使用独立名称、版本与限制说明，不能称为 NAVSIM，也不能声称环境会对 ego action 做完全 reactive response。
+
+同一轮只允许选择一个主 protocol。Bench2Drive/CARLA 作为 optional second platform，不是本阶段 Gate；若未来接入，必须独立记录 simulator、map、controller 与 scenario version，不能与主平台结果混算。
+
+#### 10.5.3 Cross-domain dataset 与 adaptation contract
+
+若主平台不是 nuScenes domain，必须把 source-domain 与 platform-domain 数据明确分离：
+
+```text
+source train / source validation
+platform train / platform dev
+platform official test (sealed or unavailable until separately authorized)
+```
+
+不得复用含义不同的 `train/validation/test` 名称假装同一 split，也不得用 platform dev 结果回写 nuScenes split。Adapter artifact 至少记录 source/platform dataset version、scene/scenario IDs、split mapping、sensor availability、camera order、history policy、ego-state mapping、trajectory transform、coordinate/time contract 与 provenance。
+
+跨域仍使用同一 Phase 0.4/0.5 model architecture。Sensor adapter 负责缺失/额外相机、图像预处理、timestamps 与 history mask；trajectory adapter 负责 source/target frame、axis、unit、horizon 和 sampling interval。Normalization statistics 只从 platform train 计算，platform dev 只用于选择 adapter/checkpoint；official test 在单独 sealed protocol 前继续禁止。
+
+若 zero-transfer 明显失败，可以在 platform train 上进行可选的 supervised LoRA、adapter 或 trajectory-head adaptation，再用 platform dev 选择 checkpoint。必须同时保存 source checkpoint、adapted checkpoint、训练数据版本和 domain-drop evidence；不得把 adaptation 结果描述为原 nuScenes model 的直接泛化能力。
+
+#### 10.5.4 Planning interface
+
+核心 planning interface 只消费本次实验启用的 trajectory 与 valid mask（raw baseline 或 Phase 0.6 selected trajectory），并输出平台要求的 trajectory/planning representation；两者必须经过同一个 adapter。它负责：
+
+- source → target coordinate transform 与 axis/unit conversion；
+- horizon 检查、时间重采样和 interpolation policy；
+- valid mask、minimum valid horizon 与 invalid fallback；
+- speed/acceleration/jerk/curvature feasibility validation；
+- 平台 submission/rollout schema serialization；
+- source/target frame、time interval、interpolation、heading/velocity derivation、validity rule 与 adapter version 的持久化。
+
+若平台原生接受 trajectory，本阶段不实现核心 PID/MPC 或 steering/throttle controller。PID/MPC 只在未来 CARLA/Bench2Drive 等要求低层控制的平台作为 optional adapter，并须独立测试；不得让 controller 误差污染当前 trajectory-policy 结论。
+
+#### 10.5.5 Rollout contract 与可复现协议
+
+每个 rollout 至少保存：
+
+```text
+environment and dataset version
+scenario / route identifier
+initial state and random seed
+observation and history references
+raw trajectory and mask
+candidate bank and selected trajectory
+fallback / invalid state
+planning-adapter output
+next state / observation reference
+per-step reward components
+per-step and episode metrics
+termination / timeout / failure reason
+model, scorer, selector and adapter provenance
+```
+
+正式 protocol 必须冻结 rollout horizon、planning frequency、observation history、random seed policy、scenario subset、episode step limit、timeout、failure handling、reset semantics 和 metric version。Raw/selected/baseline 方法使用相同 scenarios、初始状态、seeds、timeouts、retries 与 failure accounting；不得只对失败方法重跑或过滤失败 episode。
+
+Logged-replay fallback 必须明确哪些 observation 来自固定日志、ego rollout 如何传播、其他 agents 是否不响应以及何时因偏离日志支持域而终止。它只能证明受控 quasi-closed-loop 下的累计行为，不代表 fully reactive traffic interaction。
+
+#### 10.5.6 必做 baseline 与公平对照
+
+至少比较：
+
+| Baseline | 作用 |
+|---|---|
+| stop / constant-position | 检查安全或 reward 是否偏好不动 |
+| constant-velocity | 检查环境、坐标与 progress metric 是否合理 |
+| Phase 0.4 raw policy | 时序语义 trajectory core 对照 |
+| Phase 0.5 raw policy | semantic-geometric fusion 对照 |
+| Phase 0.5 raw without selector | 隔离 Phase 0.6 selection 增益 |
+| Phase 0.6 deployable-selected policy | 主 safety-aware rollout |
+
+若存在 platform-domain supervised adaptation，raw 与 selected 对照必须共享同一 adapted checkpoint；source-only 与 adapted checkpoint 另作 cross-domain 消融，不能混入 selector 消融。
+
+#### 10.5.7 Quasi-closed-loop 指标与报告
+
+指标至少包括：
+
+```text
+route / longitudinal progress
+time-to-collision or time-to-conflict
+collision and near-collision
+VRU conflict
+drivable-area / route adherence (only when map contract exists)
+speed, acceleration, jerk and lateral acceleration
+kinematic feasibility
+planning frequency / latency / throughput
+fallback and emergency-stop rate
+invalid prediction / adapter failure rate
+timeout and early-termination rate
+scenario success rate
+```
+
+ADE/FDE 继续作为 trajectory diagnostic，但不能作为唯一 planning metric。每项指标至少报告 mean、median、tail/quantile、scenario category 与 failure-reason breakdown；collision、drivable-area、route 或 success 等指标只有在平台 contract 和实现经过审核后才能报告。任何安全结论必须同时报告 progress、comfort、fallback 和 timeout，不能用静止或提前终止换取表面安全。
+
+#### 10.5.8 Reward decomposition 与 metric separation
+
+Phase 0.7 reward 只用于准闭环分析并为 Phase 0.8 冻结接口，基础分解为：
+
+```text
+R_total = R_progress
+        + R_safety
+        + R_comfort
+        + R_route
+        + R_invalid
+        + R_fallback
+```
+
+- `R_progress`：有效前进、route completion 或平台正式 progress；
+- `R_safety`：collision、near-conflict、TTC/clearance 与 VRU 风险；
+- `R_comfort`：速度、加速度、jerk、curvature/lateral acceleration；
+- `R_route`：仅在可靠 map/route contract 存在时使用；
+- `R_invalid`：invalid prediction、planning adapter failure、out-of-support 和 timeout；
+- `R_fallback`：fallback severity、repeated fallback 与 emergency/stationary 使用。
+
+所有原始 component、归一化值、权重与 total reward 必须逐 step 保存。Reward scale、clip/normalization、discount、aggregation 与 terminal reward 只用 platform train/dev 审核和冻结；official metrics 必须与自定义 reward 分开保存和报告，不能用调过的 reward 取代平台原始指标。
+
+#### 10.5.9 Reward-hacking 与退化行为审计
+
+必须主动检查：
+
+- always stop 或长期低速换取低风险；
+- 主动触发 early termination 缩短风险暴露；
+- 重复 fallback/emergency 避免正常规划；
+- 偏离 route 或驶出日志支持域逃避冲突；
+- 产生 invalid prediction 触发过于宽松的 safe default；
+- 利用 timeout、reset、missing metric 或 reward clipping 漏洞。
+
+每种模式必须有检测指标、sample/episode-level 证据、稳定 failure label，以及修正后的 reward/Gate 或明确阻塞结论。修正 reward 时必须提升 reward version，并在同一 baseline matrix 上重跑 train/dev；不得删除原始失败结果。Always-stop baseline 若接近或超过主模型 total reward，reward contract 直接判定失败。
+
+#### 10.5.10 详细子阶段
+
+##### Phase 0.7a：platform compatibility 与 protocol selection
+
+完成 NAVSIM-compatible spike，输出逐项 `compatible/with_adapter/blocked` 结论；只冻结 NAVSIM-compatible 主路径或 controlled logged-replay fallback 之一，以及 environment/dataset/scenario/metric version。
+
+##### Phase 0.7b：dataset、sensor 与 cross-domain adapter
+
+建立 sensor/history/ego-state/split contract；若跨域，先做 zero-transfer，再按 Gate 决定是否进行 platform-train supervised adaptation，完整保存 source/adapted provenance 与 domain-drop。
+
+##### Phase 0.7c：planning interface
+
+完成 trajectory coordinate/time/resampling/validity/feasibility adapter、invalid fallback 与 deterministic serialization；用 synthetic trajectory 和平台最小 fixture 验证 round-trip。
+
+##### Phase 0.7d：raw-policy rollout baseline
+
+在固定 scenarios 上运行 stop、constant-velocity、Phase 0.4 raw 与 Phase 0.5 raw，冻结 episode execution、failure accounting、metrics、latency 和 artifact persistence。
+
+##### Phase 0.7e：selected-policy rollout
+
+接入 Phase 0.6 candidate/scorer/selector，使用与 raw rollout 完全相同的 scenarios、seeds、timeouts 和 checkpoint，比较累计风险、progress、comfort、fallback 与 invalid behavior。
+
+##### Phase 0.7f：reward、failure 与 hacking audit
+
+审计 component scale、always-stop/slow/early-termination/repeated-fallback 等退化行为；冻结 reward version、weights、termination、failure taxonomy 和 rollback threshold。
+
+##### Phase 0.7g：Phase 0.8 readiness 与接口冻结
+
+冻结 environment、dataset/sensor、planning adapter、rollout、scenario suite、reward、supervised-fine-tuning（SFT）baseline、selector baseline、rollback 和 metric contracts；生成不访问 sealed official test 的 readiness receipt。Phase 0.8 未通过该 receipt 不得开始。
+
+#### 10.5.11 自动测试、integration smoke 与人工审核
+
+自动测试至少覆盖：sensor/history mapping、source/target coordinates、resampling、mask、heading/velocity derivation、invalid fallback、environment reset、seed determinism、episode timeout、termination/failure reason、raw-vs-selected fairness、reward components/aggregation、always-stop penalty、repeated fallback、artifact serialization、GT inference isolation 与 official-test guard。
+
+Integration smoke 只使用允许的 platform train/dev 或 controlled replay scenarios，必须走通：
+
+```text
+observation
+→ sensor adapter
+→ same VLA policy
+→ raw / selected trajectory
+→ planning adapter
+→ rollout transition
+→ reward components + metrics
+→ next observation / termination
+→ episode artifact persistence
+```
+
+人工审核至少覆盖坐标/重采样、累计 drift、raw/selected divergence、vehicle/VRU conflict、进度不足、comfort 退化、fallback chain、invalid prediction、timeout、early termination、route deviation（若可用）与 domain-shift failure。审核界面必须区分模型输入、平台 observation、offline GT/metric 信息和 reward-only signals。
+
+#### 10.5.12 Gate、失败分支与 rollback
+
+Phase 0.7 通过条件：
+
+- 唯一主 platform/protocol 已通过兼容性、许可证、资源和 split audit；
+- sensor/dataset/planning/rollout contract 通过自动测试与人工审核；
+- raw 与 selected rollout 在同一 scenarios、seeds、timeouts 和 checkpoint 上可复现；
+- Phase 0.6 selected policy 相对 Phase 0.5 raw baseline 改善冻结的 safety metrics，且没有超过 Gate 的 progress、comfort、fallback、invalid 或 timeout 退化；
+- reward component scale 合理，always-stop、长期低速、early termination 和 repeated fallback 均不能获得虚假优势；
+- failure taxonomy、rollback threshold 与 baseline artifacts 完整；
+- official test 未被访问，Phase 0.8 readiness receipt 通过。
+
+失败分支与 rollback：
+
+- **NAVSIM compatibility blocked：** 冻结 controlled logged-replay fallback，诚实限制结论，不同时启动第二主平台。
+- **Cross-domain collapse：** 保留 source-only 负结果；只在 platform train 做受控 supervised adaptation，若 dev 仍失败则阻塞正式 rollout。
+- **Planning adapter 错误：** 停止环境比较，先修复坐标、时间、resampling、mask 与 feasibility。
+- **Selector 累计退化：** 回滚到冻结的 Phase 0.5 raw policy baseline，保留 Phase 0.6 offline evidence，不以新权重覆盖失败 artifact。
+- **Reward hacking：** 判定 reward contract 失败，提升版本并重跑全部 baseline 后再评估 Gate。
+- **环境不稳定或不可复现：** 阻塞 Phase 0.8，不以更多 seeds 掩盖 protocol bug。
+
+#### 10.5.13 Phase 0.8 handoff contract
+
+Phase 0.7 必须为 Phase 0.8 冻结：
+
+```text
+environment / platform version
+dataset and sensor-adapter version
+planning-interface version
+rollout horizon, frequency and reset semantics
+scenario suite and seed policy
+reward definition, component weights and normalization
+termination, timeout and failure taxonomy
+fallback and invalid-action policy
+supervised VLA checkpoint / baseline
+Phase 0.6 selector checkpoint/config baseline
+rollback checkpoint and thresholds
+offline and quasi-closed-loop metric protocol
+readiness receipt and provenance
+```
+
+任何 reward、termination、fallback、scenario 或 metric 变化都必须提升对应版本，并在同一 train/dev baseline matrix 上重新验证。Phase 0.8 只能消费这一稳定 contract；本节不预先选择 policy-gradient、actor-critic、offline RL 或其他算法，也不把 planned RL 指标写成事实。
+
+#### 10.5.14 阶段学习目标、Demo 与面试证据
+
+本阶段可证明：simulation/platform compatibility analysis、cross-domain sensor adaptation、trajectory planning interface、reproducible rollout protocol、baseline fairness、reward engineering、reward-hacking audit、fallback/rollback 和从 supervised VLA 到 RL 的稳定接口设计。
+
+阶段 Demo：
+
+```text
+same scenario and observation history
+→ Phase 0.5 raw trajectory rollout
+versus
+→ Phase 0.6 selected trajectory rollout
+→ cumulative progress / safety / comfort / fallback timeline
+```
+
+Demo 必须展示平台与 protocol 名称、是否 reactive、scenario/seed、raw/selected checkpoint、planning adapter version、per-step reward/metrics、termination reason 和失败案例。不得把 controlled logged replay 或非响应交通参与者称为真实 closed-loop。
 
 ### 10.6 Phase 0.8：reinforcement fine-tuning
 
@@ -1707,13 +2241,16 @@ Optional 项目只能在对应主线模块稳定后评估，不得挤占核心 G
 |---|---|---|
 | few-shot prompt 深度搜索 | zero-shot 输出格式仍不稳定时 | 面试与工程价值低于 trajectory core |
 | DPO | safety pairs 已稳定时 | Phase 0.8 RL 已是主线 |
-| multi-candidate trajectory | single trajectory 稳定后 | 第一版调试、diversity 与评测成本高 |
+| learned multi-candidate trajectory generation | deterministic fallback bank 已稳定后 | Phase 0.6 核心只要求可审计的 deterministic candidates；learned diversity 训练与评测成本更高 |
 | fine-grained maneuver taxonomy | map/route 数据稳定后 | 标注与协议成本高 |
 | temporal six-camera BEV | current synchronized multi-camera BEV 稳定后 | 核心路线已由 historical semantic branch 提供时序信息 |
 | full future occupancy | current occupancy 与 Phase 0.6 safety interface 有效后 | 算力、时序标注和评测成本高 |
 | large pretrained BEVFormer-style model | lightweight/formal geometry encoder 完成后 | 外部依赖与兼容成本高，不阻塞核心 fusion |
 | from-scratch large occupancy model | 核心 Phase 0.5 完成后仍有明确研究需求时 | 非面试主线，不阻塞项目完成 |
 | drivable-area/map occupancy | map/route contract 建立后 | 当前阶段没有 map/route target contract |
-| Bench2Drive | NAVSIM 或其他准闭环主平台完成后 | 双平台成本高 |
+| map/route safety terms 与 traffic-rule scorer | map/route 与规则 contract 通过审核后 | 无可靠 map/route 时不能定义这些安全项 |
+| CARLA / Bench2Drive second platform | NAVSIM-compatible 或 controlled replay 主协议完成后 | 双平台、仿真依赖和结果对齐成本高 |
+| PID / MPC low-level controller | 选定平台明确要求 control command 时 | trajectory-native 主接口不需要低层控制 |
+| fully reactive simulation | quasi-closed-loop protocol 稳定后 | 环境、agent response 与 scenario 成本显著更高 |
 | world model | RL 与准闭环 policy 稳定后 | 研究扩展，不是核心 Gate |
 | 实车部署 | 不在本项目范围 | 风险与资源不匹配 |
