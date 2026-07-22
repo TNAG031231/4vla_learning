@@ -452,8 +452,8 @@ contract / regression tests
 | Phase 0.2d | sealed one-shot evaluation | `consumed_failed` | 无正式 test metrics；原 test 永久消费 |
 | Phase 0.3 | Qwen3-VL 数据接口与 legacy coarse action baseline（旧版粗粒度动作基线） | `planned` | 可复用视觉/多模态特征接口与六类历史兼容基线 |
 | Phase 0.4 | factorized meta-action（因子化元动作）+ action-conditioned waypoint（动作条件化轨迹点）+ verification（验证） | `planned` | `[B,4]` / `[B,3]` 动作头、`[B,6,2]` 轨迹点头与一致性验证器 |
-| Phase 0.5 | BEV/OCC-aware semantic-geometric fusion | `planned` | multi-camera/calibration adapter、current occupancy、融合与 trajectory ablation |
-| Phase 0.6 | trajectory safety scorer 与 safety-aware selection | `planned` | deterministic candidate bank、oracle/deployable scorer 与可审计 selector |
+| Phase 0.5 | BEV/OCC（鸟瞰图 / 占用表征）几何表示与离线空间评估，以及条件式轻量预测分支 | `planned` | Core：temporal agents、temporal occupancy 与对象—栅格一致性；Enhancement：可选当前占用预测 |
+| Phase 0.6 | factorized-action-conditioned candidates（因子化动作条件化候选）+ GT-derived safety reranking（真值派生安全重排序） | `planned` | `[B,6,6,2]` 固定候选库、双几何后端与 oracle offline reranking（真值离线重排序） |
 | Phase 0.7 | quasi-closed-loop evaluation 与 planning interface | `planned` | 平台兼容性结论、rollout/reward contract 与累计规划证据 |
 | Phase 0.8 | reinforcement fine-tuning | `planned` | 基于准闭环 reward 的最终策略优化 |
 | Final | robustness、latency、fallback、Demo 与复现 | `planned` | 完整工程与展示证据闭环 |
@@ -470,22 +470,25 @@ flowchart TD
     P02c --> P02d["Phase 0.2d consumed_failed"]
     P02d --> P03["Phase 0.3 legacy coarse action baseline<br/>旧版粗粒度动作基线<br/>train/validation only"]
     P03 --> P04["Phase 0.4 factorized action + waypoint<br/>因子化动作 + 动作条件化轨迹点 + 验证"]
-    P04 --> P05["Phase 0.5 BEV/OCC fusion"]
-    P05 --> P06["Phase 0.6 trajectory safety"]
+    P04 --> P05["Phase 0.5 Core<br/>GT-derived temporal BEV/OCC geometry"]
+    P05 --> P06["Phase 0.6 Core<br/>action-conditioned candidates<br/>+ oracle offline reranking"]
     P06 --> P07["Phase 0.7 quasi-closed-loop"]
     P07 --> P08["Phase 0.8 RL"]
     P08 --> PF["Final engineering evaluation"]
 
     P03 -.-> OPrompt["optional bounded few-shot search"]
     P04 -.-> OMulti["optional multimodal trajectories"]
+    P05 -.-> P05E["Phase 0.5 Enhancement<br/>lightweight predicted current occupancy"]
+    P05E -.-> P06E["optional inference-compatible scorer"]
+    P06E -.-> P07
     P05 -.-> OTemporalBEV["optional temporal six-camera BEV"]
-    P05 -.-> OFutureOcc["optional full future occupancy"]
+    P05 -.-> OFutureOcc["optional full future occupancy prediction"]
     P06 -.-> ODPO["optional DPO"]
     P07 -.-> OPlatform["optional second simulation platform"]
     P08 -.-> OWorld["optional world model"]
 ```
 
-Phase 0.3 只建立 Qwen3-VL（通义千问第三代视觉语言模型）接入与 legacy coarse action baseline（旧版粗粒度动作基线）；六分类输出不限制最终动作空间。Phase 0.4 建立唯一的 factorized meta-action（因子化元动作）、meta-action-conditioned waypoint（元动作条件化轨迹点）和 trajectory-to-action verification（轨迹到动作验证）核心；Phase 0.5—0.8 必须复用其 feature（特征）、factorized action（因子化动作）、trajectory（轨迹）与 consistency（动作—轨迹一致性）协议。Optional（可选）分支只能旁路增加证据，不能阻塞主线；其中 DPO（直接偏好优化）不得替代 Phase 0.8 的 RL（强化学习），world model（世界模型）也不属于核心完成条件。
+Phase 0.3 只建立 Qwen3-VL（通义千问第三代视觉语言模型）接入与 legacy coarse action baseline（旧版粗粒度动作基线）；六分类输出不限制最终动作空间。Phase 0.4 建立 factorized meta-action（因子化元动作）、meta-action-conditioned waypoint（元动作条件化轨迹点）和 trajectory-to-action verification（轨迹到动作验证）核心；Phase 0.5 Core 将 GT annotation（真值标注）转换为时序对象 / 栅格几何；Phase 0.6 Core 使用因子化动作组合生成候选并完成 oracle offline reranking（真值离线重排序）；Phase 0.7 只接收稳定轨迹与规划协议，不强制依赖 predicted occupancy（预测占用表征）。Phase 0.5 Enhancement 与推理兼容评分器是虚线条件分支，失败不阻塞核心主线。Optional（可选）项目不能替代主线 Gate，其中 DPO（直接偏好优化）不得替代 Phase 0.8 的 RL（强化学习），world model（世界模型）也不属于核心完成条件。
 
 ## 7. Phase -1：数据闭环与 coarse label freeze 简要回顾
 
@@ -1110,7 +1113,7 @@ trajectory_valid_mask:      [B, 6]
 
 训练只分两个简单步骤：
 
-**Stage A：GT-action conditioning warmup（阶段 A：真值动作条件化预热）。** 联合动作条件化优先使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的样本，以纵向与横向 GT action（真值动作）的 one-hot embedding（独热嵌入）查询 `E_long / E_lat`，先让 waypoint head（轨迹点头）学习“给定完整正确高层动作时如何生成轨迹”。联合无效的样本不能用缺失方向伪造 GT action pair（真值动作对），但其中仍然有效的单方向标签继续训练对应 action head（动作预测头）。该阶段只用于检查 target（目标）、conditioning（条件化）和 waypoint capacity（轨迹点头容量），其结果必须保存并标为 `GT-action-conditioned warmup result` 诊断产物，不得作为正式 inference（推理）结果。
+**Stage A：GT-action conditioning warmup（阶段 A：真值动作条件化预热）。** 完整 GT action pair conditioning（真值动作对条件化）只能使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的样本，以纵向与横向 GT action（真值动作）的 one-hot embedding（独热嵌入）查询 `E_long / E_lat`，先让 waypoint head（轨迹点头）学习“给定完整正确高层动作时如何生成轨迹”。联合无效的样本不能用缺失方向伪造 GT action pair（真值动作对），但其中仍然有效的单方向标签继续训练对应 action head（动作预测头）。该阶段只用于检查 target（目标）、conditioning（条件化）和 waypoint capacity（轨迹点头容量），其结果必须保存并标为 `GT-action-conditioned warmup result` 诊断产物，不得作为正式 inference（推理）结果。
 
 **Stage B：predicted-action joint training（阶段 B：预测动作联合训练）。** 使用两个 action head（动作预测头）产生的 `p_long / p_lat` 计算 soft action embedding（软动作嵌入），联合训练 longitudinal action head（纵向动作头）、lateral action head（横向动作头）与 waypoint head（轨迹点头）。正式 inference（推理）使用相同 predicted-action conditioning（预测动作条件化）路径，禁止注入 GT action（真值动作）。
 
@@ -1158,7 +1161,7 @@ left / straight / right
 
 ##### Phase 0.4c：Stage A GT-action conditioning warmup（阶段 A：真值动作条件化预热）
 
-1. 联合动作条件化优先使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的 train（训练集）样本；只有一个方向有效的样本仍可训练对应 action head（动作预测头），但不得伪造完整 GT action pair（真值动作对）。
+1. 完整 GT action pair conditioning（真值动作对条件化）只能使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的 train（训练集）样本；只有纵向有效的样本仍可训练纵向动作头，只有横向有效的样本仍可训练横向动作头，但单方向有效样本不得用于完整真值动作对条件化 waypoint head（轨迹点头）。
 2. 用 GT factorized action（真值因子化动作）的 one-hot embedding（独热嵌入）条件化 waypoint head（轨迹点头）。
 3. 核对正确动作条件下 waypoint loss（轨迹点损失）能下降，并完成小样本 overfit（过拟合）。
 4. 在 validation（验证集）保存 `GT-action-conditioned warmup result` 与 sample-level prediction（样本级预测）。
@@ -1316,911 +1319,731 @@ historical CAM_FRONT sequence
 
 最终主 Demo（演示）默认只展示 Stage B predicted-action-conditioned inference（阶段 B 预测动作条件化推理），并明确动作 embedding（嵌入）来自模型自身预测，正式推理不使用 GT action（真值动作）。Stage A GT-action-conditioned warmup（阶段 A 真值动作条件化预热）结果仍必须保存为 diagnostic artifact（诊断产物），仅在分析 action error propagation（动作误差传播）时与 Stage B 对比展示；不得让主 Demo 暗示正式推理注入真值动作。Demo 同时展示模型真实输入、target（目标）与 offline metadata（离线元数据）的边界，并附带 config（配置）、checkpoint（检查点）和 sample provenance（样本来源）。
 
-### 10.3 Phase 0.5：BEV/OCC-aware semantic-geometric fusion
+### 10.3 Phase 0.5：BEV/OCC（鸟瞰图 / 占用表征）几何表示与离线空间评估，以及条件式轻量预测分支
 
-> 本阶段不是为了单独复现一个大型 BEVFormer 或完整 occupancy network，而是为 Phase 0.4 的时序 VLA 加入 calibration-aware 多相机空间表示，使模型同时具有 VLM 语义特征和 BEV 几何特征，并验证这些几何特征是否改善连续轨迹规划。
+> 本阶段首先完成 GT-derived temporal BEV/OCC evaluator geometry（真值派生时序鸟瞰图 / 占用表征评估几何），再把 lightweight predicted current occupancy（轻量当前占用预测）保留为资源与依赖满足时的 conditional enhancement（条件增强）。核心项目完成不依赖训练 occupancy prediction network（占用预测网络），也不把真值几何接入 VLA（视觉-语言-动作模型）推理。
 
-#### 10.3.1 阶段状态、目的、必要性与边界
+#### 10.3.1 阶段状态、目的与两条路径
 
-- **阶段状态：** `planned`。
-- **阶段目的：** 在不改变 Phase 0.4 factorized meta-action target（因子化元动作目标）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）、verifier output（验证器输出）和固定张量合同的前提下，加入 current synchronized multi-camera geometry branch（当前同步多相机几何分支）、current occupancy auxiliary supervision（当前占用辅助监督）与 semantic-geometric fusion（语义—几何融合）。
-- **核心成果：** `multi-camera/calibration adapter + BEV geometry representation + current occupancy auxiliary supervision + semantic-geometric fusion + trajectory ablation evidence`。
-- **后续消费者：** Phase 0.6 只消费本阶段冻结的 predicted longitudinal / lateral actions（预测纵向 / 横向动作）、`[B,6,2]` predicted waypoints（预测轨迹点）、`[B,6]` valid mask（有效掩码）、action-trajectory consistency output（动作—轨迹一致性输出）、predicted occupancy probabilities（预测占用概率）、BEV grid metadata（鸟瞰图网格元数据）与模型 provenance（来源追溯）；不得直接消费训练期 GT occupancy（真值占用表征）。
+- **阶段状态：** planned（计划中）。
+- **核心目的：** 将 nuScenes GT annotations（nuScenes 真值标注）转换为与 Phase 0.4 固定六个轨迹点严格对齐的 object-level temporal geometry（对象级时序几何）和 raster-level temporal occupancy（栅格级时序占用表征），为 Phase 0.6 的 trajectory safety evaluator（轨迹安全评估器）提供可靠离线几何。
+- **条件增强目的：** 在核心路径通过、资源和兼容性允许时，用一个轻量或兼容预训练 BEV encoder（鸟瞰图编码器）预测 current occupancy（当前占用表征），验证推理兼容几何近似是否有展示价值。
+- **后续消费者：** Phase 0.6 Core（阶段 0.6 核心）消费 temporal agents（时序对象）、temporal occupancy（时序占用表征）、grid metadata（网格元数据）、valid masks（有效掩码）与 provenance（来源追溯）；条件式 predicted-geometry scorer（预测几何评分器）只能消费增强路径输出。
 
-本阶段解决以下问题：
+两条路径属于同一个 Phase 0.5，不是两个项目版本：
 
-- 单前视相机视野有限，不能完整观察侧后方环境；
-- VLM feature 擅长语义，但缺少显式、统一的 ego-centric 空间结构；
-- 图像平面 feature 不便直接表达车辆、VRU 与 ego 的相对位置；
-- Phase 0.6 safety scorer 需要稳定的 predicted geometry interface；
-- 必须通过消融证明 BEV/OCC 对 planning 的实际作用，而不是只增加一个可视化模块。
+| 路径 | 核心输入 | 核心输出 | 是否阻塞 Phase 0.6 Core |
+|---|---|---|---|
+| Phase 0.5 Core（核心） | GT 3D annotations（真值三维标注）、ego pose（自车位姿）、未来样本时间戳 | temporal agents、temporal occupancy、grid metadata、valid masks | 是 |
+| Phase 0.5 Enhancement（条件增强） | 当前同步多相机、相机内外参、已冻结网格 | 当前 vehicle / VRU occupancy probabilities（车辆 / 弱势道路使用者占用概率） | 否 |
 
-本项目中各概念职责严格分离：
+核心数据流固定为：
 
-```text
-BEV:
-multi-camera visual features
-→ unified ego-centric top-down spatial representation
+~~~text
+nuScenes GT annotations
+→ current ego frame
+→ temporal object geometry
+→ temporal BEV occupancy
+→ Phase 0.6 trajectory safety evaluator
+~~~
 
-Occupancy:
-BEV feature map
-→ per-class occupied probability on the current BEV grid
+Phase 0.5 Core（阶段 0.5 核心）证明坐标、时间、对象轮廓与候选轨迹之间的几何关系正确，不要求先训练 camera-to-BEV network（相机到鸟瞰图网络）。GT-derived occupancy（真值派生占用表征）只能进入 offline evaluator（离线评估器）、测试和可视化，不能进入 VLA inference input（视觉-语言-动作模型推理输入）。Predicted occupancy（预测占用表征）不是 Core Gate（核心门槛）。
 
-Meta-action-conditioned waypoint head:
-semantic-geometric representation
-→ Phase 0.4 longitudinal/lateral action embeddings
-→ [B, 6, 2] continuous future waypoints
+本阶段不以 full future occupancy prediction（完整未来占用预测）、大型 BEVFormer 复现、完整三维占用、地图 / 车道 / 信号灯建模、闭环驾驶或真实道路安全为目标。
 
-Safety scorer:
-predicted trajectory + predicted/oracle geometry
-→ Phase 0.6 risk terms and selection evidence
-```
+#### 10.3.2 Core：对象级时序几何合同
 
-BEV、occupancy、trajectory 与 safety score 不是同一概念。Occupancy 只是空间概率表示，不直接等于安全判断；Phase 0.5 不删除 longitudinal / lateral action heads（纵向 / 横向动作头）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）或 trajectory-to-action verifier（轨迹到动作验证器），也不提前实现 Phase 0.6 scorer（评分器）。
+对象级 producer（生产者）输入至少包括：
 
-本阶段不解决：
+~~~text
+sample_token
+current ego pose
+current CAM_FRONT_sample_data timestamp
+future sample timestamps
+GT 3D annotations
+annotation token
+object category
+box translation
+box size
+box orientation
+~~~
 
-```text
-full future occupancy prediction
-large-scale from-scratch BEVFormer reproduction
-SurroundOcc-scale 3D occupancy
-map / route conditioning
-fine-grained maneuver taxonomy
-learned multi-candidate trajectory generation
-closed-loop simulation
-reinforcement learning
-world model
-```
+概念输出合同为：
 
-这些能力不得成为 Phase 0.5 Gate。Temporal six-camera BEV、full future occupancy 和大型 pretrained BEVFormer-style integration 只可在核心 current-BEV 路径稳定后作为 optional。
+~~~text
+temporal_agents:
+[B, 6, N_agent, agent_fields]
 
-#### 10.3.2 前置条件与双路径最终架构
+agent_fields:
+- annotation_token
+- category
+- center_x_m
+- center_y_m
+- length_m
+- width_m
+- yaw_rad
+- valid
+- motion_source
+~~~
 
-进入 Phase 0.5 前要求：
+B 是 batch size（批大小），6 对应未来 0.5、1.0、1.5、2.0、2.5、3.0 秒，N_agent 是带 padding / valid mask（填充 / 有效掩码）的对象上限或可变长序列长度。所有对象都必须转换到当前时刻 current ego frame（当前自车坐标系）：x 轴向前为正，y 轴向左为正，单位为米；时间步必须与 Phase 0.4 的 future_waypoints [B,6,2] 一一对齐。
 
-- Phase 0.4 factorized target + temporal dataset contract（因子化目标与时序数据合同）已稳定；
-- Phase 0.4 longitudinal / lateral targets（纵向 / 横向目标）、各自 validity / reason（有效性 / 原因）、`factorized_action_joint_valid`、`[B,6,2]` waypoint target（轨迹点目标）、current ego coordinate frame（当前自车坐标系）、0.5 秒 sampling interval（采样间隔）、3.0 秒 horizon（预测时域）、`[B,6]` valid mask（有效掩码）与 metrics（指标）已通过自动测试和人工审核；
-- Phase 0.4 模型已走通 forward、training、checkpoint save/load 与 inference；
-- Phase 0.4 semantic feature interface 已定义 shape、dtype、mask、normalization 与 feature version；
-- Phase 0.4 factorized action heads（因子化动作预测头）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）与 verifier contract（验证器协议）不再随意变化；
-- 原 project test 继续永久禁止访问；
-- frozen train/validation scene mapping 保持不变。
+motion_source 必须显式记录：
 
-若 Phase 0.4 尚未超过 constant-velocity 或 ego-history 等简单 baseline，可以继续做 geometry interface 与轻量增益验证，但必须保留这一负结果，不能写成 Phase 0.4 或 trajectory VLA success 已通过。
+~~~text
+observed
+interpolated
+constant_velocity_fallback
+unavailable
+~~~
 
-核心架构采用 historical semantic input + synchronized multi-camera geometry input：
+优先使用对应未来时间步的真实 annotation（标注）；仅在正式数据合同确认真实标注不可获得时，才允许使用版本化 interpolation（插值）或 constant-velocity fallback（匀速回退）。不得静默复制 current box（当前三维框）冒充未来真实位置，也不得把回退结果标为 observed（实际观测）。
 
-```text
-historical CAM_FRONT
-→ Phase 0.4 semantic branch
-→ temporal semantic tokens
-                         \
-                          → semantic-geometric fusion
-                         /             │
-current multi-camera                  ├── longitudinal action head
-+ calibration                        ├── lateral action head
-→ geometry encoder                   └── meta-action-conditioned waypoint head
-→ BEV feature map
-├── geometry tokens
-└── current occupancy auxiliary head
-```
+对象级实现顺序：
 
-Phase 0.4 已负责 historical `CAM_FRONT` 与 ego history（自车历史）的时序语义建模；Phase 0.5 的核心新增范围是当前 anchor（锚点）附近的同步多相机 geometry input（几何输入）。Phase 0.5 必须复用 Phase 0.4 的 semantic feature（语义特征）、longitudinal / lateral action heads（纵向 / 横向动作头）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）、trajectory-to-action verifier（轨迹到动作验证器）和完整 trajectory output contract（轨迹输出协议），不得另起独立 BEV（鸟瞰图）产品或重写 Qwen / trajectory pipeline（通义千问 / 轨迹管线）。Legacy coarse action（旧版粗粒度动作）仅可作为历史基线或可选兼容输出。
+1. 以当前 CAM_FRONT_sample_data 时间戳冻结 anchor（锚点）与 current ego frame（当前自车坐标系）。
+2. 沿同一 scene（场景）查找六个未来目标时间步，不跨 scene 补帧。
+3. 读取各时间步 sample annotation（样本标注）、annotation token（标注标识）、类别、尺寸、平移与旋转。
+4. 按 global frame → current ego frame（全局坐标系到当前自车坐标系）的显式变换链转换 oriented box（有方向三维框）。
+5. 将类别统一映射为 vehicle（车辆）、VRU（弱势道路使用者）或 ignored（忽略）；VRU 至少覆盖可核验的 pedestrian（行人）和 bicycle / cyclist（自行车 / 骑行者）映射。
+6. 记录时间容差、缺失标注、对象有效性与 motion_source，不用猜测值填补不可用对象。
+7. 输出时序对象表、对象轨迹与自车轨迹联合可视化。
+8. 用人工构造案例和少量真实 train / validation（训练集 / 验证集）样本审核前后、左右、旋转与时间方向。
 
-#### 10.3.3 输入、training target 与信息边界
+坐标变换 artifact（产物）必须记录 source frame（源坐标系）、target frame（目标坐标系）、quaternion convention（四元数约定）、矩阵乘法方向、时间戳单位、anchor timestamp（锚点时间戳）、插值 / 最近帧策略、tolerance（容差）与 transform version（变换版本）。对象级结果保留 annotation_token、sample_token、category、size、orientation、valid、motion_source 与 source annotation provenance（来源标注追溯）。
 
-模型推理可以使用：
+#### 10.3.3 Core：栅格级时序 occupancy 合同
 
-```text
-historical CAM_FRONT frames
-current/past ego state
-current multi-camera images
-camera intrinsics
-camera extrinsics
-camera timestamps
-camera availability mask
-```
+对象级时序几何通过后，才能构建 raster-level temporal occupancy（栅格级时序占用表征）：
 
-建议预检的 nuScenes camera set 为：
+~~~text
+temporal_occupancy:            [B, 6, 2, H_bev, W_bev]
+temporal_occupancy_valid_mask: [B, 6, H_bev, W_bev]
 
-```text
-CAM_FRONT
-CAM_FRONT_LEFT
-CAM_FRONT_RIGHT
-CAM_BACK
-CAM_BACK_LEFT
-CAM_BACK_RIGHT
-```
+channel 0: vehicle
+channel 1: VRU
+~~~
 
-正式 camera set 必须由 nuScenes 实际记录、时间对齐质量、资源和缺失率预检确定，不得假定每个样本六相机始终完整。任何降级 camera set 或 missing-camera policy 都必须显式配置、版本化并通过 validation；不能按样本静默改变 camera order。
+第一版工程默认配置为：
 
-Training-only targets 可以包括：
+~~~text
+x_range_m: [-10, 50]
+y_range_m: [-25, 25]
+resolution_m_per_cell: 0.5
+anchor_frame: current ego frame
+x_axis: forward
+y_axis: left
+~~~
 
-```text
-future_waypoints [B, 6, 2]
-trajectory_valid_mask [B, 6]
-longitudinal_action
-longitudinal_action_valid
-longitudinal_action_reason
-lateral_action
-lateral_action_valid
-lateral_action_reason
-factorized_action_joint_valid
-GT current 3D annotations
-GT-derived current BEV occupancy
-```
+这些值是便于实现和展示的初始工程配置，不是论文结论或真实道路安全标准。实施前必须通过少量真实样本可视化确认覆盖范围合理，再冻结 raster_config_version（栅格配置版本）；网格范围、分辨率、origin（原点）、边界包含规则或类别映射有任何变化，都必须提升版本，不能在不同实验中静默修改。
 
-Future waypoints（未来轨迹点）、trajectory valid mask（轨迹有效掩码）与 factorized meta-action target（因子化元动作目标）继续沿用 Phase 0.4 contract（协议）。`L_longitudinal` 与 `L_lateral` 分别继承 `longitudinal_action_valid` 与 `lateral_action_valid`，Phase 0.5 不得重新合并成统一动作掩码；`factorized_action_joint_valid` 只服务完整动作对相关的条件化、审核与联合指标。GT current 3D annotations（当前真值三维标注）只用于生成 occupancy target（占用目标）、offline geometry audit（离线几何审计）与 evaluation reference（评估参考）；GT occupancy（真值占用表征）是 training-only target（仅训练目标）和 offline evaluation reference（离线评估参考），只进入 occupancy loss（占用损失）和离线指标，不进入模型 inference input（推理输入）或 fusion feature（融合特征）。
+栅格化步骤：
 
-永久禁止：
+1. 接收已转换到 current ego frame（当前自车坐标系）的 oriented box（有方向三维框）。
+2. 提取 vehicle（车辆）或 VRU（弱势道路使用者）的地面二维 footprint（轮廓）。
+3. 根据网格原点、范围和分辨率计算候选 cell（网格单元）。
+4. 对旋转框使用 polygon-cell intersection（多边形与网格相交）或等价确定性方法写入覆盖单元。
+5. 按 vehicle / VRU 写入独立通道，定义重叠对象和通道内并集语义。
+6. 记录 fully outside（完全超界）、partially outside（部分超界）、ignored category（忽略类别）与 missing timestep（缺失时间步）。
+7. 输出 temporal_occupancy_valid_mask，并明确 invalid / unknown（无效 / 未知）不能自动解释为空闲空间。
+8. 保存对象级框、栅格占用和 ego / candidate trajectory（自车 / 候选轨迹）叠加可视化。
 
-- GT boxes、GT occupancy raster、future agents 或 future occupancy 作为模型输入；
-- future ego trajectory 或 future waypoints 作为模型输入；
-- `nearby_agents` 字段直接输入 geometry branch；
-- 已消费 test 的图像、calibration、ego state、label、target 或统计；
-- validation GT occupancy 进入训练或 train-derived class statistics；
-- 用 future annotation 填充 current occupancy；
-- 将 GT-derived occupancy 写成 camera-only prediction；
-- 将 oracle geometry 指标写成本阶段在线能力。
+第一版 Core 不加入 drivable-area channel（可行驶区域通道）、lane topology（车道拓扑）、traffic-light state（交通灯状态）、static map occupancy（静态地图占用）、full 3D occupancy（完整三维占用）或 future occupancy prediction network（未来占用预测网络）；这些只能作为 optional（可选）扩展。
 
-#### 10.3.4 Multi-camera、anchor frame 与 calibration contract
+#### 10.3.4 Core：对象—栅格一致性与信息边界
 
-正式协议必须选择单一 anchor：
+Object-raster consistency check（对象—栅格一致性检查）至少验证：
 
-```text
-anchor timestamp:
-current CAM_FRONT sample_data timestamp
+- 对象级表示中位于网格内的每个有效 vehicle / VRU，应在相同时间步与对应通道留下占用；
+- 对象中心、旋转轮廓和 occupancy（占用表征）叠加后不得出现系统性前后 / 左右轴反转；
+- 六个时间步不得错位或交换；
+- ignored（忽略）、outside（超界）和 invalid（无效）对象必须有确定性原因；
+- 相同输入、配置和版本必须产生相同 raster（栅格）。
 
-anchor frame:
-current ego frame at anchor timestamp
-```
+第一版不要求论文式逐像素等价研究，但不得接受系统性轴反转、时间错位、类别通道错误或网格内有效对象完全没有对应占用。
 
-该选择是第一版建议；实施时仍需通过实际数据预检冻结版本。所有相机图像、camera ray、annotation box、BEV target 与 trajectory visualization 最终必须通过明确的 camera-to-anchor-ego transform 对齐到同一 anchor ego frame。
+GT future boxes（未来真值三维框）、temporal_agents 与 temporal_occupancy 都属于 evaluator-only information（仅评估器信息）。VLA 推理仍只使用 Phase 0.4 允许的历史图像、current / past ego motion（当前 / 历史自车运动）和 task_prompt（固定任务提示）；不得把 GT geometry（真值几何）、future agents（未来交通参与者）或 GT occupancy（真值占用表征）输入模型、候选生成器或动作预测头。
 
-nuScenes 各相机的 `sample_data` timestamp 可能存在细微差异。每个相机必须保留自身 timestamp 与 offset，并显式执行：
+#### 10.3.5 Enhancement：轻量当前占用预测
 
-```text
+只有同时满足以下条件才启动 Phase 0.5 Enhancement（条件增强）：
+
+- Phase 0.5 Core 已通过；
+- 有可用 GPU（图形处理器）或兼容预训练模型；
+- camera calibration contract（相机标定协议）已核验；
+- 依赖、许可证和 checkpoint（检查点）可用且可追溯；
+- 不影响 Phase 0.6 Core 的离线评估进度。
+
+增强路径只能选择一个主方案：
+
+~~~text
+current synchronized multi-camera images
++ camera intrinsics / extrinsics
++ camera timestamps / valid mask
+→ one lightweight or compatible pretrained BEV encoder
+→ current vehicle / VRU occupancy probabilities
+~~~
+
+不得同时实现或横向比较多个 LSS-style encoder（基于深度提升的编码器）、BEVFormer-style encoder（基于 Transformer 的鸟瞰图编码器）或预训练 BEV 模型，也不得从零训练大型 occupancy network（占用预测网络）。增强路径只预测 current occupancy（当前占用表征），不预测未来 occupancy（未来占用表征）。
+
+多相机 adapter（适配器）必须保留固定 camera order（相机顺序）、每相机 intrinsics（内参）、extrinsics（外参）、timestamp（时间戳）、camera_valid_mask、time offset（时间偏移）与 BEV grid metadata（鸟瞰图网格元数据）。每个相机的变换链为：
+
+~~~text
 camera sensor frame
 → ego frame at camera timestamp
 → global frame
-→ anchor ego frame
-```
+→ current anchor ego frame
+~~~
 
-概念变换链为：
+概念变换为：
 
-```text
+~~~text
 T_anchor_ego_from_camera
 =
 T_anchor_ego_from_global
 × T_global_from_ego_at_camera_time
 × T_ego_from_camera
-```
-
-实现时必须依据仓库统一 quaternion convention 核对矩阵方向，不得只复制 calibrated sensor extrinsic 并假定全部相机同一时刻。Translation 单位为米；rotation convention、矩阵乘法方向、source/target frame、camera timestamp offset 和 interpolation/nearest-pose policy 必须写入 contract。超过正式 tolerance 的 camera 必须设为 invalid 或按冻结策略排除，不能静默使用；不得跨 scene 寻找替代图像。
-
-建议张量合同：
-
-```text
-multi_camera_images:       [B, N_cam, 3, H_img, W_img]
-camera_intrinsics:         [B, N_cam, 3, 3]
-camera_to_anchor_ego:      [B, N_cam, 4, 4]
-camera_valid_mask:         [B, N_cam]
-camera_time_offsets_sec:   [B, N_cam]
-bev_features:              [B, D_bev, H_bev, W_bev]
-occupancy_target:          [B, C_occ, H_bev, W_bev]
-occupancy_valid_mask:      [B, H_bev, W_bev]
-geometry_tokens:           [B, N_bev, D_fusion]
-```
-
-- `N_cam`：正式 camera 数量与固定顺序；
-- `H_img/W_img`：processor 后图像尺寸；
-- `H_bev/W_bev`：BEV grid 尺寸；
-- `C_occ`：occupancy 类别通道数；
-- `N_bev`：保留或压缩后的 geometry token 数；
-- `D_fusion`：投影到 fusion space 后的维度。
-
-图像分辨率、BEV resolution、depth bins、feature dimension、batch size 和 dtype 必须经过 compatibility/resource preflight 再进入配置；本文不硬编码未经实测的数值。
-
-#### 10.3.5 BEV grid 与 GT current occupancy contract
-
-所有 BEV artifact 必须记录：
-
-```text
-x_range_m
-y_range_m
-resolution_m_per_cell
-H_bev
-W_bev
-origin
-x_axis_direction
-y_axis_direction
-anchor_frame
-rasterization_policy
-class_mapping_version
-raster_config_version
-```
-
-Contract 必须明确前后/左右轴方向、ego 在网格中的位置、cell 边界的 inclusive/exclusive 规则、超出范围对象的处理、oriented box 与 grid 相交的 rasterization 规则、类别重叠时的 channel 语义，以及 unknown/ignored 区域的处理。任何 BEV 配置变化必须提升 `raster_config_version`，不得覆盖旧 target、cache 或评测结果。
-
-核心 occupancy target 只描述当前 anchor 时刻的动态对象占用，第一版建议通道为：
-
-```text
-vehicle
-VRU
-```
-
-VRU 至少覆盖可核验的 pedestrian 与 bicycle/cyclist 类别映射。Future occupancy、static obstacle、drivable area 和 lane topology 不作为本阶段核心 target；零背景也不得自动解释为已确认 free space，除非后续 contract 对可观测区域与 free/unknown 语义另有严格定义。
-
-GT current occupancy producer 依次执行：
-
-1. 读取 current sample annotations，并核验 annotation 与 anchor 的时间语义。
-2. 将 global oriented 3D boxes 转换到 anchor ego frame。
-3. 按 frozen class mapping 归入 vehicle、VRU 或 ignored。
-4. 过滤正式 BEV range 外对象，同时记录过滤统计。
-5. 将 box ground footprint 按 frozen policy rasterize 到独立通道。
-6. 生成 `occupancy_valid_mask`，明确 unknown/ignored cell 语义。
-7. 记录类别映射、ignored 类别、object count 与 occupied-cell statistics。
-8. 输出 GT occupancy visualization，并与相机投影和原始 boxes 交叉核验。
-9. 对真实 train/validation 样本进行人工审核。
-10. 冻结 class mapping、grid metadata 与 `raster_config_version`。
-
-Producer 不得用 future annotation、prediction 或 CAM_FRONT 可见性修改 current GT raster；不得忽略相机视野外但处于 BEV range 内的对象；不得在没有 map contract 时生成 drivable-area target。
-
-#### 10.3.6 Geometry encoder 选择与资源控制
-
-正式实现只选择一个主线 geometry encoder，不同时大规模实现多个方案。
-
-**Candidate A：lightweight calibration-aware view transformer。** LSS-style 或等价方法将 multi-camera image features 与 intrinsics/extrinsics 经 depth-aware/calibration-aware view transform 投影到 BEV。优点是几何链条清晰、易于解释并可深度整合；风险是 depth、voxel pooling、显存和 custom CUDA 依赖。
-
-**Candidate B：compatible pretrained BEV encoder。** 使用 compatible pretrained multi-camera BEV model，经 frozen 或 partially frozen feature extractor 与 project adapter 输出 BEV feature。优点是降低从零训练成本并快速验证 fusion；风险是许可证、依赖、preprocessing、checkpoint 与坐标定义不兼容，且外部模型结果不能冒充本项目训练结果。
-
-正式选择前只做有限 compatibility spike，核对：
-
-```text
-license and redistribution limits
-repository maintenance
-nuScenes compatibility
-Python / PyTorch / CUDA compatibility
-custom operator requirements
-memory requirement
-checkpoint availability
-feature extraction stability
-output tensor shape
-output coordinate definition
-```
-
-Selection gate 只允许冻结一个主线 encoder 与选择理由；另一个保留为 optional。不得为迁就外部代码修改 Phase 0.4 frozen trajectory contract。若 Mac 本地不能完成训练，可将正式训练标记为需要受控 GPU 环境，但 multi-camera/calibration、raster、tensor 和 consumer contracts 及其测试仍必须能在本地核验。
-
-资源友好的训练顺序为：
-
-1. 冻结 Phase 0.4 VLM 大部分参数并复用 semantic feature interface。
-2. 首先冻结或轻量训练 geometry image backbone。
-3. 优先训练 BEV adapter、occupancy head、fusion module 与既有 output heads。
-4. 完成 synthetic tests、real-data smoke 和 small-subset overfit 后再决定有限解冻。
-5. 允许缓存 frozen image/BEV features，但 cache 必须版本化。
-6. 降低 image/BEV resolution、batch size 或 dtype 必须作为显式配置和 artifact provenance，不能静默发生。
-7. 不以从零训练大型 backbone 作为 Gate。
-
-Feature cache 至少记录：
+~~~
 
-```text
-source sample_token
-camera set and order
-camera timestamps
-camera/calibration version
-model and processor revision
-preprocessing version
-feature extraction policy
-feature shape and dtype
-cache schema version
-```
+实现必须核验 quaternion / rotation convention（四元数 / 旋转约定）、矩阵方向、相机异步时间差和 tolerance（容差），不得只复制 calibrated sensor extrinsic（标定传感器外参）并假定所有图像同时采集。超出容差的相机必须按版本化策略置为 invalid（无效）或排除，不能静默改变相机顺序。
 
-#### 10.3.7 模型模块与 semantic-geometric fusion
+增强输出至少包括 current vehicle / VRU occupancy probabilities（当前车辆 / 弱势道路使用者占用概率）、camera / calibration version（相机 / 标定版本）、encoder / checkpoint revision（编码器 / 检查点修订版）、grid metadata、probability threshold（概率阈值）和 provenance。GT current occupancy（当前真值占用表征）只作为训练目标或 validation reference（验证参考），不进入融合特征。
 
-**Semantic branch** 直接复用 Phase 0.4：
+如果增强路径失败，不阻塞 Core、不阻塞 Phase 0.6 的 GT-derived evaluator（真值派生评估器）；必须保存 dependency / license / resource / accuracy failure（依赖 / 许可证 / 资源 / 准确性失败）原因，且不得声称实现 online occupancy perception（在线占用感知）。
 
-```text
-historical CAM_FRONT
-+ current/past ego state
-→ temporal semantic representation
-```
-
-Phase 0.5 不重新设计 factorized action / waypoint target（因子化动作 / 轨迹点目标）、不重写完整 Qwen pipeline（通义千问管线），也不改变 Phase 0.4 longitudinal / lateral action、`[B,6,2]` waypoint、`[B,6]` mask（掩码）或 verifier output（验证器输出）schema（模式）。
-
-**Geometry branch：**
-
-```text
-current multi-camera images
-+ intrinsics/extrinsics/timestamps
-+ camera valid mask
-→ geometry encoder
-→ bev_features [B, D_bev, H_bev, W_bev]
-```
-
-**Current occupancy auxiliary head：**
-
-```text
-BEV feature map
-→ lightweight occupancy decoder
-→ occupancy_logits [B, C_occ, H_bev, W_bev]
-```
-
-GT occupancy 只进入 masked occupancy loss，不进入 semantic-geometric fusion。Inference 输出 occupancy probabilities，并保留 threshold/config provenance；threshold 只由 validation 选择。
-
-**Geometry tokenization：**
-
-```text
-BEV feature map
-→ flatten / pooling / token reduction
-→ geometry tokens
-→ projection to D_fusion
-```
-
-Token reduction 必须保留 BEV positional information。第一版只选择一种 2D learned、coordinate-aware 或 fixed sinusoidal grid embedding；不得同时实现全部方案，也不得把全局平均池化作为唯一正式 geometry representation。
-
-**Semantic-geometric fusion：** 第一版优先采用便于 shape、mask 与 attention 调试的轻量 fusion transformer：
-
-```text
-temporal semantic token(s)
-+ ego token
-+ projected geometry tokens
-+ camera/BEV masks
-+ positional embeddings
-→ 1–2 layer fusion transformer
-→ shared driving representation
-```
-
-具体 layer（层）数、token 数和 hidden dimension（隐藏维度）由资源预检与真实 feature intake（特征接入）冻结。简单 concat / pooling（拼接 / 池化）可作为 baseline（基线），但正式模型必须保留可定位的空间结构。Fusion（融合）输出继续接入 Phase 0.4 的 longitudinal action head（纵向动作头）、lateral action head（横向动作头）与 meta-action-conditioned waypoint head（元动作条件化轨迹点头）；动作条件化公式、trajectory output contract（轨迹输出协议）、坐标、3.0 秒 horizon（预测时域）、0.5 秒间隔、mask（掩码）与 serialization（序列化）保持不变。Phase 0.5 的 predicted waypoints（预测轨迹点）仍须经过同一 trajectory-to-action verifier（轨迹到动作验证器）。
-
-#### 10.3.8 Training objective 与梯度边界
-
-基础 joint loss 为：
-
-```text
-L_total
-= lambda_traj * L_trajectory
-+ lambda_long * L_longitudinal
-+ lambda_lat * L_lateral
-+ lambda_occ * L_occupancy
-```
-
-其中：
-
-```text
-L_trajectory:
-Phase 0.4 masked waypoint regression
-
-L_longitudinal:
-Phase 0.4 4-class longitudinal cross entropy
-
-L_lateral:
-Phase 0.4 3-class lateral cross entropy
-
-L_occupancy:
-current vehicle/VRU occupancy supervision
-```
-
-第一版独立多通道 occupancy（占用表征）可以使用 class-balanced `BCEWithLogits`（类别平衡二元交叉熵），并将 Dice / overlap-oriented term（Dice / 重叠项）保留为 validation-controlled optional（验证集控制的可选项）。`occupancy_valid_mask` 外不计算 loss（损失）；class weights（类别权重）和 normalization（归一化）只由 train（训练集）统计；occupancy threshold（占用阈值）、`lambda_occ`、checkpoint（检查点）与 optional overlap term（可选重叠项）只由 validation（验证集）选择；validation target（验证目标）不参与梯度；GT occupancy（真值占用表征）不进入 inference（推理）。Phase 0.4 的 `lambda_traj / lambda_long / lambda_lat` 及 predicted-action conditioning（预测动作条件化）继续生效，其中 `L_longitudinal` 只由 `longitudinal_action_valid` 控制、`L_lateral` 只由 `lateral_action_valid` 控制，不恢复统一动作掩码或六分类损失。
-
-本阶段不加入 safety loss、collision penalty、RL objective 或 DPO loss。若 occupancy 指标提升但 trajectory 明显退化，不得仅按 occupancy 选择 checkpoint，也不得把 occupancy improvement 写成 planning improvement。
-
-#### 10.3.9 详细子阶段
-
-##### Phase 0.5a：范围、依赖与资源预检
-
-1. 核对 Phase 0.4 semantic feature（语义特征）、longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]`、`predicted_waypoints [B,6,2]`、`trajectory_valid_mask [B,6]`、consistency output（一致性输出）与 checkpoint contract（检查点协议）。
-2. 核对正式 camera set、calibration、timestamp 与 ego-pose 数据可用性。
-3. 核对本地验证环境和受控训练环境资源。
-4. 对 Candidate A/B 做有限 compatibility spike。
-5. 选择一个正式 geometry encoder 并记录理由。
-6. 冻结 camera set/order、anchor、timestamp tolerance、BEV grid 与资源策略。
-7. 只输出计划内 contract/provenance，不训练正式模型。
-
-##### Phase 0.5b：multi-camera adapter 与 calibration audit
-
-1. 从 manifest/nuScenes tables 读取 current multi-camera records。
-2. 读取各 camera timestamp、intrinsics、calibrated sensor extrinsics 与对应 ego pose。
-3. 构造 `camera_to_anchor_ego` 变换和 `camera_time_offsets_sec`。
-4. 生成固定 camera order 与 `camera_valid_mask`。
-5. 检查 timestamp tolerance、scene boundary 和 missing-camera policy。
-6. 输出 multi-camera/calibration audit artifact。
-7. 用人工构造 3D point、identity transform 与真实 box 做投影检查。
-8. 人工审核 multi-camera 图像、camera order、timestamp offsets 与 anchor-BEV 对齐。
-
-##### Phase 0.5c：GT current occupancy producer
-
-1. 定义 vehicle/VRU/ignored class mapping。
-2. 定义 BEV grid、axis、origin、boundary 与 rasterization semantics。
-3. 将 current annotations 转换到 anchor ego frame。
-4. Rasterize oriented footprints，生成 channels 与 valid mask。
-5. 统计 object/class/occupied-cell distribution。
-6. 编写 synthetic geometry/raster tests。
-7. 生成真实 train/validation GT occupancy visualization。
-8. 完成人工审核并冻结 `raster_config_version`。
-
-##### Phase 0.5d：geometry-only 与 occupancy baseline
-
-先隔离 geometry branch：
-
-```text
-multi-camera
-→ BEV encoder
-→ occupancy head
-```
-
-同时建立 occupancy class-prior/all-background reference 与 geometry + ego trajectory baseline。验证 BEV feature shape、occupancy loss 下降、小样本 overfit、current occupancy prediction 超过 trivial reference、geometry-only trajectory 正常训练，以及 geometry branch 脱离 semantic branch 时仍可独立测试。
-
-##### Phase 0.5e：semantic-geometric fusion smoke training
-
-1. 加载并冻结或受控训练 Phase 0.4 semantic branch。
-2. 接入 geometry tokens、positional embedding 与 mask。
-3. 核对 projection、token scale、normalization 和 fusion attention。
-4. 核对 longitudinal / lateral logits、probabilities 与 predicted class（纵向 / 横向逻辑值、概率与预测类别）、`predicted_waypoints [B,6,2]`、consistency（动作—轨迹一致性）与 occupancy（占用表征）输出合同。
-5. 核对 `L_trajectory / L_longitudinal / L_lateral / L_occupancy` 四项 loss（损失）与各模块梯度路径。
-6. 核对 checkpoint save/load 与相同输入下的 inference。
-7. 完成 small-subset overfit。
-8. 证明 inference path 不读取 GT occupancy、GT boxes 或 `nearby_agents`。
-
-##### Phase 0.5f：正式 train/validation training
-
-- 只使用正式 train 训练；
-- 只用 validation 选择 checkpoint、loss weights、threshold 和有限超参数；
-- 记录 geometry encoder、VLM、fusion 与 heads 的 frozen/trainable 参数；
-- 保存 model/config、normalization、raster config、camera contract 与 checkpoint provenance；
-- 不访问原 project test；
-- 不以 occupancy 指标单独选择严重损害 trajectory 的 checkpoint。
-
-##### Phase 0.5g：消融、failure analysis 与接口冻结
-
-必须比较：
-
-```text
-Phase 0.4 temporal semantic + ego
-multi-camera image pooling + ego
-BEV geometry + ego
-semantic + BEV geometry
-semantic + BEV geometry + occupancy auxiliary
-```
-
-`multi-camera image pooling` 是非几何多相机对照；`BEV geometry + ego` 隔离 geometry branch；`semantic + BEV` 检验融合增益；`+ occupancy auxiliary` 检验 occupancy supervision 是否改善 geometry representation 或 trajectory。每项消融只改变声明的模块，复用同一 data contract、trajectory head、training budget 与 validation protocol。
-
-最终冻结供 Phase 0.6 使用的接口：
-
-```text
-longitudinal logits/probabilities [B,4]
-longitudinal predicted class [B]
-lateral logits/probabilities [B,3]
-lateral predicted class [B]
-predicted_waypoints [B,6,2]
-trajectory_valid_mask [B,6]
-action-trajectory consistency output
-predicted occupancy probabilities
+#### 10.3.6 实施子步骤、artifact 与版本
+
+##### Phase 0.5a：核心合同与真实数据接入
+
+核对 Phase 0.4 的 [B,6,2] waypoint（轨迹点）、[B,6] mask（掩码）、current ego frame（当前自车坐标系）、0.5 秒间隔和 3.0 秒时域；读取真实 nuScenes annotation producer artifact（标注生产者产物），冻结时间容差、类别映射、对象字段、transform version 与 provenance。若真实字段或时间链不匹配，停止而不是手写猜测 consumer schema（消费者模式）。
+
+##### Phase 0.5b：对象级时序几何
+
+实现 global-to-ego transform（全局到自车坐标变换）、六步 annotation 对齐、类别映射、motion_source 与 temporal_agents 序列化；用 synthetic geometry tests（合成几何测试）、少量真实样本和对象 / 自车联合可视化核验。失败时先修复坐标、时间或对象 token（标识）追踪，不进入栅格化。
+
+##### Phase 0.5c：时序 occupancy 栅格化
+
+按冻结网格将 oriented footprint（有方向轮廓）写入两个通道，生成 temporal_occupancy、valid mask 与对象—栅格叠加图；测试边界、旋转、重叠、空场景和确定性。失败时提升并修复 raster_config_version，不以扩大网格隐藏轴向错误。
+
+##### Phase 0.5d：一致性审核与 Core 接口冻结
+
+运行 object-raster consistency（对象—栅格一致性）、真实样本人工审核和 Phase 0.6 producer → consumer intake（生产者到消费者接入），冻结 temporal_agents、temporal_occupancy、grid metadata、valid masks、motion / raster / class mapping version 和 source SHA。Core 通过后即可进入 Phase 0.6，不等待预测分支。
+
+##### Phase 0.5e：条件式当前占用预测
+
+仅在增强条件满足时选择一个兼容 BEV encoder（鸟瞰图编码器），完成 multi-camera / calibration adapter（多相机 / 标定适配器）、current occupancy target（当前占用目标）、训练或特征提取 smoke（冒烟验证）和 validation 指标。任何失败都只阻塞增强路径。
+
+##### Phase 0.5f：条件式 semantic-geometric fusion
+
+若当前占用预测达到可解释的 validation（验证集）结果，再将 geometry feature（几何特征）接入 Phase 0.4 shared representation（共享表征），只比较 Phase 0.4 trajectory（轨迹）与 Phase 0.4 + predicted BEV feature trajectory（预测鸟瞰图特征轨迹）。动作头、动作条件化公式、[B,6,2] 输出和 verifier（验证器）保持不变；未获得增益时保留负结果，不阻塞 Core。
+
+本阶段 artifact（产物）至少包括：
+
+- temporal-agent contract / sample-level records（时序对象协议 / 样本级记录）；
+- transform / timestamp / category audit（变换 / 时间戳 / 类别审计）；
+- raster config、temporal occupancy、valid masks 与 object-raster consistency receipt（一致性回执）；
+- synthetic test results（合成测试结果）与代表性真实样本可视化；
+- Phase 0.6 intake receipt（接入回执）；
+- 如执行增强：camera / calibration audit、encoder compatibility receipt（编码器兼容回执）、current occupancy predictions / metrics（当前占用预测 / 指标）、可选融合前后轨迹结果；
+- Git / config / source manifest / split mapping SHA、rule / transform / raster / encoder version 与样本数。
+
+派生数据、图像、缓存、checkpoint（检查点）和正式输出不进入 Git（版本控制系统）。当前项目 test（测试集）不得访问、恢复或重跑。
+
+#### 10.3.7 最小测试、审核与实验
+
+对象级自动测试至少覆盖：
+
+~~~text
+empty scene
+single vehicle ahead
+vehicle behind
+vehicle left / right
+rotated vehicle
+pedestrian / cyclist
+missing future annotation
+scene boundary
+timestamp mismatch
+~~~
+
+栅格级自动测试至少覆盖：
+
+~~~text
+axis-aligned box
+rotated box
+partially outside grid
+fully outside grid
+vehicle / VRU channel separation
+overlapping objects
+empty occupancy
+deterministic repeated output
+~~~
+
+还必须测试 current ego frame 轴方向、六步时间对齐、motion_source、valid masks、object-raster consistency、序列化 round-trip（往返）与 GT inference isolation（真值推理隔离）。人工审核只抽取少量代表性 train / validation 场景，叠加 boxes（框）、occupancy（占用表征）、ego trajectory（自车轨迹）和时间步；不进行论文级大规模重标注或标注者一致性实验。
+
+Core 只要求四项证据：
+
+1. object-level temporal geometry（对象级时序几何）；
+2. raster temporal occupancy（栅格级时序占用表征）；
+3. object-raster consistency（对象—栅格一致性）；
+4. representative real-sample visualization（代表性真实样本可视化）。
+
+若执行增强，只比较 GT-derived current occupancy（真值派生当前占用）与 predicted current occupancy（预测当前占用），报告 vehicle IoU、VRU IoU、per-channel precision / recall（分通道精确率 / 召回率）；若执行融合，再报告 fusion（融合）前后 ADE / FDE。所有结果只来自 validation（验证集），不要求多随机种子、置信区间、显著性检验、完整概率校准、多个 encoder（编码器）比较、多种 loss（损失）比较、多分辨率搜索或大量交叉分组。
+
+#### 10.3.8 Core Gate、条件增强失败与停止条件
+
+Phase 0.5 Core 通过条件：
+
+- 六个几何时间步与 Phase 0.4 的 [B,6,2] waypoint 时间严格对齐；
+- GT boxes（真值三维框）正确转换到 current ego frame（当前自车坐标系）；
+- vehicle / VRU 类别映射、annotation token（标注标识）和 motion_source 正确；
+- temporal_agents（时序对象）通过合成测试和真实样本审核；
+- temporal_occupancy [B,6,2,H_bev,W_bev] 的轴方向、网格范围、类别通道和时间正确；
+- object-raster consistency（对象—栅格一致性）没有未解释的系统性错误；
+- Phase 0.6 能读取稳定的 temporal_agents、temporal_occupancy、grid metadata、valid masks 与 provenance；
+- GT geometry（真值几何）没有进入 VLA inference（视觉-语言-动作模型推理）；
+- 所有开发、审核和配置选择只使用 train / validation，已消费 test 未被访问。
+
+Predicted occupancy（预测占用表征）性能、BEV fusion（鸟瞰图融合）是否改善轨迹、六相机模型是否训练成功，以及 occupancy network（占用预测网络）是否超过论文指标，均不得成为 Core Gate。
+
+失败分支：
+
+- **时间 / 坐标错误：** 停止栅格与评分器工作，先修复 anchor、transform、tolerance 和轴方向。
+- **对象追踪或 motion_source 不可信：** 保持 unavailable（不可用）并记录原因，不静默生成未来位置。
+- **栅格不一致：** 修复 origin、boundary、polygon intersection（原点 / 边界 / 多边形相交）或类别映射，提升版本后重跑受影响验证。
+- **增强路径受阻或无增益：** 保留原因或负结果，继续使用 Core 输出进入 Phase 0.6。
+- **发现 test 访问风险：** 立即停止，Core 不授权任何 sealed / consumed evaluation（封存 / 已消费评估）。
+
+#### 10.3.9 Demo 与面试能力映射
+
+Core Demo（核心演示）展示：同一 train / validation 样本的六步 GT oriented boxes（真值有方向框）、对象 token 与 motion_source、temporal occupancy（时序占用表征）、Phase 0.4 轨迹以及对象—栅格一致性结果。界面必须把 GT target / evaluator-only geometry（真值目标 / 仅评估器几何）与 model input / prediction（模型输入 / 预测）分区，不能把 GT occupancy 画成模型输入。
+
+Phase 0.5 Core 能通过以下证据证明能力：
+
+- **nuScenes 3D annotation parsing（nuScenes 三维标注解析）：** temporal-agent producer（时序对象生产者）、字段验证器与 sample-level record（样本级记录）。
+- **global-to-ego coordinate transform（全局到自车坐标变换）：** 确定性变换单元测试、前后左右合成案例与真实框叠加图。
+- **quaternion / yaw handling（四元数 / 航向角处理）：** 旋转框测试、矩阵 / 航向角 round-trip（往返）和 rotated-box visualization（旋转框可视化）。
+- **temporal alignment（时序对齐）：** 六步时间收据、容差审计、missing / scene-boundary tests（缺失 / 场景边界测试）。
+- **oriented box rasterization（旋转框栅格化）：** polygon-cell intersection 测试和对象—栅格叠加图。
+- **BEV grid design（鸟瞰图网格设计）与 occupancy representation（占用表征）：** 版本化 raster config、两通道张量和范围可视化。
+- **object / raster consistency validation（对象 / 栅格一致性验证）：** 自动 consistency receipt（一致性回执）与抽样审核。
+- **GT / inference information isolation（真值 / 推理信息隔离）：** 输入协议测试、artifact provenance 与 Phase 0.6 evaluator-only 标识。
+
+若执行 Enhancement（条件增强），额外通过 camera-order / calibration tests（相机顺序 / 标定测试）、camera-to-BEV feature artifact（相机到鸟瞰图特征产物）、current occupancy metrics（当前占用指标）和可选 fusion comparison（融合比较）展示 multi-camera calibration（多相机标定）、camera-to-BEV feature extraction（相机到鸟瞰图特征提取）、lightweight occupancy prediction（轻量占用预测）与 semantic-geometric fusion（语义—几何融合）。
+
+### 10.4 Phase 0.6：factorized-action-conditioned candidate trajectories（因子化动作条件化候选轨迹）+ GT-derived BEV/OCC safety reranking（真值派生鸟瞰图 / 占用表征安全重排序）
+
+> 本阶段把 Phase 0.4 的 factorized action probabilities（因子化动作概率）、共享 driving feature（驾驶特征）、同一个 waypoint head（轨迹点头）与 trajectory-to-action verifier（轨迹到动作验证器）真正贯通到候选生成，再用 Phase 0.5 Core 的 GT-derived geometry（真值派生几何）完成 oracle offline reranking（真值离线重排序）。它是 open-loop（开环）离线评估与选择证据，不是可部署在线安全决策。
+
+#### 10.4.1 阶段状态、目标、输入与信息边界
+
+- **阶段状态：** planned（计划中）。
+- **核心目标：** Phase 0.4 action probabilities → top action pairs（高概率动作对）→ action-conditioned candidate trajectories（动作条件化候选轨迹）→ trajectory-to-action verification（轨迹到动作验证）→ GT-derived geometric safety scoring（真值派生几何安全评分）→ offline candidate reranking（离线候选重排序）。
+- **前置条件：** Phase 0.4 的 p_long、p_lat、shared feature h、动作 embedding（嵌入）、waypoint head、verifier、[B,6,2] / [B,6] 坐标时间协议已冻结；Phase 0.5 Core 的 temporal_agents、temporal_occupancy、grid metadata、valid masks 与 provenance 已通过 Gate（门槛）。
+- **核心输出：** 固定候选库、逐候选动作一致性与运动学状态、对象级 / 栅格级风险分项、完整代价、oracle-selected trajectory（真值选择轨迹）、选择原因和 sample-level artifact（样本级产物）。
+
+核心链路为：
+
+~~~text
+p_long [B,4] + p_lat [B,3]
+→ top-3 action pairs
+→ raw soft + 3 hard action-pair + 2 fallback trajectories
+→ per-candidate verifier + kinematic validation
+→ GT temporal agents / occupancy evaluator
+→ decomposed costs
+→ oracle offline reranking
+~~~
+
+GT boxes（真值三维框）、GT temporal occupancy（真值时序占用表征）和 future agents（未来交通参与者）只进入 evaluator（评估器），不得进入 action pair selection（动作对选择）、waypoint head、候选生成或 VLA inference（视觉-语言-动作模型推理）。核心结果必须命名为 oracle offline reranking（真值离线重排序），不得命名为 deployable selector（可部署选择器）、online safety policy（在线安全策略）、camera-only safety selection（仅相机安全选择）或 closed-loop safety controller（闭环安全控制器）。
+
+#### 10.4.2 动作组合概率与固定候选张量
+
+Phase 0.4 输出：
+
+~~~text
+p_long: [B,4]
+p_lat:  [B,3]
+~~~
+
+动作组合概率定义为：
+
+~~~text
+p_pair(i,j) = p_long(i) * p_lat(j)
+~~~
+
+第一版不人为禁止明确可组合的纵向 / 横向动作，最多形成 4 × 3 = 12 个 action pairs（动作对）。对每个样本按 joint probability（联合概率）降序选择 top-3；概率并列时使用冻结的 longitudinal class order（纵向类别顺序）、lateral class order（横向类别顺序）和稳定索引打破平局，保证结果确定且可复现。
+
+固定候选库：
+
+| index | candidate_type | 生成方式 |
+|---:|---|---|
+| 0 | raw_soft_conditioned | 使用完整 p_long / p_lat 的 soft action embedding（软动作嵌入）得到 Phase 0.4 原始轨迹 |
+| 1 | top1_hard_action_pair | top-1 动作对的纵向 / 横向 one-hot embedding（独热嵌入） |
+| 2 | top2_hard_action_pair | top-2 动作对的纵向 / 横向 one-hot embedding |
+| 3 | top3_hard_action_pair | top-3 动作对的纵向 / 横向 one-hot embedding |
+| 4 | controlled_braking_fallback | 受控制动回退 |
+| 5 | stationary_fallback | 停车回退 |
+
+主线固定：
+
+~~~text
+M = 6
+K = 6
+candidate_trajectories: [B,6,6,2]
+candidate_valid_masks:  [B,6,6]
+~~~
+
+所有候选保持 Phase 0.4 的 current ego frame（当前自车坐标系）、x 前向、y 左向、米单位、3.0 秒 horizon（预测时域）和 0.5 秒 interval（间隔），不得为 safety scorer（安全评分器）改变时间轴。
+
+#### 10.4.3 动作条件化候选生成、fallback 与 metadata
+
+Top-3 hard action-pair candidates（硬动作对候选）必须复用同一个 Phase 0.4 waypoint head：
+
+~~~text
+shared driving feature h
++ selected longitudinal one-hot embedding
++ selected lateral one-hot embedding
+→ same waypoint head
+→ [B,6,2]
+~~~
+
+候选生成不得重新训练另一个 trajectory model（轨迹模型），不得读取 GT action（真值动作）或 GT trajectory（真值轨迹）。每条 hard candidate（硬候选）保存动作对、联合概率、rank（排名）与 conditioning type（条件化类型）。该接口迁移 DriveMA（可验证元动作驾驶视觉-语言-动作模型）的高层动作到轨迹思想，并借鉴 multimodal anchor（多模态锚点）的离散候选概念，但不实现 diffusion model（扩散模型）或论文规模强化学习。
+
+确定性 fallback candidates（回退候选）只保留两条：
+
+- **controlled_braking_fallback（受控制动回退）：** 从 raw trajectory（原始轨迹）或当前速度出发，沿原轨迹方向逐步减少纵向进度；保持六步时间轴，不突然改变横向方向、不产生反向运动，并通过速度、加速度与 jerk（加加速度）基础可行性检查。
+- **stationary_fallback（停车回退）：** 六个点保持在当前自车原点附近，只作为最后回退；必须承担 progress / unnecessary-stop penalty（进度 / 不必要停车惩罚），不得因始终停车自动获得最低总成本。
+
+Fallback 参数、制动 profile（曲线）、原点容差、最大减速度、jerk limit（加加速度限制）和 generator version（生成器版本）必须配置化、版本化；不再把 mild / strong / emergency（轻度 / 强度 / 紧急）多级速度缩放矩阵作为核心。
+
+每个候选至少记录：
+
+~~~text
+candidate_index
+candidate_type
+longitudinal_action
+lateral_action
+joint_action_probability
+conditioning_type
+source_model_checkpoint
+source_waypoint_head_version
+generator_version
+trajectory_valid
+invalid_reason
+verifier_output
+~~~
+
+raw_soft_conditioned 额外记录完整 p_long、完整 p_lat、top-1 action pair（最高概率动作对）和 raw trajectory source（原始轨迹来源）。Fallback 候选额外记录 fallback parameters（回退参数）、source raw trajectory（来源原始轨迹）、braking profile（制动曲线）与 fallback severity（回退程度）。所有候选保存 sample_token、split、model / config SHA、coordinate / time version 和 candidate provenance（候选来源追溯）。
+
+#### 10.4.4 每候选 verifier 与运动学检查
+
+六条候选必须分别运行 Phase 0.4 trajectory-to-action verifier（轨迹到动作验证器）：
+
+- hard action-pair candidate（硬动作对候选）：比较 conditioning action pair（条件化动作对）与 trajectory-implied action pair（轨迹隐含动作对）；
+- raw soft candidate（原始软动作候选）：比较模型 top-1 action pair 与轨迹隐含动作对；
+- controlled_braking_fallback：显式期望 longitudinal action（纵向动作）为 decelerate / stop；
+- stationary_fallback：显式期望 longitudinal action 为 stop。
+
+逐候选输出：
+
+~~~text
+longitudinal_consistent
+lateral_consistent
+joint_consistent
+consistency_reason
+verifier_version
+~~~
+
+Fallback 的语义一致性只验证生成器是否符合回退意图，不得混入模型动作分类准确率。
+
+Kinematic validation（运动学检查）至少检查 shape（形状）、NaN / Inf（非数 / 无穷值）、valid mask（有效掩码）、时间间隔、反向运动、速度、加速度、jerk、曲率与有效 horizon（时域）。无效候选保留 metadata 和 invalid_reason，但不进入正常最小成本比较；若所有候选无效，selector（选择器）必须 fail closed（失败即关闭）并输出 no_valid_candidate（无有效候选），不能伪造安全结果。
+
+#### 10.4.5 Ego footprint 与时间对齐
+
+Waypoint（轨迹点）不能被当作无面积点。Ego footprint contract（自车轮廓协议）至少包括：
+
+~~~text
+ego_length_m
+ego_width_m
+reference_point
+front_offset_m
+rear_offset_m
+vehicle_margin_m
+VRU_margin_m
+heading_derivation
+footprint_version
+~~~
+
+Heading（航向角）优先由相邻有效 waypoint 差分得到；重复点或极低速点沿用最近稳定航向，首尾缺少双侧差分时使用单侧差分，最后一点使用最近有效 segment heading（轨迹段航向），有效点不足时标记 heading unavailable（航向不可用）并按版本化 conservative policy（保守策略）处理。上述每条路径都必须有确定性单元测试。
+
+车辆与 VRU 使用不同 safety margin（安全边界），具体数值仅由 train-derived statistics（训练集派生统计）、validation（验证集）和可视化审核冻结，不冒充真实道路物理安全标准。Footprint 与 temporal_agents / temporal_occupancy 必须按相同六步时间轴对齐。
+
+#### 10.4.6 GT-derived object / raster safety evaluator
+
+Phase 0.6 Core scorer（核心评分器）读取：
+
+~~~text
+candidate_trajectories [B,6,6,2]
+candidate_valid_masks [B,6,6]
+temporal_agents
+temporal_occupancy
 BEV grid metadata
-geometry feature version
-occupancy threshold/config
-model/checkpoint provenance
-```
+ego footprint contract
+~~~
 
-#### 10.3.10 Artifact、版本与 provenance
+实现顺序固定：
 
-本阶段计划实现 multi-camera/calibration adapter、occupancy target producer、geometry encoder adapter、occupancy head、fusion module、loss/metrics、visualization 与 tests；具体文件名和 CLI 在实施子任务中确定，本文不把 planned 入口写成已经存在。
+1. 先完成 object-level backend（对象级后端）：将每个候选的 oriented ego footprint（有方向自车轮廓）与对应时间步 vehicle / VRU oriented boxes（车辆 / 弱势道路使用者有方向框）计算相交、距离与时间关系。
+2. 再完成 raster-level backend（栅格级后端）：将同一 ego footprint 栅格化到相同 BEV grid（鸟瞰图网格），与 temporal occupancy 对齐检查冲突和净空近似。
+3. 比较两个 backend（后端）的 candidate-level（候选级）结果；对系统性分歧生成 box / footprint / raster overlay（框 / 自车轮廓 / 栅格叠加）和 reason taxonomy（原因分类）。
 
-本地 artifact（产物）至少包括：camera / calibration audit（相机 / 标定审计）、anchor / timestamp receipt（锚点 / 时间戳回执）、BEV grid / raster config（鸟瞰图网格 / 栅格配置）、GT occupancy statistics / visualizations（真值占用统计 / 可视化）、encoder compatibility report（编码器兼容报告）、feature-cache manifest（特征缓存清单，如启用）、training config / curves（训练配置 / 曲线）、checkpoint provenance（检查点来源）、sample-level longitudinal / lateral action、waypoint、consistency 与 occupancy predictions（样本级纵向 / 横向动作、轨迹点、一致性和占用预测）、ablation matrix（消融矩阵）与 failure cases（失败案例）。派生数据、cache（缓存）、checkpoint（检查点）、日志和正式输出不进入 Git（版本控制系统）。
+核心风险项：
 
-Artifact 至少记录 Git/config SHA、source manifest/schema/split mapping SHA、camera set/order、anchor/tolerance/calibration version、raster config/class mapping version、model/processor/geometry encoder revision、feature/fusion version、checkpoint SHA、random seed、train/validation sample count 与 metric protocol version。
+~~~text
+collision
+near_miss
+minimum_vehicle_clearance
+minimum_VRU_clearance
+time_to_conflict
+~~~
 
-#### 10.3.11 实验指标、分组分析与资源证据
+Time to conflict（冲突时间）与 TTC（碰撞时间）必须记录离散时间定义、插值策略和无冲突语义。没有可靠 map contract（地图协议）时，不加入 off-road（驶离道路）、lane violation（车道违规）、traffic-rule violation（交通规则违规）或 route deviation（路线偏离）。
 
-Trajectory 继续报告：
+Object backend（对象后端）与 raster backend（栅格后端）必须使用同一时间、坐标、margin（边界）和类别版本。Raster 只能作为独立几何后端，不能把 occupancy 值直接等同于最终 safety score（安全分数）。
 
-```text
-ADE@1s / 2s / 3s
-FDE@1s / 2s / 3s
-trajectory valid rate
+#### 10.4.7 分解代价与确定性重排序
+
+每个候选必须单独持久化：
+
+~~~text
+J_action_confidence
+J_consistency
+J_risk
+J_progress
+J_comfort
+J_fallback
+~~~
+
+语义为：
+
+- J_action_confidence：动作组合概率不足的代价；raw soft candidate 使用模型概率摘要，fallback 使用显式非模型来源标识。
+- J_consistency：conditioning / expected action pair（条件化 / 期望动作对）与 trajectory-implied action（轨迹隐含动作）不一致的代价。
+- J_risk：collision、near-miss、clearance（净空距离）、time to conflict / TTC 和 VRU 风险。
+- J_progress：终点前进不足、相对 raw trajectory 的进度损失与 unnecessary stop（不必要停车）。
+- J_comfort：速度、加速度、jerk 和曲率异常。
+- J_fallback：对受控制动和停车回退的有序惩罚，stationary 不得零代价。
+
+unnecessary_stop（不必要停车）定义为：selector（选择器）选中最终停车的 stationary_fallback，或选中导致停车的 controlled_braking_fallback，但同一样本的 raw_soft_conditioned 候选在 oracle object / raster geometry（真值对象 / 栅格几何）下没有超过冻结的 collision / near-miss（碰撞 / 近失）阈值。停车速度、持续时间、净空与冲突阈值只用 validation（验证集）冻结；oracle geometry 不可用时标为 unavailable（不可用），不能推断为 false。该定义只用于离线审计，不得在推理路径读取真值。
+
+总成本固定为：
+
+~~~text
+J_total
+= w_action      * J_action_confidence
++ w_consistency * J_consistency
++ w_risk        * J_risk
++ w_progress    * J_progress
++ w_comfort     * J_comfort
++ w_fallback    * J_fallback
+~~~
+
+Selector 只在有效候选中选择最小 J_total；平局使用冻结的 candidate_index 顺序。所有原始分项、归一化值、权重、总分、选择原因与未选原因必须持久化，不能只保存总分。权重只能通过 train-derived statistics 和 validation 上少量预定义配置冻结，不做大规模网格搜索，不根据 test 调整。J_risk 不能完全覆盖 progress，否则系统会总停车；J_progress 也不能覆盖 collision 风险。
+
+#### 10.4.8 Oracle 边界与条件式 predicted-geometry scorer
+
+使用 Phase 0.5 Core GT geometry（真值几何）选择候选的结果只能命名为 oracle offline reranking（真值离线重排序）。它能证明候选轨迹接口、高层动作—轨迹组合、几何评估、重排序和安全 / 进度 / 舒适性权衡；不能证明在线感知安全、真实道路安全、完整闭环或可部署安全系统。
+
+只有 Phase 0.5 Enhancement（条件增强）成功时，才可增加 inference-compatible predicted-geometry scorer（推理兼容预测几何评分器）。该分支只能读取：
+
+~~~text
+predicted current occupancy probabilities
+BEV grid metadata
+candidate trajectories
+current ego state
+~~~
+
+它不读取 GT boxes、GT occupancy、future agents 或 future occupancy。由于只预测 current occupancy（当前占用表征），允许使用随时间增长的 occupancy dilation（占用膨胀）近似不确定性，但必须标为近似，不能冒充 future occupancy prediction（未来占用预测）或真实对象运动预测。该分支不属于 Core Gate。
+
+若执行条件分支，只报告 oracle vs predicted selected-candidate agreement（真值与预测所选候选一致率）、unsafe-candidate recall（不安全候选召回率）和 false-alarm rate（误报率），同时给出样本量、协议和限制；不要求完整 rank calibration（排序校准）、risk-bin calibration（风险分箱校准）或大规模一致性矩阵。
+
+#### 10.4.9 最小比较、指标与 failure analysis
+
+核心只比较：
+
+1. raw soft-conditioned trajectory（原始软动作条件化轨迹）；
+2. oracle safety-reranked trajectory（真值安全重排序轨迹）；
+3. oracle best candidate upper bound（真值候选上界）。
+
+第三组只说明固定候选库是否包含更优轨迹，不是部署结果。Predicted-geometry reranked trajectory（预测几何重排序轨迹）仅在 Phase 0.5 Enhancement 完成后可选增加。分项 cost（代价）仍逐候选保存，但不要求 risk-only、risk + progress、多套总分、多 fallback 组合或多 candidate bank（候选库）形成论文式消融矩阵。
+
+核心指标：
+
+~~~text
+raw collision / near-miss rate
+reranked collision / near-miss rate
+minimum vehicle clearance
+minimum VRU clearance
+time to conflict
+terminal progress
+progress loss after reranking
+acceleration / jerk
+unnecessary stop rate
 longitudinal consistency rate
 lateral consistency rate
 joint consistency rate
-```
+raw retention rate
+fallback rate
+selected candidate type distribution
+invalid candidate rate
+ADE@1s / 2s / 3s
+FDE@1s / 2s / 3s
+~~~
 
-Action 继续报告：
+核心 Gate 不要求置信区间、显著性检验、多随机种子、大量场景交叉统计、完整概率校准曲线或 tail quantile（尾部分位数）全套报告。人工 failure analysis（失败分析）聚焦少量代表性类型：raw trajectory collision（原始轨迹碰撞）、action-trajectory inconsistency（动作—轨迹不一致）、over-conservative stop（过度保守停车）、VRU conflict（弱势道路使用者冲突）、all candidates invalid（全部候选无效）和 object / raster scorer disagreement（对象 / 栅格评分器分歧）。
 
-```text
-longitudinal macro-F1
-lateral macro-F1
-joint action accuracy
-```
+#### 10.4.10 详细实施子步骤
 
-上述动作指标沿用 Phase 0.4 的独立有效性合同：纵向指标只使用 `longitudinal_action_valid`，横向指标只使用 `lateral_action_valid`，联合准确率只使用 `factorized_action_joint_valid`，并分别报告有效样本数。
+##### Phase 0.6a：candidate contract and top action-pair generation（候选协议与高概率动作对生成）
 
-Occupancy 至少报告：
+- **输入 / 输出：** 输入 p_long [B,4]、p_lat [B,3]、类别顺序与模型版本；输出 12 个 p_pair、确定性 top-3 动作对和候选 metadata 骨架。
+- **实现 / 复用：** 复用 Phase 0.4 动作 head 输出和版本化类别 schema，实现乘积、排序、tie-break（平局处理）与概率有限值检查。
+- **禁止 / 失败：** 不读取 GT action / trajectory；概率 shape、归一化或有限值错误时 fail closed，不生成伪候选。
+- **测试 / artifact / 面试证据：** 测试乘积、排序、并列概率与 batch determinism（批次确定性）；保存 pair table（动作对表）、top-3 receipt（回执）和来源版本，证明因子化动作组合与确定性接口设计。
 
-```text
-vehicle IoU
-VRU IoU
-macro occupancy IoU
-per-channel precision / recall / F1
-occupied-cell rate
-false-positive occupancy rate
-```
+##### Phase 0.6b：action-conditioned candidate trajectories（动作条件化候选轨迹）
 
-不能只报告总体 accuracy（准确率），因为背景 grid（网格）占比可能很高。Trajectory（轨迹）和 occupancy（占用表征）至少按 `VRU present/absent`、nearby-agent density（邻近交通参与者密度）、camera availability（相机可用性）、ego speed range（自车速度范围）、longitudinal / lateral action combination（纵向 / 横向动作组合）分组；day / night（白天 / 夜间）仅在字段可靠且经过审计时使用。Legacy six-class metric（旧六分类指标）只可作为可选兼容结果。
+- **输入 / 输出：** 输入 shared feature h、p_long / p_lat、top-3 one-hot embeddings（独热嵌入）和同一 waypoint head；输出 raw + 3 hard candidates（硬候选）以及两个 fallback，总张量 [B,6,6,2]。
+- **实现 / 复用：** 复用 Phase 0.4 soft / hard conditioning（软 / 硬条件化）和 waypoint head；fallback 使用版本化确定性生成器。
+- **禁止 / 失败：** 不训练第二个轨迹模型，不读 GT action / trajectory；head 或 fallback 输出异常时只将对应候选标为 invalid（无效）。
+- **测试 / artifact / 面试证据：** 测试六候选顺序、shape、时间坐标、hard embedding 和 fallback 单调制动；保存 candidate bank、生成参数和 checkpoint provenance，证明同一多模态表征可生成动作可控轨迹。
 
-资源指标记录 trainable parameters、peak memory、training step time、inference latency 与 feature-cache size（如使用）。所有数字必须真实测量后填写，本文不预设性能、显存或 latency。
+##### Phase 0.6c：candidate verification and kinematic validation（候选一致性验证与运动学检查）
 
-#### 10.3.12 自动测试、真实数据 smoke 与人工审核
+- **输入 / 输出：** 输入六条候选、conditioned / expected action（条件化 / 期望动作）和 masks；输出逐候选 verifier、kinematic validity（运动学有效性）与 invalid_reason。
+- **实现 / 复用：** 六次调用 Phase 0.4 verifier，并计算速度、加速度、jerk、曲率、反向运动和有效时域。
+- **禁止 / 失败：** 不用 scorer 分数修正轨迹或动作；失败候选保留原值与原因并排除选择。
+- **测试 / artifact / 面试证据：** 覆盖 soft / hard / braking / stationary、动作冲突、NaN、mask 和全无效；保存 verification table（验证表）与失败图，证明可验证元动作和防御性候选协议。
 
-Calibration tests 至少覆盖：
+##### Phase 0.6d：GT-derived object/raster safety scoring（真值派生对象 / 栅格安全评分）
 
-- intrinsics shape、有限值和 camera order；
-- quaternion/rotation matrix 合法性；
-- camera → ego-at-camera-time → global → anchor ego transform；
-- identity/synthetic transform 与 known 3D point projection；
-- 左右 camera 方向不反转；
-- timestamp offset、tolerance 与 `camera_valid_mask`；
-- scene boundary guard。
+- **输入 / 输出：** 输入有效候选、temporal_agents、temporal_occupancy、grid metadata 与 ego footprint；输出 object / raster 两套 collision、near-miss、clearance 和 time-to-conflict 分项。
+- **实现 / 复用：** 复用 Phase 0.5 Core 坐标、时间、box、raster 和 valid-mask 合同；先对象后栅格，并生成分歧原因。
+- **禁止 / 失败：** GT geometry 仅在离线 evaluator 使用；任一 backend 版本不匹配时 fail closed，不以另一后端冒充双后端通过。
+- **测试 / artifact / 面试证据：** 覆盖碰撞、擦边、不同 VRU margin、时间错位、旋转 footprint 和 object-raster disagreement；保存逐候选风险表与叠加图，证明几何安全评估能力。
 
-Raster tests 至少覆盖：
+##### Phase 0.6e：cost composition and offline reranking（代价组合与离线重排序）
 
-- axis-aligned 与 rotated box；
-- grid boundary、partially outside 与 empty scene；
-- vehicle/VRU channel mapping、overlap 和 ignored class；
-- deterministic raster output 与 `occupancy_valid_mask`。
+- **输入 / 输出：** 输入动作置信、一致性、风险、进度、舒适与 fallback 分项；输出 J_total、oracle-selected index / trajectory、selection reason（选择原因）和 upper bound（上界）。
+- **实现 / 复用：** 使用版本化 normalization（归一化）、有限预定义权重、稳定 tie-break 与 invalid filter（无效过滤）。
+- **禁止 / 失败：** 不用 test 调权重，不让 stationary 自动胜出；全候选无效时输出 no_valid_candidate。
+- **测试 / artifact / 面试证据：** 测试 risk / progress 冲突、相同总分、stationary penalty、raw retention 与权重版本；保存 component table（分项表）、选择审计和失败案例，证明多目标系统设计。
 
-Model/contract tests 至少覆盖：
+##### Phase 0.6f：minimal comparison, visualization and interface freeze（最小比较、可视化与接口冻结）
 
-- multi-camera batch、BEV feature、geometry-token 与 occupancy-logit shape；
-- camera/BEV mask 和 positional information；
-- masked occupancy loss；
-- semantic-geometric fusion forward 与梯度；
-- Phase 0.4 longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]`、`predicted_waypoints [B,6,2]`、`trajectory_valid_mask [B,6]` 与 verifier output（验证器输出）合同不变；
-- Phase 0.4 逐方向 validity / reason（有效性 / 原因）与 `factorized_action_joint_valid` 可被真实 consumer intake（消费者接入）读取，且纵向 / 横向 loss mask（损失掩码）互不覆盖；
-- checkpoint save/load；
-- inference path 不要求 GT occupancy；
-- test split guard。
+- **输入 / 输出：** 输入 raw、oracle-reranked、oracle best candidate 和全部 sample-level artifacts；输出最小指标表、代表性可视化、failure cases 与 Phase 0.7 handoff（交接）。
+- **实现 / 复用：** 只用 train / validation 完成三组比较，若增强成功再可选增加 predicted-geometry 组。
+- **禁止 / 失败：** 不访问已消费 test，不把 oracle 结果写成在线能力；若风险改善主要来自 stationary，则 Gate 失败。
+- **测试 / artifact / 面试证据：** 核对指标重算、serialization round-trip（序列化往返）、provenance 和 consumer intake；展示完整候选、分项和选择原因，证明端到端可审计重排序。
 
-真实数据 smoke 只使用 train/validation，必须走通：
+#### 10.4.11 自动测试、真实数据审核与 artifact
 
-```text
-multi-camera records
-→ calibration transforms
-→ GT current occupancy target
-→ geometry encoder
-→ occupancy prediction
-→ semantic-geometric fusion
-→ longitudinal/lateral action prediction
-→ meta-action-conditioned waypoint prediction
-→ trajectory-to-action verification
-→ metrics and artifact persistence
-```
+除各子步骤测试外，集成测试至少覆盖 [B,6,6,2] / [B,6,6] 合同、top-3 tie-break、同一 waypoint head 复用、六候选 verifier、fallback 运动学、ego heading 边界、object / raster scorer、分项成本、invalid candidate filter、stationary penalty、GT inference isolation 与 consumed-test guard（已消费测试保护）。
 
-人工审核至少检查六相机是否属于同一 anchor 附近、camera order 与 timestamp offsets、3D box 到图像投影、GT/predicted occupancy、GT trajectory、Phase 0.4 prediction、Phase 0.5 fused prediction，以及 VRU、密集车辆和左右横向运动场景。GT occupancy 与 GT trajectory 必须在可视化中明确标为 training/evaluation target。
+真实数据 smoke（冒烟验证）只用 train / validation，必须走通：
 
-#### 10.3.13 Gate、失败分支与停止条件
+~~~text
+Phase 0.4 probabilities + h
+→ top-3 pairs
+→ six candidates
+→ verifier + kinematic validation
+→ Phase 0.5 Core object/raster geometry
+→ decomposed costs
+→ oracle offline reranking
+→ metrics + artifact persistence
+~~~
 
-Phase 0.5 通过条件：
+人工审核少量代表性样本，至少包含 raw 安全并保留、raw 冲突后选择 hard candidate（硬候选）、只能使用制动回退、过度保守停车、动作—轨迹不一致、VRU conflict 和 object-raster disagreement。所有 artifact 保留 sample_token、candidate metadata、model / waypoint / verifier / footprint / scorer / selector / raster version、config / Git SHA、split 和输入来源；派生结果、图像、checkpoint 和日志不进入 Git。
 
-- multi-camera/calibration contract 通过自动测试和人工审核；
-- anchor、BEV grid 与 current occupancy target 正确且版本化；
-- geometry encoder 稳定输出 BEV features；
-- occupancy model 超过 trivial all-background/class-prior reference；
-- fusion model 可稳定训练、保存、加载和推理；
-- fused trajectory 不出现坐标、方向、mask 或数值异常；
-- 所有训练、checkpoint selection、ablation 与报告只使用 train/validation；
-- Phase 0.6 可消费稳定的 predicted trajectory、predicted occupancy 与 BEV metadata；
-- inference 不读取 GT occupancy、GT boxes、future agents 或已消费 test。
+#### 10.4.12 Core Gate、失败分支与停止条件
 
-理想增益是 `semantic + BEV` 在整体或关键安全场景上优于 Phase 0.4，且 occupancy auxiliary 对 geometry 或 trajectory 有可解释帮助；这不是预设事实，必须由 validation ablation 证明。
+Phase 0.6 Core 通过条件：
+
+- p_long × p_lat 的组合概率正确，top-3 动作对选择确定且可复现；
+- 同一个 Phase 0.4 waypoint head 能生成三条 hard action-pair candidates；
+- 候选库固定为 candidate_trajectories [B,6,6,2] 与 candidate_valid_masks [B,6,6]；
+- 六条候选都有完整 metadata，分别通过 verifier 或留下明确 invalid_reason；
+- 两条 fallback 通过基础运动学检查，且 stationary 有 progress / unnecessary-stop penalty；
+- ego footprint 与候选、temporal agents、temporal occupancy 的六步时间严格对齐；
+- object-level scorer 与 raster-level scorer 均通过，未留下系统性轴向、类别或时间差异；
+- reranker 持久化每个分项、J_total、选择原因和未选原因；
+- 风险下降不主要依赖 stationary fallback，progress loss 与 unnecessary stop 可审计；
+- 所有正式结果来自 train / validation，没有访问、恢复或重跑已消费 test；
+- 冻结输出接口可以交给 Phase 0.7，但不授权将 oracle geometry 用作在线输入。
+
+Predicted occupancy scorer（预测占用评分器）不得成为 Core Gate。
 
 失败分支：
 
-- **Calibration/raster 错误：** 停止训练，先修复坐标、时间、class mapping 与 target producer。
-- **Occupancy 不超过 trivial baseline：** 停止 joint training，审计背景不平衡、raster、mask、loss 与 encoder。
-- **Occupancy 有效但 trajectory 无提升：** 允许进入 Phase 0.6，但必须保留“BEV 未改善当前 open-loop trajectory”的负结果，以 Phase 0.4 trajectory 为对照，并只把 predicted occupancy 表述为候选 safety geometry interface。
-- **Fusion 导致 trajectory 明显退化：** 回退到简单 fusion baseline，检查 token scale、normalization、mask 与 loss weighting；不得删除不利对照。
-- **Phase 0.4 未超过简单 baseline：** 只可报告 geometry interface 与增量消融，不得宣称 final trajectory core 已成功。
-- **资源不足：** 依次尝试 freeze backbone、cache frozen features、降低 image/BEV resolution、减小 batch、gradient accumulation 与受控外部 GPU；不得静默改变数据、坐标或 target contract。
-
-任何使用新 untouched evaluation protocol 的不可逆评估必须单独建立 contract、shadow execution、durable claim 与 rerun guard；Phase 0.5 本身不授权访问、恢复或重跑 Phase 0.2d consumed test。
-
-#### 10.3.14 阶段学习目标、Demo 与面试证据
-
-本阶段可证明：nuScenes multi-camera 数据理解、camera calibration、异步多相机 ego-motion compensation、camera-to-BEV geometry、occupancy target construction、BEV feature learning、VLM semantic 与 geometry feature fusion、multi-task learning、资源控制、消融和 failure analysis。
-
-阶段 Demo：
-
-```text
-historical CAM_FRONT
-+ current six-camera images
-+ current/past ego state
-→ temporal semantic features
-+ BEV geometry
-→ current occupancy prediction
-→ longitudinal logits/probabilities [B,4]
-→ longitudinal predicted class [B]
-+ lateral logits/probabilities [B,3]
-→ lateral predicted class [B]
-→ predicted_waypoints [B,6,2]
-→ action-trajectory consistency
-```
-
-Demo 至少显示六相机缩略图、current GT occupancy（明确为 training/evaluation target）、predicted occupancy、GT trajectory（明确为 target）、Phase 0.4 trajectory、Phase 0.5 fused trajectory、action prediction 与输入/输出版本信息。GT occupancy 或 GT boxes 不得显示为模型在线输入。
-
-### 10.4 Phase 0.6：trajectory safety scorer 与 safety-aware selection
-
-> Phase 0.6 不是另起一个 safety model 项目，而是在 Phase 0.4/0.5 同一 VLA policy 的真实预测轨迹之后增加确定性候选、双 scorer 与可审计 selector：oracle scorer 只用于离线校准和上界，deployable scorer 才代表可部署信息边界。
-
-#### 10.4.1 阶段状态、目的、前置条件与主链路
-
-- **阶段状态：** `planned`。
-- **阶段目的：** 对 Phase 0.4/0.5 生成的 raw trajectory 及其确定性 fallback candidates 分解风险、进度、舒适性和 policy deviation，在不改写候选轨迹的前提下选择一条输出，并验证风险下降是否以过度停车或明显进度损失为代价。
-- **前置条件：** Phase 0.4 trajectory coordinate/time/mask contract 已冻结；Phase 0.5 predicted occupancy probabilities、BEV grid metadata、threshold/config 与 model/checkpoint provenance 已通过 Gate；oracle 与 deployable 信息边界已冻结。
-- **后续消费者：** Phase 0.7 必须调用同一 policy、candidate generator、deployable scorer 和 selector；Phase 0.8 在 Phase 0.7 冻结的 rollout/reward contract 上 fine-tune 同一 policy，不重建另一套 safety pipeline。
-
-完整顺序固定为：
-
-```text
-Phase 0.4 / 0.5 policy raw trajectory
-→ Phase 0.6 raw + deterministic fallback candidate bank
-→ oracle offline scorer calibration and deployable predicted-geometry scoring
-→ deterministic safety-aware selection
-→ Phase 0.7 same policy + same selector quasi-closed-loop rollout
-→ Phase 0.8 same policy reinforcement fine-tuning
-```
-
-本阶段不训练新的端到端 safety model，不生成 learned multimodal trajectories，不把 GT future geometry 送入在线选择，不实现 controller/simulator，也不展开 DPO 或 RL。DPO 继续为 optional；核心交付是可审计的 trajectory-level safety layer。
-
-#### 10.4.2 Candidate bank 与张量合同
-
-每个 raw trajectory 至少确定性派生以下候选类型：
-
-```text
-raw policy trajectory
-mild speed reduction
-strong speed reduction
-controlled braking
-stationary / emergency fallback
-```
-
-候选数量、速度缩放比例、制动 profile、stationary 判定和 emergency margin 必须进入版本化配置，不在计划中硬编码最终数值。候选生成器只能使用 raw trajectory、其 valid mask、current ego state 和已冻结的 kinematic config；不得读取 GT future trajectory、GT future agents、oracle score 或 test feedback。所有候选必须保持 raw trajectory 的 current ego frame、单位、horizon 和 waypoint sampling contract。
-
-批量接口为：
-
-```text
-candidate_trajectories: [B, M, K, 2]
-candidate_valid_masks:  [B, M, K]
-candidate_types:        [B, M]
-candidate_metadata:     [B, M]
-selected_index:         [B]
-selected_trajectory:    [B, K, 2]
-selected_valid_mask:    [B, K]
-```
-
-- `M` 是配置决定的固定 candidate bank 大小，必须包含 raw candidate 和至少一种可停止 fallback；
-- `candidate_metadata` 至少记录 source raw prediction、生成参数、fallback severity、generator version 与 rejection reason；
-- 候选顺序固定并版本化，`selected_index` 必须能唯一回溯到 candidate type 和全部 component score；
-- selector 只能选择候选，不能在 scoring 后再次平滑、裁剪、插值或修改轨迹；任何轨迹变换都必须发生在 candidate generation 阶段并留下 provenance。
-
-#### 10.4.3 Kinematic validation 与 invalid candidate policy
-
-每条候选在评分前必须验证：
-
-- waypoint、导出速度、加速度、jerk 与 curvature 均为 finite；
-- timestamp、sampling interval、horizon 和 valid mask 一致；
-- 速度、加速度、jerk、curvature、lateral acceleration 与 reverse motion 满足版本化 feasibility bounds；
-- 有效点数量足以计算所需项，invalid tail 不得作为零坐标参与评分；
-- raw trajectory 与派生候选均没有坐标系、轴方向或单位漂移。
-
-Invalid candidate 必须被拒绝或赋予确定性高代价，并保存具体原因；不得 clamp、修正或推断非法值。若 raw candidate invalid，selector 只能从通过验证的 fallback 中选择；若所有候选 invalid，必须返回显式 failure/fallback state，不能伪造正常 selected trajectory。
-
-#### 10.4.4 Ego footprint 与几何冲突语义
-
-风险计算必须使用沿候选轨迹 rollout 的 oriented ego footprint，而不是把 waypoint 当作无面积的点。Footprint contract 至少记录 vehicle length/width、reference point、front/rear offset、safety margin、heading derivation、orientation convention 与 footprint version。若 waypoint 不直接提供 heading，必须采用单一、经 synthetic test 验证的导出策略，并对低速或重复点定义稳定行为。
-
-车辆与 VRU 使用独立 margin；VRU margin 可以更保守，但必须由 validation 与安全审计选择并版本化。Oriented overlap、clearance 和 near-miss 都必须尊重同一 BEV axis、cell boundary 和时间对齐合同。没有 map/route contract 时，不得凭空报告 off-road、lane 或 traffic-rule violation。
-
-#### 10.4.5 Oracle temporal-geometry scorer
-
-Oracle scorer 是 offline evaluator 和校准上界，只允许使用 validation 上的 GT current/future boxes 或由其构建的 temporal occupancy；它不属于模型 inference path，也不能写成 camera-only 安全能力。建议的 temporal geometry 形状为：
-
-```text
-oracle_temporal_geometry: [B, T_score, C, H_bev, W_bev]
-```
-
-Oracle contract 必须版本化：score horizon、time interval/tolerance、vehicle/VRU class mapping、box interpolation 或 nearest-time policy、missing-frame policy、BEV grid/raster config、unknown/ignored semantics 与 source provenance。时间不满足 tolerance、future annotation 缺失或 transform 不可靠时必须标为 unavailable，不能用当前 box 静态复制冒充真实 future geometry。
-
-Oracle risk decomposition 至少包括：
-
-```text
-vehicle collision / overlap
-VRU collision / overlap
-vehicle minimum clearance
-VRU minimum clearance
-near-miss indicator / severity
-time-to-collision or time-to-conflict
-```
-
-Collision、clearance、near-miss 与 TTC 的阈值、聚合和 invalid behavior 只由 train/validation synthetic/real audit 确认。Oracle selected result 只能作为 upper-bound reference，不得进入 deployable result 或 Phase 0.7 online selection。
-
-#### 10.4.6 Deployable predicted-geometry scorer
-
-Deployable scorer 的输入严格限制为：
-
-```text
-current predicted occupancy probabilities
-BEV grid metadata
-candidate trajectories and masks
-current ego state
-ego footprint contract
-```
-
-它不读取 GT boxes、GT occupancy、future agents、future occupancy、future ego trajectory 或 test labels。由于 Phase 0.5 核心只预测 current occupancy，本阶段不得将其描述为未来 occupancy prediction；正式做法是在候选时间轴上采用版本化、保守且随时间增长的 uncertainty inflation / occupancy dilation，表达感知与运动未知性，而不是伪造未来对象轨迹。
-
-Predicted occupancy 的概率必须保留，不能先硬阈值化后丢失概率信息。Deployable risk 至少包括沿 oriented footprint 的 integrated occupancy probability、maximum footprint risk、predicted clearance、time-weighted risk、VRU-weighted risk 与 inflation 后 conflict indicator。Occupancy threshold 可以服务离散审计指标，但 total cost 应保留概率风险项；dilation radius、time weighting、VRU weighting 与 aggregation 全部只用 validation 选择并进入 scorer version。
-
-如果 Phase 0.5 predicted occupancy artifact 缺失、字段/版本不符、概率非法或 BEV metadata 不匹配，deployable selection 必须 fail closed；允许独立完成 oracle scorer 开发和审计，但不得以 GT geometry 替代 deployable input 后继续宣称在线 selector 可用。
-
-#### 10.4.7 Oracle 与 deployable scorer 校准
-
-同一 validation candidate bank 上必须比较：
-
-```text
-candidate rank agreement
-unsafe-candidate recall
-safe-candidate precision
-vehicle-conflict recall
-VRU-conflict recall
-false-alarm rate
-final selection agreement
-```
-
-校准优先保证 unsafe recall，尤其是 VRU conflict recall，同时显式报告 false alarm、过度保守和 rank disagreement。不得只报告平均相关性，也不得用 oracle-selected trajectory 代替 predicted-selected trajectory 形成项目最终结论。阈值、权重和 inflation policy 只能在 validation 上冻结；新的 untouched evaluation protocol 需另行建立后才能用于最终泛化结论。
-
-#### 10.4.8 Risk、comfort、progress、deviation 与 fallback cost
-
-每条候选保存以下独立 component，不得只持久化 total score：
-
-```text
-J_risk
-J_comfort
-J_progress
-J_policy_deviation
-J_fallback_severity
-```
-
-- `J_risk`：由 oracle 或 deployable backend 产生的 collision、VRU、clearance、near-miss、TTC 与 occupancy probability 风险分解；
-- `J_comfort`：速度、加速度、jerk、curvature 与 lateral acceleration 的平滑性/边界代价；
-- `J_progress`：terminal progress、path progress、低速和 stopped duration，防止总是停车获得伪安全；
-- `J_policy_deviation`：候选相对 raw policy 的 waypoint、terminal position、heading 与 progress reduction；
-- `J_fallback_severity`：对 mild reduction、strong reduction、controlled braking 与 emergency/stationary 的有序惩罚。
-
-`unnecessary_stop` 必须定义为：selector 选择最终导致停车的 controlled-braking、stationary 或 emergency fallback，但同一样本的 raw candidate 在 oracle temporal geometry 下没有超过冻结冲突阈值。具体停车速度、持续时间和冲突阈值只用 validation 冻结。该指标仅用于 validation/offline audit；它不要求推断 reason 与 action 的对应关系，也不得在 deployable inference 时读取 oracle。若 oracle geometry unavailable，该样本的 `unnecessary_stop` 必须标为 unavailable，不能推断为 false。
-
-#### 10.4.9 Total cost 与确定性 selection
-
-正式选择目标为：
-
-```text
-J_total = w_risk      * J_risk
-        + w_comfort   * J_comfort
-        + w_progress  * J_progress
-        + w_deviation * J_policy_deviation
-        + w_fallback  * J_fallback_severity
-```
-
-权重、component normalization、阈值和 backend version 只用 train-derived statistics 与 validation 选择；不得根据 test 或未来正式 evaluation 调整。Selector 取有限候选中的最小可行 `J_total`，使用冻结的 deterministic tie-break order；risk/feasibility 优先级、浮点 tolerance 与完全相同分数时的候选顺序必须进入 selector version。
-
-输出至少包括 selected index/trajectory/mask、candidate types、所有 component/total scores、oracle/deployable backend 标识、selection reason、fallback state、invalid/rejected candidates、scorer/selector/candidate-generator version 和完整 provenance。`selection reason` 必须来自有限、版本化 reason taxonomy，不能由自由文本覆盖真实分项。
-
-#### 10.4.10 详细子阶段
-
-##### Phase 0.6a：contract 与 synthetic geometry
-
-冻结 candidate、mask、footprint、score decomposition、selector output 与 version contract；用直行、横向、制动、静止、旋转 box、VRU、边界相切、空场景、invalid candidate 等人工案例验证几何和确定性。
-
-##### Phase 0.6b：oracle temporal geometry
-
-建立 GT boxes → temporal geometry producer，核对时间、坐标、类别、插值/缺帧与 BEV grid，完成真实 train/validation 可视化和人工审核；oracle artifact 与 inference artifact 必须物理和语义分离。
-
-##### Phase 0.6c：oracle scorer baseline
-
-在固定 candidate bank 上完成 oracle risk decomposition、raw-vs-fallback 比较、threshold audit 与 oracle-selected upper bound，报告 collision、near-miss、VRU、clearance、TTC、progress、comfort 与 unnecessary-stop。
-
-##### Phase 0.6d：deployable scorer
-
-接入 Phase 0.5 current predicted occupancy probabilities，冻结 uncertainty inflation 与概率风险聚合；比较 oracle/deployable rank、unsafe recall、false alarm 与 selection agreement。
-
-##### Phase 0.6e：safety-aware selector
-
-加入 progress、comfort、policy deviation 与 fallback severity，冻结 normalization、weights、tie-break 和 invalid policy；完成同输入重复运行一致性与 sample-level selection reason 审核。
-
-##### Phase 0.6f：消融、failure analysis 与接口冻结
-
-至少比较：
-
-```text
-Phase 0.4 raw trajectory
-Phase 0.5 raw fused trajectory
-oracle-selected candidates (upper bound only)
-deployable predicted-geometry selected candidates
-risk-only selection
-risk + progress selection
-risk + progress + comfort + policy-deviation selection
-```
-
-每项消融共享相同 candidate bank、footprint、validation samples 和 metric protocol。最终冻结供 Phase 0.7 使用的 raw trajectory、candidate bank、selected trajectory、fallback state、risk decomposition、candidate-generator version、deployable scorer version 与 selector version。
-
-#### 10.4.11 指标、分组与 baseline
-
-Planning quality 继续报告 ADE、FDE、per-horizon error、valid rate、terminal progress 与 action-trajectory consistency。Oracle safety 至少报告 collision/near-miss、vehicle/VRU violation、minimum clearance、TTC 和 oracle unsafe rate。Deployable scorer 至少报告 unsafe recall、safe precision、vehicle/VRU recall、false alarm、rank/selection agreement 与 calibration by risk bin。
-
-Selector behavior 至少报告 risk reduction、selected candidate distribution、raw retention rate、fallback rate/severity、unnecessary-stop rate、progress loss、comfort/jerk、policy deviation、invalid/rejected rate 和 reason distribution。所有指标必须按 VRU presence、nearby-agent density、speed range、coarse action、occupancy quality 与 raw/fallback candidate type 分组；安全提升若主要来自 stationary/emergency 增加，必须明确判为失败模式。
-
-#### 10.4.12 自动测试、真实数据 smoke 与人工审核
-
-自动测试至少覆盖：candidate shape/order/version、速度缩放与制动终点、mask 传播、finite/kinematic validation、oriented footprint、vehicle/VRU overlap、clearance、TTC、时间对齐、probability-preserving risk、uncertainty inflation、component normalization、deterministic tie-break、invalid/all-invalid behavior、selector 不修改候选、GT 信息隔离和 test guard。
-
-真实数据 smoke 只使用 train/validation，必须走通：
-
-```text
-Phase 0.4 / 0.5 prediction artifact
-→ contract validation
-→ deterministic candidate bank
-→ oracle and deployable scoring
-→ safety-aware selection
-→ component metrics and sample-level persistence
-```
-
-人工审核至少覆盖 raw safe/raw unsafe、车辆/VRU conflict、near miss、低速拥堵、横向运动、急刹、stationary fallback、predicted/oracle disagreement、false alarm、unnecessary stop 与 all-invalid failure。可视化必须区分 raw/selected trajectory、GT oracle geometry 与 predicted occupancy，不能把 oracle 图层画成在线输入。
-
-#### 10.4.13 Gate、失败分支与停止条件
-
-Phase 0.6 通过条件：
-
-- candidate/footprint/time/coordinate contract 通过 synthetic、real-data smoke 和人工审核；
-- oracle scorer 对人工构造冲突与真实抽检表现正确；
-- deployable scorer 在 validation 达到冻结的 unsafe/VRU recall Gate，且 false alarm 有明确上限；
-- predicted-selected trajectory 相对 Phase 0.5 raw trajectory 降低风险，同时没有超过 Gate 的 unnecessary stop、progress loss、comfort degradation 或 invalid rate；
-- selector 确定性、可复现，且每次选择都能回溯到 component scores、reason 与版本；
-- inference path 不读取 GT geometry、future agents、future occupancy 或 test；
-- Phase 0.7 handoff contract 已冻结。
-
-失败分支：
-
-- **Candidate/kinematic contract 错误：** 停止 scoring，先修复坐标、时间、mask、footprint 或 feasibility。
-- **Oracle scorer 错误：** 停止 deployable calibration，先修复 temporal geometry、class mapping 与 synthetic cases。
-- **Predicted occupancy 无效或缺失：** 阻塞 deployable selector；oracle audit 可以继续，但不能用 GT 替代在线输入。
-- **Unsafe recall 不足：** 回到 Phase 0.5 occupancy quality、inflation 或 scorer calibration；不得降低安全 Gate 以换取通过。
-- **风险下降依赖过度停车：** 调整 validation-only progress/deviation/fallback cost，重新报告全量 trade-off；若仍失败，保留 raw policy 并阻塞 Phase 0.7 selected rollout。
-- **Comfort/feasibility 退化：** 修复 candidate generator 或 selector weights；不得让 scorer 在选择后修改轨迹。
-
-本阶段不访问或恢复 Phase 0.2d consumed test；任何未来不可逆 evaluation 必须另建 untouched protocol、shadow execution、durable claim 和 rerun guard。
-
-#### 10.4.14 阶段学习目标、Demo 与面试证据
-
-本阶段可证明：trajectory rollout geometry、oriented footprint collision checking、oracle/deployable information boundary、probabilistic occupancy risk、deterministic fallback generation、多目标 selection、calibration、safety-progress-comfort trade-off、failure analysis 与可追溯 artifact 设计。
-
-阶段 Demo：
-
-```text
-raw VLA trajectory
-→ deterministic candidate bank
-→ predicted occupancy risk heatmap
-→ per-candidate risk / progress / comfort / deviation
-→ selected trajectory and fallback reason
-→ oracle overlay for offline audit only
-```
-
-Demo 必须同时展示 raw 与 selected trajectory、候选类型、component scores、predicted/oracle disagreement 和 unnecessary-stop 案例，不得只展示成功样本或把 oracle-selected upper bound 当成 deployable 结果。
+- **动作概率或 hard conditioning 错误：** 停止候选生成，回到 Phase 0.4 输出 / embedding / head 合同。
+- **候选大面积无效：** 审计坐标、mask、反归一化、fallback 参数与运动学规则，不降低检查门槛。
+- **Object / raster 分歧：** 回到 Phase 0.5 的 transform、raster、margin 和时间合同，解释前不得通过 Gate。
+- **Always-stop 选择：** 判定 cost / candidate bank 失败，重新审核 progress、fallback 和 risk scale，不宣称安全提升。
+- **Oracle 改善有限：** 保留负结果，说明固定候选库不足；可把更丰富生成列入 Optional，但不伪造收益。
+- **Predicted scorer 失败：** 只阻塞条件增强，不影响 oracle Core 结论。
+- **信息泄漏或 test 风险：** 立即停止；本阶段不授权任何不可逆评估。
+
+#### 10.4.13 Phase 0.7 handoff 信息边界
+
+Phase 0.6 为 Phase 0.7 冻结：
+
+~~~text
+raw_soft_conditioned trajectory + mask
+candidate_trajectories [B,6,6,2]
+candidate_valid_masks [B,6,6]
+candidate metadata and verifier outputs
+oracle-selected trajectory + evaluator-only marker
+decomposed costs and selection reason
+footprint / scorer / selector versions
+optional predicted-geometry-selected trajectory
+model / config / data provenance
+~~~
+
+Phase 0.7 可以复用候选、轨迹、mask、planning adapter（规划适配器）和离线 oracle evidence（真值证据），但 quasi-closed-loop（准闭环）核心不得把 GT geometry 作为在线 selector 输入。Phase 0.5 Enhancement 未完成时，Phase 0.7 仍可使用 Phase 0.4 raw trajectory（原始轨迹）推进接口与环境验证；只有推理兼容 predicted-geometry scorer（预测几何评分器）存在时，才可选运行 selected trajectory rollout（选择轨迹滚动）。因此 Phase 0.7 Core 不强制依赖 predicted occupancy（预测占用表征）。
+
+#### 10.4.14 Demo 与面试能力映射
+
+核心 Demo（演示）：
+
+~~~text
+historical CAM_FRONT + ego state
+→ longitudinal / lateral probabilities
+→ top-3 action pairs
+→ raw + 3 action-conditioned + 2 fallback trajectories
+→ per-candidate action consistency
+→ GT-derived temporal occupancy
+→ per-candidate risk / progress / comfort costs
+→ oracle-selected trajectory
+→ selection reason
+~~~
+
+可视化必须分区标记 model input（模型输入）、model prediction（模型预测）、GT target（真值目标）、offline evaluator-only geometry（仅离线评估器几何）和 selected output（选择输出），不得把 GT occupancy 画成模型输入。Demo 至少展示：原始轨迹安全并保留、原始轨迹冲突后选择其他动作条件化轨迹、只能使用制动回退、过度保守停车失败，以及动作—轨迹不一致。
+
+面试能力通过以下证据证明：
+
+- **分层动作规划：** p_pair 表、top-3 deterministic test（确定性测试）和 hard-conditioned candidate artifact（硬条件候选产物）证明 factorized action probability（因子化动作概率）、动作对生成与动作条件化轨迹。
+- **多模态轨迹建模：** Qwen3-VL（通义千问第三代视觉语言模型）feature provenance（特征追溯）、soft / hard embedding 对照和同一 waypoint head 的六候选图证明共享多模态表征可控生成。
+- **几何安全评估：** ego-footprint tests（自车轮廓测试）、object / raster collision tables（对象 / 栅格碰撞表）、clearance / TTC 图和分歧可视化证明几何评估。
+- **系统设计：** candidate contract、verifier、scorer、selector、version / SHA 和 consumer intake receipt（消费者接入回执）证明模块协议与 provenance。
+- **安全与性能权衡：** raw / reranked collision、progress loss、comfort、unnecessary stop、fallback rate 与代表性失败案例共同证明，不能只展示碰撞下降。
 
 ### 10.5 Phase 0.7：quasi-closed-loop evaluation 与 planning interface
 
-> 本阶段不声称真实 closed-loop 或完全 reactive simulation；它将 Phase 0.4—0.6 的同一 policy 与 selector 放入可复现的 quasi-closed-loop protocol，观察滚动执行、累计误差、安全、fallback 和进度，并冻结 Phase 0.8 可直接消费的 environment/reward/baseline/rollback contract。
+> 本阶段不声称真实 closed-loop（闭环）或完全 reactive simulation（响应式仿真）；核心先将 Phase 0.4 raw trajectory policy（原始轨迹策略）接入可复现的 quasi-closed-loop protocol（准闭环协议）。只有 Phase 0.5 Enhancement（条件增强）和 Phase 0.6 inference-compatible scorer（推理兼容评分器）均可用时，才可选加入 selected trajectory rollout（选择轨迹滚动）；GT oracle reranking（真值重排序）仍只作为离线证据。
 
 #### 10.5.1 阶段状态、目的、边界与核心流程
 
 - **阶段状态：** `planned`。
-- **阶段目的：** 将同一 VLA policy、Phase 0.5 perception/geometry 输出和 Phase 0.6 deployable selector 接入一个版本化环境与 planning adapter，比较 raw policy 和 safety-selected policy 在相同 scenarios 下的滚动表现。
-- **前置条件：** Phase 0.6 candidate、deployable scorer、selector、fallback 和 output contract 通过 Gate；Phase 0.4/0.5 model checkpoint 与 inference interface 已冻结。
+- **阶段目的：** 将 Phase 0.4 VLA policy（视觉-语言-动作模型策略）、稳定 trajectory / mask（轨迹 / 掩码）和 planning adapter（规划适配器）接入版本化环境；条件分支可在相同 scenarios（场景）下比较 raw policy（原始策略）与 inference-compatible selected policy（推理兼容选择策略）。
+- **前置条件：** Phase 0.6 Core 的 candidate / verifier / fallback / trajectory output contract（候选 / 验证器 / 回退 / 轨迹输出协议）与 oracle offline evidence（真值离线证据）已冻结；Phase 0.4 model checkpoint（模型检查点）与 inference interface（推理接口）已冻结。Predicted occupancy（预测占用表征）和 predicted-geometry scorer（预测几何评分器）不是 Phase 0.7 Core 的强制前置条件。
 - **核心边界：** 本阶段不把 logged replay 写成 fully reactive closed loop，不要求实现低层车辆控制，不同时建设两个平台，不使用 GT future geometry 驱动在线 selector，也不展开 Phase 0.8 的 RL 算法。
 
 核心流程为：
@@ -2228,16 +2051,16 @@ Demo 必须同时展示 raw 与 selected trajectory、候选类型、component s
 ```text
 environment observation
 → sensor / dataset adapter
-→ Phase 0.5 VLA policy
-→ raw trajectory
-→ Phase 0.6 candidate bank + deployable scorer + selector
-→ selected trajectory
+→ Phase 0.4 VLA policy
+→ raw trajectory + mask
+→ optional Phase 0.6 candidate bank + inference-compatible scorer + selector
+→ raw or optional selected trajectory
 → planning interface
 → rollout state + reward components + metrics
 → next observation
 ```
 
-Raw rollout 与 selected rollout 必须使用相同 model checkpoint、observation history、scenario、initial state、step budget、timeout 和 environment version；唯一允许的差异是 Phase 0.6 selection 是否启用。
+Phase 0.7 Core 可以只完成 raw rollout（原始轨迹滚动）与 planning interface（规划接口）验证。若条件式 selected rollout（选择轨迹滚动）启用，raw 与 selected 必须使用相同 model checkpoint、observation history、scenario、initial state、step budget、timeout 和 environment version；唯一允许差异是推理兼容 selection（选择）是否启用，GT geometry（真值几何）不得进入在线步骤。
 
 #### 10.5.2 平台选择、compatibility spike 与唯一 fallback
 
@@ -2278,7 +2101,7 @@ platform official test (sealed or unavailable until separately authorized)
 
 #### 10.5.4 Planning interface
 
-核心 planning interface 只消费本次实验启用的 trajectory 与 valid mask（raw baseline 或 Phase 0.6 selected trajectory），并输出平台要求的 trajectory/planning representation；两者必须经过同一个 adapter。它负责：
+核心 planning interface 只消费本次实验启用的 trajectory 与 valid mask（raw baseline，或条件分支中的 Phase 0.6 inference-compatible selected trajectory），并输出平台要求的 trajectory/planning representation；两者必须经过同一个 adapter。它负责：
 
 - source → target coordinate transform 与 axis/unit conversion；
 - horizon 检查、时间重采样和 interpolation policy；
@@ -2322,9 +2145,8 @@ Logged-replay fallback 必须明确哪些 observation 来自固定日志、ego r
 | stop / constant-position | 检查安全或 reward 是否偏好不动 |
 | constant-velocity | 检查环境、坐标与 progress metric 是否合理 |
 | Phase 0.4 raw policy | 时序语义 trajectory core 对照 |
-| Phase 0.5 raw policy | semantic-geometric fusion 对照 |
-| Phase 0.5 raw without selector | 隔离 Phase 0.6 selection 增益 |
-| Phase 0.6 deployable-selected policy | 主 safety-aware rollout |
+| Optional Phase 0.5 predicted-BEV fused policy | 仅在 Enhancement 完成时检查预测几何特征增益 |
+| Optional Phase 0.6 inference-compatible selected policy | 仅在 predicted-geometry scorer 可用时隔离 selection 增益 |
 
 若存在 platform-domain supervised adaptation，raw 与 selected 对照必须共享同一 adapted checkpoint；source-only 与 adapted checkpoint 另作 cross-domain 消融，不能混入 selector 消融。
 
@@ -2341,7 +2163,7 @@ drivable-area / route adherence (only when map contract exists)
 speed, acceleration, jerk and lateral acceleration
 kinematic feasibility
 planning frequency / latency / throughput
-fallback and emergency-stop rate
+controlled-braking / stationary fallback rate
 invalid prediction / adapter failure rate
 timeout and early-termination rate
 scenario success rate
@@ -2367,7 +2189,7 @@ R_total = R_progress
 - `R_comfort`：速度、加速度、jerk、curvature/lateral acceleration；
 - `R_route`：仅在可靠 map/route contract 存在时使用；
 - `R_invalid`：invalid prediction、planning adapter failure、out-of-support 和 timeout；
-- `R_fallback`：fallback severity、repeated fallback 与 emergency/stationary 使用。
+- `R_fallback`：fallback severity、repeated fallback 与 controlled-braking / stationary 使用。
 
 所有原始 component、归一化值、权重与 total reward 必须逐 step 保存。Reward scale、clip/normalization、discount、aggregation 与 terminal reward 只用 platform train/dev 审核和冻结；official metrics 必须与自定义 reward 分开保存和报告，不能用调过的 reward 取代平台原始指标。
 
@@ -2377,7 +2199,7 @@ R_total = R_progress
 
 - always stop 或长期低速换取低风险；
 - 主动触发 early termination 缩短风险暴露；
-- 重复 fallback/emergency 避免正常规划；
+- 重复 controlled-braking / stationary fallback 避免正常规划；
 - 偏离 route 或驶出日志支持域逃避冲突；
 - 产生 invalid prediction 触发过于宽松的 safe default；
 - 利用 timeout、reset、missing metric 或 reward clipping 漏洞。
@@ -2400,11 +2222,11 @@ R_total = R_progress
 
 ##### Phase 0.7d：raw-policy rollout baseline
 
-在固定 scenarios 上运行 stop、constant-velocity、Phase 0.4 raw 与 Phase 0.5 raw，冻结 episode execution、failure accounting、metrics、latency 和 artifact persistence。
+在固定 scenarios 上运行 stop、constant-velocity 与 Phase 0.4 raw，冻结 episode execution、failure accounting、metrics、latency 和 artifact persistence；Phase 0.5 predicted-BEV fused policy 仅在 Enhancement 完成时可选加入。
 
 ##### Phase 0.7e：selected-policy rollout
 
-接入 Phase 0.6 candidate/scorer/selector，使用与 raw rollout 完全相同的 scenarios、seeds、timeouts 和 checkpoint，比较累计风险、progress、comfort、fallback 与 invalid behavior。
+仅在 inference-compatible predicted-geometry scorer 可用时接入 Phase 0.6 candidate/scorer/selector，使用与 raw rollout 完全相同的 scenarios、seeds、timeouts 和 checkpoint，比较累计风险、progress、comfort、fallback 与 invalid behavior；不得接入 oracle GT geometry。
 
 ##### Phase 0.7f：reward、failure 与 hacking audit
 
@@ -2440,8 +2262,8 @@ Phase 0.7 通过条件：
 
 - 唯一主 platform/protocol 已通过兼容性、许可证、资源和 split audit；
 - sensor/dataset/planning/rollout contract 通过自动测试与人工审核；
-- raw 与 selected rollout 在同一 scenarios、seeds、timeouts 和 checkpoint 上可复现；
-- Phase 0.6 selected policy 相对 Phase 0.5 raw baseline 改善冻结的 safety metrics，且没有超过 Gate 的 progress、comfort、fallback、invalid 或 timeout 退化；
+- raw rollout 在同一 scenarios、seeds、timeouts 和 checkpoint 上可复现；若条件式 selected rollout 启用，raw / selected 公平对照也必须可复现；
+- Phase 0.7 Core 不依赖 predicted occupancy；若条件式 Phase 0.6 selected policy 启用，其相对 Phase 0.4 raw baseline 的安全改善不得伴随超过 Gate 的 progress、comfort、fallback、invalid 或 timeout 退化；
 - reward component scale 合理，always-stop、长期低速、early termination 和 repeated fallback 均不能获得虚假优势；
 - failure taxonomy、rollback threshold 与 baseline artifacts 完整；
 - official test 未被访问，Phase 0.8 readiness receipt 通过。
@@ -2451,7 +2273,7 @@ Phase 0.7 通过条件：
 - **NAVSIM compatibility blocked：** 冻结 controlled logged-replay fallback，诚实限制结论，不同时启动第二主平台。
 - **Cross-domain collapse：** 保留 source-only 负结果；只在 platform train 做受控 supervised adaptation，若 dev 仍失败则阻塞正式 rollout。
 - **Planning adapter 错误：** 停止环境比较，先修复坐标、时间、resampling、mask 与 feasibility。
-- **Selector 累计退化：** 回滚到冻结的 Phase 0.5 raw policy baseline，保留 Phase 0.6 offline evidence，不以新权重覆盖失败 artifact。
+- **条件式 selector 累计退化：** 回滚到冻结的 Phase 0.4 raw policy baseline，保留 Phase 0.6 oracle offline evidence，不以新权重覆盖失败 artifact。
 - **Reward hacking：** 判定 reward contract 失败，提升版本并重跑全部 baseline 后再评估 Gate。
 - **环境不稳定或不可复现：** 阻塞 Phase 0.8，不以更多 seeds 掩盖 protocol bug。
 
@@ -2469,7 +2291,7 @@ reward definition, component weights and normalization
 termination, timeout and failure taxonomy
 fallback and invalid-action policy
 supervised VLA checkpoint / baseline
-Phase 0.6 selector checkpoint/config baseline
+optional Phase 0.6 inference-compatible selector checkpoint/config baseline
 rollback checkpoint and thresholds
 offline and quasi-closed-loop metric protocol
 readiness receipt and provenance
@@ -2485,9 +2307,9 @@ readiness receipt and provenance
 
 ```text
 same scenario and observation history
-→ Phase 0.5 raw trajectory rollout
-versus
-→ Phase 0.6 selected trajectory rollout
+→ Phase 0.4 raw trajectory rollout
+optionally versus
+→ Phase 0.6 inference-compatible selected trajectory rollout
 → cumulative progress / safety / comfort / fallback timeline
 ```
 
@@ -2515,12 +2337,15 @@ Optional 项目只能在对应主线模块稳定后评估，不得挤占核心 G
 |---|---|---|
 | few-shot prompt 深度搜索 | zero-shot 输出格式仍不稳定时 | 面试与工程价值低于 trajectory core |
 | DPO | safety pairs 已稳定时 | Phase 0.8 RL 已是主线 |
-| learned multi-candidate trajectory generation | deterministic fallback bank 已稳定后 | Phase 0.6 核心只要求可审计的 deterministic candidates；learned diversity 训练与评测成本更高 |
+| learned diverse trajectory generator（学习式多样轨迹生成器） | 固定 top-action-pair candidate bank（高概率动作对候选库）仍缺少有效多样性时 | Phase 0.6 核心已用同一 waypoint head 生成动作条件候选；diffusion（扩散）或独立生成模型成本更高 |
 | fine-grained maneuver taxonomy | map/route 数据稳定后 | 标注与协议成本高 |
-| temporal six-camera BEV | current synchronized multi-camera BEV 稳定后 | 核心路线已由 historical semantic branch 提供时序信息 |
-| full future occupancy | current occupancy 与 Phase 0.6 safety interface 有效后 | 算力、时序标注和评测成本高 |
-| large pretrained BEVFormer-style model | lightweight/formal geometry encoder 完成后 | 外部依赖与兼容成本高，不阻塞核心 fusion |
-| from-scratch large occupancy model | 核心 Phase 0.5 完成后仍有明确研究需求时 | 非面试主线，不阻塞项目完成 |
+| lightweight predicted current occupancy + fusion（轻量当前占用预测与融合） | Phase 0.5 Core 通过且 GPU、标定、依赖、许可证和 checkpoint 可用时 | 条件增强失败不阻塞 GT-derived geometry evaluator（真值派生几何评估器）或 Phase 0.6 Core |
+| temporal six-camera BEV（时序六相机鸟瞰图） | 轻量当前占用预测稳定后 | 核心时序几何来自 GT annotation；多相机时序模型成本更高 |
+| full future occupancy prediction（完整未来占用预测） | 当前占用条件增强和安全接口确有增益后 | 算力、时序监督和评测成本高，核心已有 GT temporal occupancy 用于离线评估 |
+| large pretrained BEVFormer-style model（大型预训练鸟瞰图模型） | 单一轻量 / 兼容 encoder 仍不能满足增强目标时 | 外部依赖与兼容成本高，不阻塞 Core |
+| from-scratch large occupancy model（从零训练大型占用网络） | 核心完成后仍有明确研究需求时 | 非面试主线，不阻塞项目完成 |
+| multi-encoder / loss / probability-calibration matrix（多编码器 / 损失 / 概率校准矩阵） | 单一增强方案出现明确诊断问题时 | 论文式比较成本高，不属于 Phase 0.5 / 0.6 Gate |
+| alternate candidate banks and multi-level fallback matrix（替代候选库与多级回退矩阵） | 固定六候选库暴露可复现覆盖不足时 | 核心先证明动作条件化候选、双后端评分与可审计重排序 |
 | drivable-area/map occupancy | map/route contract 建立后 | 当前阶段没有 map/route target contract |
 | map/route safety terms 与 traffic-rule scorer | map/route 与规则 contract 通过审核后 | 无可靠 map/route 时不能定义这些安全项 |
 | CARLA / Bench2Drive second platform | NAVSIM-compatible 或 controlled replay 主协议完成后 | 双平台、仿真依赖和结果对齐成本高 |
