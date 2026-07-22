@@ -1,4 +1,6 @@
-# Safety-Aware VLA for Autonomous Driving：完整项目执行计划
+# Safety-Aware VLA（安全感知视觉-语言-动作模型）for Autonomous Driving（面向自动驾驶）：融合 BEV（鸟瞰图）/ OCC（占用表征）空间评估的面试导向最终项目规划
+
+本项目以可复现、可核查的工程证据服务于多模态与自动驾驶算法岗位面试，而不是以追求 SOTA（当前最优水平）或完整复现单篇论文为目标。主线用于展示 nuScenes（自动驾驶数据集）数据处理、VLM（视觉语言模型）与 VLA（视觉-语言-动作模型）建模、动作空间设计、连续轨迹规划、BEV（鸟瞰图）/ occupancy（占用表征）几何评估，以及信息泄漏控制、工程测试、错误分析和系统集成能力；所有尚未由代码、测试和真实结果支持的能力继续标为 `planned`（计划中）。
 
 ## 0. 文档说明与维护规则
 
@@ -21,24 +23,90 @@
 - 阶段状态、contract、rule 或 evaluation protocol 变化时，必须记录版本与 provenance；不得覆盖 frozen artifact。
 - Phase 0.3 及后续阶段必须按第 5.2 节统一模板补全；尚未在本文展开的阶段只保留骨架，不得用概述冒充可执行规格。
 
-## 1. 项目使命、最终目标与非目标
+## 1. 信息边界与总体数据流
 
-### 1.1 项目使命
+### 1.1 项目定位与最终主线
 
-本项目研究 **Safety-Aware VLA for Autonomous Driving with BEV/OCC-aware Spatial Evaluation**：从可审计的 coarse meta-action MVP 出发，逐步建立由历史 `CAM_FRONT` 时序语义、current/past ego state 与当前同步多相机几何表示共同驱动，生成连续未来轨迹并接受安全评估的自动驾驶 VLA。Map/route、多候选轨迹和 temporal multi-camera BEV 均在对应 optional 阶段单独评估，不作为核心主线的默认前提。
+本项目仍是 **Safety-Aware VLA（安全感知视觉-语言-动作模型）for Autonomous Driving（面向自动驾驶）**，并融合 BEV（鸟瞰图）/ OCC（占用表征）空间评估。最终主线不以六类动作分类、粗动作轨迹展开、重排序和 DPO（直接偏好优化）作为项目终点，而是逐步建立“高层动作意图 + 低层连续轨迹 + 可解释几何评估”的统一接口：高层输出说明车辆准备做什么，低层 waypoint（轨迹点）说明车辆具体如何移动，evaluator（评估器）负责在离线条件下检查空间风险和两类输出是否一致。
 
-### 1.2 Phase 0：coarse meta-action MVP
+当前已完成的是六类 coarse meta-action（粗粒度元动作）的数据闭环、冻结标签、人工审核与早期基线基础；factorized meta-action（因子化元动作）、continuous waypoint（连续轨迹点）、trajectory-to-action verifier（轨迹到动作验证器）、BEV（鸟瞰图）/ occupancy（占用表征）几何评估、candidate trajectory reranking（候选轨迹重排序）和 preference learning（偏好学习）均为 `planned`（计划中）。不得把 Phase -1（阶段 -1）或 Phase 0.1（阶段 0.1）改写成已经实现轨迹模型、几何评估器或安全决策系统。
 
-Phase 0 验证以下最小证据链：
+面试导向的核心价值是通过可运行代码、固定协议、sample-level output（样本级输出）和代表性失败案例证明以下能力：自动驾驶数据解析与坐标变换、多模态特征建模、组合动作空间设计、连续轨迹预测、BEV（鸟瞰图）/ occupancy（占用表征）几何评估、future / GT leakage（未来信息 / 真值信息泄漏）防护，以及模型、验证器、评估器和重排序器之间的系统集成。项目不追求 SOTA（当前最优水平），不完整复现单篇论文，不进行论文级大规模消融、穷举超参数搜索或大量 backbone（主干模型）横向比较，也不证明真实道路安全、完整 closed-loop driving（闭环驾驶）或量产部署能力。
+
+### 1.2 Inference input contract（推理输入协议）
+
+推理输入中的 instruction（指令）拆分为三个不同概念：
+
+- `task_prompt`：固定任务说明，例如要求模型预测驾驶动作和未来轨迹；所有样本可以使用同一模板，且模板不得包含由未来轨迹、标签或 evaluator（评估器）信息派生的内容。
+- `route_command`：可选的样本级导航指令，例如直行、左转或右转；只有数据集存在可靠来源，并且训练与推理阶段都可获得同一语义时才能启用。当前 nuScenes（自动驾驶数据集）主线若不能核验可靠来源，就不得默认加入模型输入。
+- `natural_language_instruction`：自然语言驾驶指令；当前项目主线暂不使用，只作为未来扩展，不能写成现有 manifest（清单）字段或当前模型能力。
+
+经对应阶段 contract（协议）批准后，模型推理只允许使用：
 
 ```text
-数据和标签是否可信
-→ 视觉模型能否预测 coarse action
-→ 安全 scorer 能否评价候选行为
-→ reranker / preference learning 是否提供增益
+CAM_FRONT image
+task_prompt
+current ego motion
+approved past ego motion
+optional route_command
 ```
 
-固定六类 coarse action 为：
+其中 `current_ego_pose` 与 `current_ego_motion` 继续沿用现有冻结字段定义、时间源和 past-only（仅使用历史）派生规则；本轮不修改 frozen manifest schema（冻结清单模式）。后续若引入历史图像或同步多相机输入，也必须由对应 Phase（阶段）单独更新输入 contract（协议）和 schema version（模式版本），不能在总体说明中提前视为当前输入。
+
+模型推理永久禁止使用：
+
+```text
+future ego trajectory
+GT meta-action
+route command derived from future trajectory
+GT boxes
+GT occupancy
+future agents
+test labels
+evaluator-only information
+```
+
+尤其不能先根据 `future_ego_trajectory` 判断车辆未来左转，再把“左转”写入 `route_command` 送给模型；这会把预测目标变成输入，属于 target leakage（目标泄漏）。同理，GT boxes（真值三维框）、GT occupancy（真值占用表征）和 future agents（未来交通参与者）只能进入离线 evaluator（评估器），不能通过 prompt（提示）、特征缓存、样本元数据或预处理结果间接进入 VLA（视觉-语言-动作模型）。
+
+### 1.3 总体数据流与模块职责
+
+最终目标数据流如下，除已有 coarse meta-action（粗粒度元动作）数据基础外均保持 `planned`（计划中）：
+
+```mermaid
+flowchart TD
+    A["CAM_FRONT 图像<br/>+ current / past ego motion 当前 / 历史自车运动<br/>+ task_prompt 固定任务提示<br/>+ optional route_command 可选导航指令"] --> B["shared multimodal backbone<br/>共享多模态主干模型"]
+    B --> C["factorized meta-action<br/>因子化元动作"]
+    C --> D["meta-action-conditioned waypoint prediction<br/>元动作条件化轨迹点预测"]
+    C --> E["trajectory-to-action verifier<br/>轨迹到动作验证器"]
+    D --> E
+    D --> F["candidate trajectories<br/>候选轨迹"]
+    G["GT boxes / GT-derived occupancy<br/>真值三维框 / 真值派生占用表征<br/>仅限离线评估"] --> H["BEV / occupancy evaluator<br/>鸟瞰图 / 占用表征评估器"]
+    F --> H
+    H --> I["candidate trajectory reranking<br/>候选轨迹重排序"]
+    E --> I
+    I --> J["optional preference learning<br/>可选偏好学习"]
+```
+
+各模块的输入、输出和设计原因如下：
+
+- shared multimodal backbone（共享多模态主干模型）读取允许的图像、`task_prompt`、current / past ego motion（当前 / 历史自车运动）和经过批准的 `route_command`，输出共享特征；它用于避免动作分类与轨迹规划各自维护不兼容的视觉主干。
+- factorized meta-action（因子化元动作）输出纵向与横向两个可组合的高层意图；它解决旧六类互斥 schema（模式）不能同时表达“减速 + 左移”等组合的问题。
+- meta-action-conditioned waypoint prediction（元动作条件化轨迹点预测）读取共享特征与高层动作 embedding（嵌入），输出当前自车坐标系中的连续 future waypoints（未来轨迹点）；它是更接近自动驾驶 planning（规划）的主要低层输出。
+- trajectory-to-action verifier（轨迹到动作验证器）把预测轨迹投影回动作空间，与预测高层动作比较，输出 action-trajectory consistency（动作—轨迹一致性）结果；它用于发现语义和运动不一致的错误。
+- BEV（鸟瞰图）/ occupancy evaluator（占用表征评估器）读取模型候选轨迹与 evaluator-only（仅评估器可用）的 GT geometry（真值几何），输出分解的安全代价；它提供离线空间评估，不给模型提供真值感知输入。
+- candidate trajectory reranking（候选轨迹重排序）结合几何代价、一致性、进度和舒适性，在固定候选集合中选择轨迹；optional preference learning（可选偏好学习）只有在候选与偏好证据可靠时才使用，不是项目必须终点。
+
+### 1.4 能力边界与工程可靠性
+
+本项目的连续轨迹预测与安全评估仍属于 open-loop planning（开环规划）和 non-reactive offline evaluation（非响应式离线评估）：记录中的其他交通参与者不会根据模型输出实时响应，evaluator（评估器）也不能证明模型在真实道路或完整仿真中的安全性。后续若接入 quasi-closed-loop evaluation（准闭环评估），必须继续明确其 observation（观测）、交通参与者响应和回放限制，不得改称真实 closed-loop driving（闭环驾驶）。
+
+工程可靠性保留数据和坐标可追溯、scene-level split（场景级数据切分）、future / GT leakage（未来信息 / 真值信息泄漏）检查、固定输入输出协议、单元测试、smoke test（冒烟测试）、sample-level output（样本级输出）、少量有代表性的人工核验和 failure case analysis（失败案例分析）。这些证据用于说明系统实现可信，不扩展为多随机种子统计、置信区间、显著性检验、大规模人工一致性实验、复杂论文式消融矩阵或穷举调参。
+
+## 2. 为什么保留 coarse meta-action（粗粒度元动作）及最终动作空间
+
+### 2.1 Legacy coarse action schema（旧版粗粒度动作模式）
+
+当前冻结的六类动作继续保留，并明确命名为 **legacy coarse action schema（旧版粗粒度动作模式）**：
 
 ```text
 keep
@@ -49,182 +117,139 @@ left_lateral
 right_lateral
 ```
 
-六类动作是 **coarse behavior representation**，不是最终动作空间。`left_lateral` / `right_lateral` 只表示稳定的左右横向运动，不能直接解释为 turn、lane change 或其原因。coarse action 在长期系统中继续作为辅助监督、可解释输出、baseline 与 action-trajectory 一致性检查接口，不通过不断增加互斥类别来承担完整规划任务。
+该 schema（模式）及 `label_rule_version=phase-1.6-meta-action-v0.2` 不删除、不重命名、不覆盖，也不静默改变语义。它承担五个长期角色：保留 Phase -1（阶段 -1）已完成的标签成果；作为 Majority Baseline（多数类基线）和早期模型的统一比较空间；提供简单、可审核的粗粒度驾驶行为；作为后续多任务训练的辅助监督；在 failure case analysis（失败案例分析）中提供可解释语义。`left_lateral` 与 `right_lateral` 仍只表示稳定的左右横向运动，不能解释为 lane change（变道）或 turn（转弯）。
 
-### 1.3 核心实施原则：面向最终系统，而不是制作多个临时产品
+保留旧 schema（模式）不等于把它设为最终动作空间。它适合验证数据、标签、parser（解析器）和早期模型链路，却无法完整表达同时发生的纵向与横向行为，因此后续扩展必须新增版本化 target（目标）和评测合同，而不是改写已冻结字段。
 
-从 Phase 0.3 开始，所有阶段都服务于同一个最终 VLA：
+### 2.2 Factorized meta-action（因子化元动作）
 
-```text
-historical CAM_FRONT frames
-+ current/past ego state
-→ Qwen3-VL / temporal semantic representation
-
-current synchronized multi-camera images
-+ camera intrinsics/extrinsics/timestamps
-→ calibration-aware BEV representation
-→ current occupancy auxiliary prediction
-
-semantic representation
-+ BEV geometry tokens
-+ ego representation
-        ↓
-semantic-geometric fusion
-        ↓
-coarse action auxiliary head
-+ continuous future waypoint head
-        ↓
-geometric / occupancy safety scorer
-        ↓
-trajectory selection
-        ↓
-quasi-closed-loop environment
-        ↓
-reinforcement fine-tuning
-```
-
-这一路线采用双路径、双时间尺度：Phase 0.4 负责历史 `CAM_FRONT` 的时序语义建模，Phase 0.5 只在核心范围内增加当前 anchor 附近的同步多相机 geometry input。各相机允许存在细微 timestamp 差异，但必须通过 calibration 与 ego pose 变换到统一 anchor ego frame；temporal six-camera BEV 仅作为 optional。这一范围仍同时证明时序语义理解和多相机空间建模，并避免把 Phase 0.5 扩张成独立的大型 BEV 项目。
-
-后续不是先完成一个纯分类产品，再推倒重做一个轨迹产品，随后再重做一个 BEV 产品。Coarse action、continuous trajectory、BEV/OCC、safety scorer 和 reinforcement learning 是同一架构的不同模块：Phase 0.3 验证 VLM 接入，Phase 0.4 建立最终核心模型骨架，Phase 0.5—0.8 在该骨架上依次增加空间建模、安全约束、准闭环评测和 reinforcement fine-tuning。
-
-阶段划分只用于控制调试范围、建立最少必要 baseline、完成模块级消融并确认每个模块是否有效。已完成模块应通过稳定接口继续复用，不做无必要的推倒重写；每个阶段必须交付可复用的数据、feature、model、evaluator 或 environment contract，而不是只交付一次性实验数字。全过程继续遵守 inference/GT information boundary、坐标与时间合同、scene-level split 和 train/validation/test 防泄漏规则。
-
-### 1.4 最终 VLA 主路线
-
-核心路线统一为：
+最终高层动作空间 `planned`（计划中）为两个可组合的 action head（动作预测头）：
 
 ```text
-Phase 0.3  Qwen3-VL data interface and rapid visual baseline
-→ Phase 0.4 temporal vision + ego state + continuous trajectory VLA core
-→ Phase 0.5 BEV/OCC-aware semantic-geometric fusion
-→ Phase 0.6 trajectory safety scorer and safety-aware selection
-→ Phase 0.7 quasi-closed-loop evaluation and planning interface
-→ Phase 0.8 reinforcement fine-tuning
-→ Final robustness, latency, fallback, Demo and reproducibility evidence
+longitudinal_action:
+- stop
+- decelerate
+- keep
+- accelerate
+
+lateral_action:
+- left
+- straight
+- right
 ```
 
-Phase 0.3 是快速 baseline，不是长期主线终点；Phase 0.4 开始直接建设后续模块共用的最终模型。Phase 0.5—0.8 都扩展 Phase 0.4 的 shared driving representation 和 trajectory interface。RL 是核心阶段；world model 仍是 optional。完整 fine-grained maneuver taxonomy、learned 多候选轨迹生成、大规模 preference/DPO、完整 future occupancy prediction 和双仿真平台均不阻塞主线。
+真实驾驶动作通常是组合行为，例如 `decelerate + left`、`keep + right` 或 `accelerate + straight`。原六类互斥动作每次只能表达一种主导语义，无法同时说明纵向速度趋势与横向方向；如果不断向单一类别集合增加组合类，类别数量、长尾问题、标签维护和错误解释都会迅速复杂化。因子化表示让两个 head（预测头）共享同一多模态特征但分别学习纵向与横向语义，更容易扩展、审核和复用。
 
-### 1.5 非目标
+评测时分别报告 longitudinal macro-F1（纵向宏平均 F1）和 lateral macro-F1（横向宏平均 F1），并以 joint accuracy（联合准确率）检查两个 head（预测头）是否同时正确。高层动作因此仍然可解释、可验证，但不再承担连续路径的全部信息。
 
-本项目的基础完成条件不包括：
+第一版不直接增加 `lane_change`、`turn`、`follow_road_curve`、`overtake` 或 `yield`。仅靠单帧 `CAM_FRONT` 与 ego trajectory（自车轨迹），通常无法稳定区分 lane change（变道）、turn（转弯）和 follow-road-curve（沿弯道行驶），也无法可靠判断超车或让行意图。只有后续加入经过审核的 map（地图）、lane topology（车道拓扑）、intersection topology（路口拓扑）、route command（导航指令）或 temporal input（时序输入）中的至少一部分后，才允许定义、版本化并重新审核 fine-grained maneuver type（细粒度机动类型）。
 
-- 量产级、实车或 real-time 部署；
-- world model、复杂 DPO 或完整 fine-grained maneuver taxonomy；
-- 同时完成 NAVSIM 与 Bench2Drive 两个平台；
-- 完整 occupancy prediction 系统；
-- 仅依靠更多 `stop` 预测获得表面上的安全指标改善；
-- 将 oracle GT scorer 冒充在线 camera-only safety capability；
-- 在没有 map、lane topology、route 或必要时序信息时，把 coarse lateral 标签解释为 turn 或 lane change。
+### 2.3 Continuous waypoint action space（连续轨迹点动作空间）
 
-## 2. MVP 和完整项目的成功定义
-
-### 2.1 Coarse-action MVP success
-
-Coarse-action MVP 必须同时满足：
-
-- 数据、标签、split、预测和评测结果具备 sample-level provenance；
-- train、validation、test 按 scene-level split，且经过无泄漏验证；
-- Majority、ego-motion、VLM、LoRA/action adapter 与 reranker 使用统一 action schema、parser 和 evaluation protocol；
-- 每种方法保存可回溯的 sample-level predictions，并报告 macro-F1、per-class F1、confusion matrix、class distribution、invalid output rate 与 parsing success rate；
-- safety 改善不能仅来自 `stop` 增加，必须联合报告风险、`unnecessary_stop` 与 action quality；
-- 最终结论基于新的 untouched evaluation protocol。Phase 0.2d 已消费的原 project test 不再具备这一资格。
-
-### 2.2 Trajectory VLA success
-
-Trajectory VLA 必须同时满足：
-
-- 模型真实输出带坐标、时间、horizon 与 valid mask 合同的 future waypoints；
-- 在同一协议下超过 constant-velocity 与 ego-history baselines；
-- coarse action 与 predicted trajectory 的语义一致性可度量；
-- safety reranking 在规划性能与风险之间取得可验证改进，并报告失败案例与 trade-off。
-
-多候选轨迹若被启用，还必须验证有效 diversity；它不是第一版 trajectory VLA 的核心完成条件。
-
-### 2.3 Full project success
-
-完整项目的核心完成要求包括：
-
-- historical `CAM_FRONT` 时序视觉和 current/past ego state 输入；
-- 当前同步多相机图像、calibration 与统一 anchor ego frame 几何输入；
-- VLM semantic representation；
-- continuous future waypoint prediction；
-- BEV/OCC-aware geometry representation；
-- semantic-geometric feature fusion；
-- trajectory safety scoring；
-- quasi-closed-loop planning evaluation；
-- reinforcement fine-tuning；
-- robustness、latency 与 fallback evidence；
-- 完整 Demo、可复现配置，以及每项能力可定位的代码、artifact 和指标证据。
-
-完整 fine-grained maneuver taxonomy、learned 多候选轨迹生成、大规模 preference/DPO、完整 future occupancy prediction、Bench2Drive 与 NAVSIM 双平台和 world model 均为 optional；Phase 0.6 从单条 raw trajectory 确定性派生的 safety fallback candidate bank 属于核心 safety contract，不等同于 learned multimodal trajectory generation。实车部署不在本项目范围。RL 不属于 optional；它必须在 quasi-closed-loop reward 与保护边界建立后作为 Phase 0.8 完成并报告。
-
-## 3. 推理输入、训练 target 和 offline evaluator 的信息边界
-
-### 3.1 Model inference inputs
-
-经对应阶段 contract 批准后，模型推理输入可以包括：
+低层主要输出 `planned`（计划中）为：
 
 ```text
-historical CAM_FRONT frames
-current synchronized multi-camera images
-camera intrinsics / extrinsics / timestamps / availability mask
-current / past ego state
-driving instruction
-route command
-map / lane topology
+future_waypoints shape: [B, 6, 2]
+prediction horizon: 3.0 seconds
+sampling interval: 0.5 seconds
+coordinate frame: current ego frame
+x-axis: positive forward
+y-axis: positive left
+unit: meter
 ```
 
-具体传感器、历史长度、缺帧策略和坐标约定由阶段 contract 冻结。Phase 0.5 的 predicted BEV / occupancy 是模型内部 geometry representation 与下游输出，不是额外的外部 GT input；尚未进入对应阶段的输入不得提前接入并冒充当前能力。
+`B` 是 batch size（批大小）；`6` 表示从当前时刻后 0.5 秒到 3.0 秒、每 0.5 秒预测一个轨迹点；`2` 表示每个轨迹点包含 `(x, y)`。所有点都表达在当前时刻自车坐标系中，`x` 轴向前为正，`y` 轴向左为正，单位为米。缺失或无效 future target（未来目标）仍通过版本化 valid mask（有效掩码）处理，不改变现有 `current_ego_pose`、`current_ego_motion` 或 frozen manifest schema（冻结清单模式）。
 
-### 3.2 Training targets
+第一版不直接预测 steering（转向角）、throttle（油门）或 brake（制动）。nuScenes（自动驾驶数据集）没有与本项目一一对应的完整底层控制监督，项目也没有经过核验的真实车辆动力学模型和 closed-loop control environment（闭环控制环境）；直接输出控制量会把无法真实验证的车辆与控制假设混入模型结论。Waypoint（轨迹点）则可以与现有 `future_ego_trajectory` 对齐，并直接用于 ADE（平均位移误差）、FDE（最终位移误差）、collision check（碰撞检查）和 BEV（鸟瞰图）/ occupancy evaluation（占用表征评估），更符合当前项目可实现、可复现和可核查的能力边界。
 
-训练路径可使用与任务对应的监督 target：
+### 2.4 Planned model interface（计划中的模型接口）
+
+第一版主结构在后续 Phase（阶段）中按以下接口实现：
 
 ```text
-coarse meta-action
-fine-grained actions
-future ego trajectory
-future waypoints
-GT occupancy
-consistency targets
+shared multimodal backbone
+├── longitudinal action head
+├── lateral action head
+└── meta-action-conditioned waypoint head
 ```
 
-Training target 必须与 inference input 分离；target 的存在不代表推理时可访问同源 GT 信息。
+shared multimodal backbone（共享多模态主干模型）提取图像、`task_prompt` 和自车状态特征；longitudinal action head（纵向动作头）预测四类纵向动作；lateral action head（横向动作头）预测三类横向动作；meta-action-conditioned waypoint head（元动作条件化轨迹点头）同时接收共享特征和高层动作 embedding（嵌入），输出 `[B, 6, 2]` 连续轨迹点。高层动作回答“准备做什么”，轨迹回答“具体怎么移动”，两者共享信息但分别接受分类与几何验证。
 
-### 3.3 Offline evaluator inputs
+Legacy coarse action schema（旧版粗粒度动作模式）继续作为历史基线、辅助监督和解释接口，但不替代上述三个主要输出 head（预测头）。新增 factorized target（因子化目标）和 waypoint target（轨迹点目标）时必须提升相应 schema version（模式版本）并保留旧字段兼容；具体模型代码、loss weight（损失权重）和训练超参数留给后续 Phase（阶段）规格，本节不预设。
 
-Offline evaluator 可按阶段 contract 使用：
+### 2.5 Trajectory-to-action verifier（轨迹到动作验证器）
+
+本项目借鉴 DriveMA（可验证元动作驾驶视觉-语言-动作模型）的可迁移接口思想，但不把项目写成 DriveMA（可验证元动作驾驶视觉-语言-动作模型）复现：
 
 ```text
-GT current/future agent boxes
-GT-derived temporal occupancy
-ego pose
-optional map
-candidate action rollout
-predicted candidate trajectories
+input x
+→ predicted meta-action m
+→ predicted trajectory τ
+→ project trajectory back to action space
+→ compare implied action with predicted action
 ```
 
-这些输入只用于 oracle offline scoring、failure analysis、reranking 或 evaluator validation。在线能力必须另以 predicted geometry 与真实 inference path 验证。
+trajectory-to-action verifier（轨迹到动作验证器）后续根据预测轨迹的纵向位移、速度趋势和横向运动，反推出 trajectory-implied action（轨迹隐含动作），再与模型预测的 `longitudinal_action` 和 `lateral_action` 比较，输出 action-trajectory consistency（动作—轨迹一致性）及明确冲突原因。它能够识别“高层输出减速，但轨迹仍持续加速”或“高层输出向左，但轨迹终点明显向右”等错误，并把结果用于 failure case analysis（失败案例分析）、candidate trajectory reranking（候选轨迹重排序）和 optional preference learning（可选偏好学习）。
 
-### 3.4 永久禁止的信息泄漏
+Verifier（验证器）第一版是版本化、可单元测试的规则检查工具，不承诺 DriveMA（可验证元动作驾驶视觉-语言-动作模型）的 GRPO（组相对策略优化）、turn-level credit assignment（轮次级信用分配）、全参数训练或海量数据方案，也不需要论文规模的 reinforcement learning（强化学习）。第一版先以 supervised training（监督训练）、规则验证和候选重排序展示语言—动作对齐能力；阈值、投影规则和失败原因必须通过 train / validation（训练集 / 验证集）及人工构造案例核验，不能读取已消费 test（测试集）来选择。
 
-- future ego trajectory 不得进入模型推理；
-- GT meta-action 不得进入模型推理；
-- GT boxes、future agents 或 GT occupancy 不得进入模型 test-time inference；
-- test labels 不得用于 prompt、threshold、candidate、model、architecture 或 checkpoint 选择；
-- 不得以 GT ego trajectory 替代模型 candidate trajectory 进行 collision check；
-- 不得将 oracle GT scorer 的结果表述为在线 camera-only safety capability。
+## 3. BEV（鸟瞰图）/ occupancy（占用表征）与 geometric safety scorer（几何安全评分器）
 
-```mermaid
-flowchart LR
-    A["Inference inputs"] --> B["VLA model"]
-    B --> C["Actions / candidate trajectories"]
-    D["Versioned training targets"] --> E["Training losses only"]
-    C --> F["Offline evaluator"]
-    G["GT boxes / temporal occupancy / optional map"] --> F
-    F --> H["Metrics / reranking / failure analysis"]
+### 3.1 定位与职责分离
+
+BEV（鸟瞰图）是把场景几何统一到自车中心俯视坐标系的空间表示；occupancy（占用表征）描述特定时间步和网格位置是否被车辆、VRU（弱势道路使用者）或其他已定义类别占据；geometric safety scorer（几何安全评分器）把候选自车轨迹与这些几何表示比较，输出可分解的风险、可行性、进度和舒适性代价。三者不是同一概念：occupancy（占用表征）不直接等于安全决策，scorer（评分器）也不能替代模型的轨迹输出。
+
+本项目保留 GT-derived evaluator（由真值构造的评估器）的离线定位，同时保留 object-level（对象级）与 raster-level（栅格级）两条实现路径。对象级路径直接使用带类别、姿态、尺寸、时间和 token（标识）的 GT boxes（真值三维框）；栅格级路径把相同真值几何按冻结规则构造成 temporal occupancy（时序占用表征）。两条路径用于交叉核验几何规则、分析失败样本和校准 scorer（评分器），不构成 VLA（视觉-语言-动作模型）的推理输入。
+
+### 3.2 最终主接口与过渡接口
+
+最终主要评估接口为：
+
+```text
+predicted waypoint trajectory
+→ ego footprint rollout
+→ GT boxes or GT-derived temporal occupancy
+→ decomposed safety costs
 ```
+
+predicted waypoint trajectory（预测轨迹点序列）提供当前自车坐标系中的候选运动；ego footprint rollout（自车轮廓轨迹展开）沿每个时间步放置具有长度、宽度、姿态和安全边界的自车轮廓，避免把 waypoint（轨迹点）当作没有面积的点；GT boxes（真值三维框）或 GT-derived temporal occupancy（真值派生时序占用表征）提供只供 evaluator（评估器）使用的环境几何；decomposed safety costs（分解安全代价）分别记录 collision（碰撞）、near-miss（近失）、VRU（弱势道路使用者）距离违规、TTC（碰撞时间）、可行性、harsh action / jerk（激烈动作 / 加加速度）、进度和 `unnecessary_stop`，避免用单一总分掩盖“总是停车”等退化行为。Drivable-area evaluation（可行驶区域评估）只有在可靠 map（地图）与坐标 contract（协议）存在时才启用。
+
+在 continuous waypoint head（连续轨迹点头）尚未实现前，允许使用以下临时接口完成 scorer smoke test（评分器冒烟测试）：
+
+```text
+coarse action
+→ configured short-horizon rollout
+```
+
+该 coarse action rollout（粗动作轨迹展开）只是验证坐标、时间、碰撞规则、对象/栅格一致性和分项输出的过渡方案，不是最终规划输出。Predicted waypoint trajectory（预测轨迹点序列）实现后应成为主要评估对象；不得以 GT future ego trajectory（真值未来自车轨迹）替代模型候选轨迹进行碰撞评分，否则评估的是真值驾驶行为而不是模型规划能力。
+
+### 3.3 Evaluator contract（评估器协议）
+
+对象级和栅格级实现必须共享同一坐标、时间和版本语义：
+
+- 所有 candidate trajectory（候选轨迹）、ego footprint（自车轮廓）、GT boxes（真值三维框）和 temporal occupancy（时序占用表征）必须转换到同一 current ego frame（当前自车坐标系），明确 `x` 向前、`y` 向左、单位为米及 transform order（变换顺序）。
+- 轨迹时间步、box timestamp（三维框时间戳）和 occupancy time step（占用表征时间步）必须记录 horizon（预测时域）、sampling interval（采样间隔）、tolerance（容差）和缺帧策略，不能只按数组下标假定同步。
+- 对象级 artifact（产物）必须保留 annotation token（标注标识）、sample token（样本标识）、类别、尺寸、姿态、source frame（源坐标系）和 transform provenance（变换来源）；运动假设必须显式记录为 observed（已观测）、interpolated（插值）、constant-velocity（匀速）或 unavailable（不可用），不得静默复制当前对象冒充真实未来状态。
+- 栅格级 artifact（产物）必须记录 grid range（网格范围）、resolution（分辨率）、origin（原点）、轴方向、类别通道、边界规则、unknown / free semantics（未知 / 空闲语义）、rasterization policy（栅格化策略）和 `raster_config_version`。
+- candidate（候选）、footprint（轮廓）、motion assumption（运动假设）、scorer（评分器）、阈值、分项权重和输出 schema（模式）都必须版本化；sample-level output（样本级输出）能够回溯模型、候选、几何来源、配置和代码版本。
+
+GT boxes（真值三维框）、GT occupancy（真值占用表征）、future agents（未来交通参与者）和任何 evaluator-only（仅评估器可用）信息只能进入 evaluator（评估器）。当前主线不训练完整 BEVFormer（鸟瞰图视觉模型）、OccNet（占用预测网络）、SurroundOcc（环视占用预测模型）或其他大型 occupancy prediction network（占用预测网络）；若后续 Phase（阶段）实现轻量 predicted occupancy（预测占用表征）辅助分支，也必须与 GT-derived evaluator（真值派生评估器）分离，并通过真实 inference path（推理路径）证明其输入不含真值几何。
+
+### 3.4 Candidate reranking（候选重排序）与一致性接口
+
+Evaluator（评估器）不直接修改轨迹，只对固定候选集合输出逐项代价和版本化 reason（原因）。Candidate trajectory reranking（候选轨迹重排序）再结合 safety cost（安全代价）、action-trajectory consistency（动作—轨迹一致性）、progress（进度）、comfort（舒适性）和 fallback severity（回退严重程度）选择候选，并同时保存原始轨迹、所有候选、分项代价、选择原因和最终轨迹。这样可以区分“模型轨迹本身较好”“验证器发现语义冲突”和“几何评估迫使系统选择保守候选”三类能力。
+
+Preference learning（偏好学习）只在候选生成、verifier（验证器）、scorer（评分器）和重排序结果经过核验后作为 optional（可选）消费者；DPO（直接偏好优化）不是项目必须终点，GRPO（组相对策略优化）也不是第一版要求。第一版通过 supervised training（监督训练）、规则化一致性检查、离线几何评分和候选重排序形成完整且可解释的工程证据链。
+
+### 3.5 面试能力映射
+
+| 能力 | 通过什么代码或结果证明 | 当前边界 |
+|---|---|---|
+| 数据工程能力 | 以现有 nuScenes（自动驾驶数据集）解析脚本、`CAM_FRONT` / future trajectory（未来轨迹）/ nearby agents（邻近交通参与者）对齐结果、坐标可视化、scene-level split（场景级切分）、manifest versioning（清单版本管理）及 validator（验证器）结果证明。 | 数据闭环、冻结标签和 manifest（清单）基础已有真实证据；不得把派生数据提交 Git（版本控制系统）。 |
+| 多模态模型能力 | 后续以 Qwen3-VL（通义千问第三代视觉语言模型）数据适配、LoRA（低秩适配）训练记录、multimodal feature fusion（多模态特征融合）张量合同、custom action head（自定义动作预测头）测试及 sample-level prediction（样本级预测）证明。 | 均为 `planned`（计划中）；模型卡或论文结果不能替代本项目运行证据。 |
+| 自动驾驶规划能力 | 后续以 factorized action space（因子化动作空间）分类指标、`[B, 6, 2]` waypoint prediction（轨迹点预测）、ADE（平均位移误差）/ FDE（最终位移误差）、action-conditioned planning（动作条件化规划）可视化和 action-trajectory consistency（动作—轨迹一致性）结果证明。 | 连续轨迹模型为 `planned`（计划中）；当前六类输出只是 legacy coarse action schema（旧版粗粒度动作模式）。 |
+| BEV（鸟瞰图）/ occupancy（占用表征）能力 | 后续以 GT boxes（真值三维框）到 temporal occupancy rasterization（时序占用栅格化）的对象/栅格对照、ego footprint collision checking（自车轮廓碰撞检查）、TTC（碰撞时间）、VRU（弱势道路使用者）距离和条件化 drivable-area evaluation（可行驶区域评估）证明。 | Evaluator（评估器）为 `planned`（计划中）且只做离线几何评估；可行驶区域指标依赖可靠 map contract（地图协议）。 |
+| 系统分析能力 | 以 inference / target / evaluator（推理 / 目标 / 评估器）隔离测试、information leakage prevention（信息泄漏防护）、trajectory-to-action verifier（轨迹到动作验证器）、failure case analysis（失败案例分析）、sample-level provenance（样本级来源追溯）和 safety-performance trade-off（安全性与行驶性能权衡）报告证明。 | 保留少量代表性人工核验与可复现输出，不扩展为论文式大规模统计或复杂消融。 |
 
 ## 4. 数据、坐标、时间、版本和 artifact 总合同
 
