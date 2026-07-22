@@ -343,8 +343,11 @@ label_rule_version
 longitudinal_action
 lateral_action
 factorized_action_rule_version
-factorized_action_valid
-factorized_action_reason
+longitudinal_action_valid
+longitudinal_action_reason
+lateral_action_valid
+lateral_action_reason
+factorized_action_joint_valid
 source_future_trajectory_version
 source_legacy_meta_action
 fine_action_rule_version
@@ -883,12 +886,12 @@ Qwen3-VL visual / semantic features
 temporal fusion
         ↓
 shared driving representation h
-        ├── longitudinal action head → [B, 4]
-        ├── lateral action head      → [B, 3]
-        └── meta-action-conditioned waypoint head → [B, 6, 2]
+        ├── longitudinal action head → logits/probabilities [B,4] → predicted class [B]
+        ├── lateral action head      → logits/probabilities [B,3] → predicted class [B]
+        └── meta-action-conditioned waypoint head → predicted_waypoints [B,6,2]
 ```
 
-Longitudinal action head（纵向动作头）输出四类 logits（逻辑值），lateral action head（横向动作头）输出三类 logits（逻辑值），两个动作 head（预测头）共享同一 driving representation（驾驶表征）`h`。Waypoint head（轨迹点头）不只读取 `h`，还必须读取纵向和横向动作 embedding（嵌入）：高层动作回答“准备怎么驾驶”，waypoint（轨迹点）负责输出“具体怎么移动”。
+Longitudinal action head（纵向动作头）输出 `[B,4]` logits / probabilities（逻辑值 / 概率）和 `[B]` predicted class（预测类别），lateral action head（横向动作头）输出 `[B,3]` logits / probabilities（逻辑值 / 概率）和 `[B]` predicted class（预测类别），两个动作 head（预测头）共享同一 driving representation（驾驶表征）`h`。Waypoint head（轨迹点头）不只读取 `h`，还必须读取纵向和横向动作 embedding（嵌入）：高层动作回答“准备怎么驾驶”，waypoint（轨迹点）负责输出“具体怎么移动”。
 
 动作条件化采用可微的 soft embedding（软嵌入）：
 
@@ -916,13 +919,18 @@ historical_images:           [B, T_hist, 3, H, W]
 ego_motion_history:          [B, T_hist, E]
 history_valid_mask:          [B, T_hist]
 longitudinal_action_target:  [B]
+longitudinal_action_valid:   [B]
 lateral_action_target:       [B]
+lateral_action_valid:        [B]
+factorized_action_joint_valid: [B]
 future_waypoints:            [B, 6, 2]
 trajectory_valid_mask:       [B, 6]
 
-longitudinal_logits:         [B, 4]
-lateral_logits:              [B, 3]
-predicted_waypoints:         [B, 6, 2]
+longitudinal logits/probabilities: [B,4]
+longitudinal predicted class:      [B]
+lateral logits/probabilities:      [B,3]
+lateral predicted class:           [B]
+predicted_waypoints:               [B,6,2]
 ```
 
 - `B`：batch size；
@@ -932,7 +940,7 @@ predicted_waypoints:         [B, 6, 2]
 
 `T_hist`、`H/W` 与 batch size（批大小）允许根据数据可用性和 resource preflight（资源预检）配置；`K=6`、prediction horizon（预测时域）`=3.0 s` 与 sampling interval（采样间隔）`=0.5 s` 是当前主线固定合同，不得由资源预检改变。六个轨迹点依次对应当前时刻后的 `0.5 / 1.0 / 1.5 / 2.0 / 2.5 / 3.0 s`，全部位于 current ego frame（当前自车坐标系），`x` 轴向前为正，`y` 轴向左为正，单位为米。任何其他 horizon（预测时域）或采样间隔只能作为 optional extension（可选扩展）使用独立 schema version（模式版本），不得替换当前主线。
 
-Future waypoints（未来轨迹点）与 factorized actions（因子化动作）只作为 target（目标）；模型输入只允许 current / past（当前 / 历史）图像、ego motion（自车运动状态）与固定 `task_prompt`。缺失历史帧与 future target（未来目标）分别由 `history_valid_mask` 和 `trajectory_valid_mask` 显式处理，loss（损失）不得在 invalid position（无效位置）上计算；`factorized_action_valid=false` 的样本不得强行参与动作分类或动作条件化训练。
+Future waypoints（未来轨迹点）与 factorized actions（因子化动作）只作为 target（目标）；模型输入只允许 current / past（当前 / 历史）图像、ego motion（自车运动状态）与固定 `task_prompt`。缺失历史帧与 future target（未来目标）分别由 `history_valid_mask` 和 `trajectory_valid_mask` 显式处理，loss（损失）不得在 invalid position（无效位置）上计算。`longitudinal_action_valid` 与 `lateral_action_valid` 分别控制对应动作监督；任一方向无效都不得自动丢弃另一方向仍然有效的监督。`factorized_action_joint_valid` 只表示完整动作对是否可用于联合动作条件化，不替代两个独立有效性字段。
 
 #### 10.2.4 Factorized target + temporal dataset contract（因子化目标与时序数据合同）
 
@@ -942,30 +950,36 @@ Phase 0.4a 不新建独立大阶段，而是在同一版本化数据扩展中同
 longitudinal_action
 lateral_action
 factorized_action_rule_version
-factorized_action_valid
-factorized_action_reason
+longitudinal_action_valid
+longitudinal_action_reason
+lateral_action_valid
+lateral_action_reason
+factorized_action_joint_valid
 source_future_trajectory_version
 source_legacy_meta_action
 source_audit_record
 ```
 
-旧六类 `meta_action` 与新因子化标签可以同时存在：`source_legacy_meta_action` 保存来源兼容关系，`source_audit_record` 继续回溯 Phase -1（阶段 -1）人工审核；新字段不得覆盖 `meta_action`、`label_rule_version` 或 frozen manifest（冻结清单）。
+旧六类 `meta_action` 与新因子化标签可以同时存在：`source_legacy_meta_action` 只用于追溯、兼容检查和 failure analysis（失败分析），`source_audit_record` 继续回溯 Phase -1（阶段 -1）人工审核；新字段不得覆盖 `meta_action`、`label_rule_version` 或 frozen manifest（冻结清单）。纵向与横向标签必须从同一条 frozen future trajectory（冻结未来轨迹）独立计算，不得根据 legacy six-class action（旧六分类动作）直接映射，也不得继承旧六类标签的互斥优先级。例如，原 `left_lateral` 样本仍可从轨迹独立派生为 `decelerate + left`、`keep + left` 或其他符合新规则的组合。
 
 Factorized target derivation（因子化目标派生）按固定顺序执行：
 
 ```text
 frozen future ego trajectory
 → trajectory validity check
-→ longitudinal motion statistics
-→ longitudinal_action
-→ lateral displacement / heading statistics
-→ lateral_action
+├── longitudinal motion statistics
+│   → longitudinal_action + longitudinal validity/reason
+└── lateral displacement / heading statistics
+    → lateral_action + lateral validity/reason
+→ factorized_action_joint_valid
 → factorized target record
 ```
 
-纵向标签复用现有 `stop / decelerate / keep / accelerate` 的轨迹规则思想，但不静默修改六类 legacy rule（旧版规则）。Factorized longitudinal rule（因子化纵向规则）使用独立的 `factorized_action_rule_version`；具体速度、位移或趋势阈值必须用 train / validation（训练集 / 验证集）与已有人工审核样本确认，本计划不猜测新数值。
+纵向标签复用现有 `stop / decelerate / keep / accelerate` 的轨迹规则思想，但不静默修改六类 legacy rule（旧版规则）。Factorized longitudinal rule（因子化纵向规则）使用独立的 `factorized_action_rule_version`；具体速度、位移或趋势阈值必须用 train / validation（训练集 / 验证集）与已有人工审核样本确认，本计划不猜测新数值。纵向统计能够可靠判定时设置 `longitudinal_action_valid=true`；否则保留无效或不确定状态，并在 `longitudinal_action_reason` 中记录原因，而不受横向标签是否有效影响。
 
-横向标签根据 final lateral displacement（最终横向位移）、maximum lateral displacement（最大横向位移）和 heading change（航向变化）联合判定 `left / straight / right`。第一版不区分 turn（转弯）、lane change（变道）和 follow-road-curve（沿弯道行驶）；轨迹缺失、时间不完整、数值非法、统计相互冲突或处于规则边界时必须设为 `invalid / uncertain`，记录 `factorized_action_valid=false` 与明确 `factorized_action_reason`，不能强行分配标签。
+横向标签根据 final lateral displacement（最终横向位移）、maximum lateral displacement（最大横向位移）和 heading change（航向变化）联合判定 `left / straight / right`。第一版不区分 turn（转弯）、lane change（变道）和 follow-road-curve（沿弯道行驶）；横向统计相互冲突或处于规则边界时必须设置 `lateral_action_valid=false`，并在 `lateral_action_reason` 中记录 `invalid / uncertain`（无效 / 不确定）原因，不能强行分配标签，也不能因此删除仍然有效的纵向监督。反之，纵向标签无效时仍须保留可靠的横向监督。
+
+`factorized_action_joint_valid` 由两个独立有效性字段确定，仅当 `longitudinal_action_valid=true` 且 `lateral_action_valid=true` 时为真。轨迹整体缺失、时间不完整或数值非法时可以使两个方向都无效；单方向规则边界只使对应方向无效。该联合字段服务完整动作对条件化、联合指标与审核，不得反向覆盖独立标签及其原因。
 
 Temporal record（时序记录）构建依次执行：
 
@@ -977,7 +991,7 @@ Temporal record（时序记录）构建依次执行：
 6. 对历史不足样本应用单一、版本化策略并生成 `history_valid_mask`。
 7. 复用 frozen future trajectory producer（冻结未来轨迹生产者）生成 `[6, 2]` waypoint target（轨迹点目标），不另写猜测式轨迹解析器。
 8. 依据 0.5 秒间隔和 3.0 秒时域生成 `[6]` `trajectory_valid_mask`，不得更改 `K=6`。
-9. 从同一 frozen future trajectory（冻结未来轨迹）派生 factorized target（因子化目标），并保存其规则版本、有效性、原因与来源字段。
+9. 从同一 frozen future trajectory（冻结未来轨迹）独立派生纵向与横向 target（目标），分别保存有效性和原因，再计算 `factorized_action_joint_valid`，并保留规则版本与来源字段。
 10. 保持现有 scene-level（场景级）train / validation mapping（训练集 / 验证集映射）；原 test（测试集）永久拒绝读取。
 11. 构建新的 temporal / factorized / waypoint schema version（时序 / 因子化 / 轨迹点模式版本），引用 `phase0_trainval_dataset_manifest_v1` 及其 SHA-256，不覆盖原 manifest（清单）。
 12. 对少量代表性 train / validation（训练集 / 验证集）样本生成时序、factorized action（因子化动作）与 waypoint（轨迹点）联合可视化并人工审核。
@@ -1043,16 +1057,16 @@ Shared fusion 输出稳定 feature contract，包括 shape、dtype、mask、norm
 
 ```text
 longitudinal action head:
-h → 4 logits
+h → logits/probabilities [B,4] → predicted class [B]
 
 lateral action head:
-h → 3 logits
+h → logits/probabilities [B,3] → predicted class [B]
 
 meta-action-conditioned waypoint head:
-concat(h, e_long, e_lat) → 6 × 2 waypoint coordinates
+concat(h, e_long, e_lat) → predicted_waypoints [B,6,2]
 ```
 
-两个 factorized action heads（因子化动作预测头）共享 `h`，但分别预测纵向与横向语义。Meta-action-conditioned waypoint head（元动作条件化轨迹点头）读取 `h` 以及由动作概率和可训练 embedding table（嵌入表）产生的 `e_long / e_lat`。主线输出固定为 `[B,4]` longitudinal logits（纵向逻辑值）、`[B,3]` lateral logits（横向逻辑值）与 `[B,6,2]` predicted waypoints（预测轨迹点）。
+两个 factorized action heads（因子化动作预测头）共享 `h`，但分别预测纵向与横向语义。Meta-action-conditioned waypoint head（元动作条件化轨迹点头）读取 `h` 以及由动作概率和可训练 embedding table（嵌入表）产生的 `e_long / e_lat`。主线输出固定为 longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]` 与 `predicted_waypoints [B,6,2]`。
 
 Legacy six-class head（旧六分类头）不再是 Phase 0.4 主输出；若历史兼容确有需要，可配置为 optional compatibility auxiliary head（可选兼容辅助头），但默认关闭、单独标记版本，且不得替代两个 factorized action heads（因子化动作预测头）或影响正式推理协议。
 
@@ -1084,16 +1098,19 @@ L_lateral:
 
 ```text
 longitudinal_action_target: [B]
+longitudinal_action_valid:  [B]
 lateral_action_target:      [B]
+lateral_action_valid:       [B]
+factorized_action_joint_valid: [B]
 future_waypoints:           [B, 6, 2]
 trajectory_valid_mask:      [B, 6]
 ```
 
-正式实现时在 SmoothL1 / Huber（平滑 L1 / Huber）等价配置中选择并版本化一个方案。`L_trajectory` 只在 `trajectory_valid_mask` 为真处计算；`L_longitudinal` 与 `L_lateral` 只使用 `factorized_action_valid=true` 的样本。具体 loss weight（损失权重）只在 validation（验证集）上从少量预定义配置中选择，不进行大规模网格搜索。
+正式实现时在 SmoothL1 / Huber（平滑 L1 / Huber）等价配置中选择并版本化一个方案。`L_trajectory` 只在 `trajectory_valid_mask` 为真处计算；`L_longitudinal` 只由 `longitudinal_action_valid` 控制，`L_lateral` 只由 `lateral_action_valid` 控制。横向无效不得屏蔽有效的纵向交叉熵，纵向无效也不得屏蔽有效的横向交叉熵；`factorized_action_joint_valid` 不作为两个分类 loss（损失）的统一掩码。具体 loss weight（损失权重）只在 validation（验证集）上从少量预定义配置中选择，不进行大规模网格搜索。
 
 训练只分两个简单步骤：
 
-**Stage A：GT-action conditioning warmup（阶段 A：真值动作条件化预热）。** 对有效 factorized action target（因子化动作目标）使用 one-hot embedding（独热嵌入）查询 `E_long / E_lat`，先让 waypoint head（轨迹点头）学习“给定正确高层动作时如何生成轨迹”。该阶段只用于检查 target（目标）、conditioning（条件化）和 waypoint capacity（轨迹点头容量），其结果必须标为 `GT-action-conditioned warmup result`，不得作为正式 inference（推理）结果。
+**Stage A：GT-action conditioning warmup（阶段 A：真值动作条件化预热）。** 联合动作条件化优先使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的样本，以纵向与横向 GT action（真值动作）的 one-hot embedding（独热嵌入）查询 `E_long / E_lat`，先让 waypoint head（轨迹点头）学习“给定完整正确高层动作时如何生成轨迹”。联合无效的样本不能用缺失方向伪造 GT action pair（真值动作对），但其中仍然有效的单方向标签继续训练对应 action head（动作预测头）。该阶段只用于检查 target（目标）、conditioning（条件化）和 waypoint capacity（轨迹点头容量），其结果必须保存并标为 `GT-action-conditioned warmup result` 诊断产物，不得作为正式 inference（推理）结果。
 
 **Stage B：predicted-action joint training（阶段 B：预测动作联合训练）。** 使用两个 action head（动作预测头）产生的 `p_long / p_lat` 计算 soft action embedding（软动作嵌入），联合训练 longitudinal action head（纵向动作头）、lateral action head（横向动作头）与 waypoint head（轨迹点头）。正式 inference（推理）使用相同 predicted-action conditioning（预测动作条件化）路径，禁止注入 GT action（真值动作）。
 
@@ -1123,8 +1140,8 @@ left / straight / right
 ##### Phase 0.4a：factorized target + temporal dataset contract（因子化目标与时序数据合同）
 
 1. 读取真实 frozen future trajectory producer artifact（冻结未来轨迹生产者产物），核对字段层级、版本、坐标、时间和 SHA-256。
-2. 实现并版本化 longitudinal / lateral target derivation（纵向 / 横向目标派生），保留 `source_legacy_meta_action` 与 `source_audit_record`。
-3. 对 invalid / uncertain（无效 / 不确定）轨迹 fail closed（失败即关闭），不强行派生动作。
+2. 从同一 frozen future trajectory（冻结未来轨迹）独立实现并版本化 longitudinal / lateral target derivation（纵向 / 横向目标派生），不得从 legacy 六分类标签直接映射；保留 `source_legacy_meta_action` 与 `source_audit_record` 仅作追溯和检查。
+3. 分别生成 `longitudinal_action_valid/reason` 与 `lateral_action_valid/reason`，再计算 `factorized_action_joint_valid`；单方向 invalid / uncertain（无效 / 不确定）只屏蔽对应监督，不强行派生标签，也不删除另一方向的有效监督。
 4. 构建 historical `CAM_FRONT`、ego-motion history（自车运动历史）、history mask（历史掩码）、`[6,2]` waypoint target（轨迹点目标）与 `[6]` trajectory mask（轨迹掩码）。
 5. 运行 schema validator（模式验证器）、scene-level split guard（场景级切分保护）和 future leakage check（未来信息泄漏检查）。
 6. 用少量代表性 train / validation（训练集 / 验证集）样本完成联合可视化与人工审核。
@@ -1141,7 +1158,7 @@ left / straight / right
 
 ##### Phase 0.4c：Stage A GT-action conditioning warmup（阶段 A：真值动作条件化预热）
 
-1. 只使用 `factorized_action_valid=true` 且 waypoint target（轨迹点目标）有效的 train（训练集）样本。
+1. 联合动作条件化优先使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的 train（训练集）样本；只有一个方向有效的样本仍可训练对应 action head（动作预测头），但不得伪造完整 GT action pair（真值动作对）。
 2. 用 GT factorized action（真值因子化动作）的 one-hot embedding（独热嵌入）条件化 waypoint head（轨迹点头）。
 3. 核对正确动作条件下 waypoint loss（轨迹点损失）能下降，并完成小样本 overfit（过拟合）。
 4. 在 validation（验证集）保存 `GT-action-conditioned warmup result` 与 sample-level prediction（样本级预测）。
@@ -1163,9 +1180,9 @@ left / straight / right
 Verifier（验证器）输入固定为：
 
 ```text
-predicted_waypoints [B, 6, 2]
-predicted longitudinal action
-predicted lateral action
+predicted_waypoints [B,6,2]
+longitudinal_predicted_class [B]
+lateral_predicted_class [B]
 trajectory_valid_mask
 factorized_action_rule_version
 verifier_version
@@ -1203,7 +1220,7 @@ Synthetic tests（合成测试）至少覆盖 `stop + straight`、`accelerate + 
 
 本阶段计划新增 temporal / factorized data builder and validator（时序 / 因子化数据构建器与验证器）、最小 trajectory baselines（轨迹基线）、模块化 VLA core（视觉-语言-动作模型核心）、factorized action heads（因子化动作预测头）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）、masked losses（带掩码损失）、trajectory-to-action verifier（轨迹到动作验证器）、metrics（指标）、visualization（可视化）与 tests（测试）；具体文件名和 CLI（命令行入口）由实施子任务确定，本文不声称它们已经存在。
 
-本地 artifact（产物）至少包括：temporal / factorized manifest and sidecar（时序 / 因子化清单及边车文件）、target derivation audit（目标派生审计）、representative manual review（代表性人工审核）、contract validation receipt（协议验证回执）、normalization statistics（归一化统计）、最小 baseline predictions / metrics（基线预测 / 指标）、Stage A warmup（阶段 A 预热）结果、Stage B predicted-action inference（阶段 B 预测动作推理）结果、training configs / curves（训练配置 / 曲线）、checkpoint provenance（检查点来源）、sample-level factorized action / trajectory predictions（样本级因子化动作 / 轨迹预测）、verifier outputs（验证器输出）、visualizations（可视化）和 failure cases（失败案例）。派生数据、checkpoint（检查点）、日志和正式输出不进入 Git（版本控制系统），frozen manifest（冻结清单）不得覆盖。
+本地 artifact（产物）至少包括：temporal / factorized manifest and sidecar（时序 / 因子化清单及边车文件）、逐方向 validity / reason（有效性 / 原因）与 `factorized_action_joint_valid`、target derivation audit（目标派生审计）、representative manual review（代表性人工审核）、contract validation receipt（协议验证回执）、normalization statistics（归一化统计）、最小 baseline predictions / metrics（基线预测 / 指标）、必须保存的 Stage A warmup diagnostic artifact（阶段 A 预热诊断产物）、Stage B predicted-action inference（阶段 B 预测动作推理）结果、training configs / curves（训练配置 / 曲线）、checkpoint provenance（检查点来源）、sample-level factorized action / trajectory predictions（样本级因子化动作 / 轨迹预测）、verifier outputs（验证器输出）、visualizations（可视化）和 failure cases（失败案例）。派生数据、checkpoint（检查点）、日志和正式输出不进入 Git（版本控制系统），frozen manifest（冻结清单）不得覆盖。
 
 Artifact（产物）至少记录 temporal / factorized schema version（时序 / 因子化模式版本）、`factorized_action_rule_version`、`verifier_version`、history policy（历史策略）、固定 waypoint coordinate / time contract（轨迹点坐标 / 时间协议）、source manifest / split SHA-256（来源清单 / 切分哈希）、model / processor / feature revision（模型 / 处理器 / 特征修订版）、conditioning stage（条件化阶段）、config / Git SHA（配置 / 版本控制哈希）、checkpoint SHA-256、train / validation sample count（训练集 / 验证集样本数）与 metric protocol version（指标协议版本）。不要求用多随机种子统计替代上述可追溯性。
 
@@ -1224,10 +1241,14 @@ lateral consistency rate
 joint consistency rate
 
 trajectory valid rate
-invalid output rate
+invalid prediction rate（无效预测率）
 ```
 
-可选报告 legacy six-class compatibility metric（旧六分类兼容指标），但六分类 macro-F1（宏平均 F1）不再是 Phase 0.4 的主要动作指标。所有轨迹表必须明确区分 `GT-action-conditioned warmup result` 与 `predicted-action-conditioned inference result`：前者只诊断 waypoint head（轨迹点头）在正确动作条件下的能力，后者才代表正式 inference（推理）。本阶段不要求置信区间、多随机种子统计、显著性检验或论文级复杂消融。
+Phase 0.4 的 `invalid prediction rate` 统计模型张量与规划输出失败，至少包括 NaN / Inf（非数 / 无穷值）、tensor shape（张量形状）错误、有效轨迹点不足、mask（掩码）错误、坐标反归一化失败、action logits（动作逻辑值）异常，以及 verifier（验证器）无法完成动作投影。该指标不同于 Phase 0.3 基于文本 parser（解析器）的 `invalid output rate`：Phase 0.3 继续按旧六分类生成文本是否可解析统计，Phase 0.4 不得把解析失败率与张量预测失败率混为同一指标。
+
+`longitudinal macro-F1` 只在 `longitudinal_action_valid=true` 的目标上计算，`lateral macro-F1` 只在 `lateral_action_valid=true` 的目标上计算，`joint action accuracy` 只在 `factorized_action_joint_valid=true` 的完整动作对上计算；报告必须同时给出三个指标各自的有效样本数，避免用统一过滤条件静默丢弃单方向监督。
+
+可选报告 legacy six-class compatibility metric（旧六分类兼容指标），但六分类 macro-F1（宏平均 F1）不再是 Phase 0.4 的主要动作指标。所有轨迹表必须明确区分 `GT-action-conditioned warmup result` 与 `predicted-action-conditioned inference result`：前者是必须保存的 diagnostic artifact（诊断产物），只诊断 waypoint head（轨迹点头）在正确动作条件下的能力；后者才代表正式 inference（推理）。本阶段不要求置信区间、多随机种子统计、显著性检验或论文级复杂消融。
 
 VRU presence（弱势道路使用者存在性）只作为 offline stratification metadata（离线分组元数据），不得进入模型输入。若本阶段尚无经过验证的 collision evaluator（碰撞评估器），不报告或推断 collision / safety（碰撞 / 安全）结果；正式 safety metrics（安全指标）在 Phase 0.6 建立。
 
@@ -1237,12 +1258,13 @@ VRU presence（弱势道路使用者存在性）只作为 offline stratification
 - past/current/future 时间顺序；
 - history mask 与 trajectory mask；
 - 当前 frozen schema（冻结模式）的 `current_ego_pose` / `current_ego_motion` 最低子字段与 `source_audit_record` 追溯；
-- factorized target derivation（因子化目标派生）的四类纵向、三类横向、invalid / uncertain（无效 / 不确定）和 rule version（规则版本）；
+- factorized target derivation（因子化目标派生）的四类纵向、三类横向、逐方向 invalid / uncertain（无效 / 不确定）、`factorized_action_joint_valid` 和 rule version（规则版本）；测试必须覆盖纵向有效而横向无效、横向有效而纵向无效，并证明有效方向的监督仍被保留；
 - current ego frame transform 和左右轴方向；
 - 固定 `[B,6,2]` waypoint（轨迹点）、`[B,6]` mask（掩码）、3.0 秒时域、0.5 秒间隔、单位与 collator batch（批处理整理）；
-- `[B,4]` longitudinal logits（纵向逻辑值）、`[B,3]` lateral logits（横向逻辑值）与 model forward shape（模型前向形状）；
+- longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]`、`predicted_waypoints [B,6,2]` 与 model forward shape（模型前向形状）；
 - soft embedding（软嵌入）的概率加权、梯度路径，以及 inference（推理）不接受 GT action（真值动作）；
-- masked loss 忽略 invalid positions；
+- masked loss（带掩码损失）分别使用 `longitudinal_action_valid`、`lateral_action_valid` 与 `trajectory_valid_mask`，且一个动作方向无效时另一方向的有效分类 loss（损失）不被清零；
+- `invalid prediction rate` 对 NaN / Inf、shape（形状）、有效点数量、mask（掩码）、坐标反归一化、action logits（动作逻辑值）和 verifier projection（验证器投影）失败的确定性计数；
 - normalization 只由 train 生成；
 - checkpoint save/load 与 deterministic small fixture；
 - Stage A / Stage B（阶段 A / 阶段 B）conditioning path（条件化路径）分离；
@@ -1256,14 +1278,15 @@ VRU presence（弱势道路使用者存在性）只作为 offline stratification
 
 Phase 0.4 通过条件：
 
-- factorized target（因子化目标）的派生、版本、invalid / uncertain（无效 / 不确定）处理和代表性人工审核通过；
+- factorized target（因子化目标）从同一 frozen future trajectory（冻结未来轨迹）独立派生；逐方向 validity / reason（有效性 / 原因）、`factorized_action_joint_valid`、版本、invalid / uncertain（无效 / 不确定）处理和代表性人工审核通过，且未由 legacy 六分类标签直接映射；
 - temporal dataset（时序数据集）、固定 `[B,6,2]` waypoint（轨迹点）、`[B,6]` mask（掩码）、坐标与时间 contract（协议）完整且审核通过；
 - 模型可稳定训练、保存、加载和推理；
-- longitudinal / lateral action head（纵向 / 横向动作头）分别输出 `[B,4]` / `[B,3]`，waypoint head（轨迹点头）使用模型预测的 soft action embedding（软动作嵌入）输出 `[B,6,2]`；
+- longitudinal action head（纵向动作头）输出 logits / probabilities（逻辑值 / 概率）`[B,4]` 与 predicted class（预测类别）`[B]`，lateral action head（横向动作头）输出 logits / probabilities（逻辑值 / 概率）`[B,3]` 与 predicted class（预测类别）`[B]`，waypoint head（轨迹点头）使用模型预测的 soft action embedding（软动作嵌入）输出 `predicted_waypoints [B,6,2]`；
 - predicted trajectory（预测轨迹）的 current ego frame（当前自车坐标系）、轴方向、单位和 0.5 秒间隔正确；
 - constant-velocity（匀速外推）、ego-history MLP（仅自车历史状态）、direct waypoint（直接轨迹点）与 factorized conditioned VLA（因子化条件视觉-语言-动作模型）完成同协议比较；
 - shuffled-image diagnostic（图像打乱诊断）能够回答视觉是否真实发挥作用，结果无论正负均保留；
 - longitudinal / lateral / joint consistency（纵向 / 横向 / 联合一致性）可由 verifier（验证器）稳定复现并回溯到 sample-level reason（样本级原因）；
+- `invalid prediction rate` 能稳定覆盖张量、轨迹、掩码、反归一化、动作输出与 verifier projection（验证器投影）失败，且不与 Phase 0.3 parser-based invalid-output rate（基于解析器的无效输出率）混用；
 - 正式结论使用 predicted-action-conditioned inference result（预测动作条件化推理结果），不把 GT-action warmup（真值动作预热）冒充推理结果；
 - 所有结果只来自 train / validation（训练集 / 验证集），没有访问已消费 test（测试集）；
 - model / feature / factorized-action / trajectory / consistency interface（模型 / 特征 / 因子化动作 / 轨迹 / 一致性接口）可供 Phase 0.5—0.8 复用。
@@ -1281,15 +1304,17 @@ Phase 0.4 通过条件：
 ```text
 historical CAM_FRONT sequence
 + current/past ego state
-→ longitudinal action [B, 4]
-+ lateral action [B, 3]
+→ longitudinal logits/probabilities [B,4]
+→ longitudinal predicted class [B]
++ lateral logits/probabilities [B,3]
+→ lateral predicted class [B]
 → predicted soft action embeddings
-→ 3-second waypoints [B, 6, 2]
+→ predicted_waypoints [B,6,2]
 → trajectory-implied actions
 → longitudinal / lateral / joint consistency
 ```
 
-Demo（演示）必须并列展示 GT-action-conditioned warmup（真值动作条件化预热）与 predicted-action-conditioned inference（预测动作条件化推理），但只把后者标为正式结果；同时展示模型真实输入、target（目标）与 offline metadata（离线元数据）的边界，并附带 config（配置）、checkpoint（检查点）和 sample provenance（样本来源）。
+最终主 Demo（演示）默认只展示 Stage B predicted-action-conditioned inference（阶段 B 预测动作条件化推理），并明确动作 embedding（嵌入）来自模型自身预测，正式推理不使用 GT action（真值动作）。Stage A GT-action-conditioned warmup（阶段 A 真值动作条件化预热）结果仍必须保存为 diagnostic artifact（诊断产物），仅在分析 action error propagation（动作误差传播）时与 Stage B 对比展示；不得让主 Demo 暗示正式推理注入真值动作。Demo 同时展示模型真实输入、target（目标）与 offline metadata（离线元数据）的边界，并附带 config（配置）、checkpoint（检查点）和 sample provenance（样本来源）。
 
 ### 10.3 Phase 0.5：BEV/OCC-aware semantic-geometric fusion
 
@@ -1354,7 +1379,7 @@ world model
 进入 Phase 0.5 前要求：
 
 - Phase 0.4 factorized target + temporal dataset contract（因子化目标与时序数据合同）已稳定；
-- Phase 0.4 longitudinal / lateral targets（纵向 / 横向目标）、`[B,6,2]` waypoint target（轨迹点目标）、current ego coordinate frame（当前自车坐标系）、0.5 秒 sampling interval（采样间隔）、3.0 秒 horizon（预测时域）、`[B,6]` valid mask（有效掩码）与 metrics（指标）已通过自动测试和人工审核；
+- Phase 0.4 longitudinal / lateral targets（纵向 / 横向目标）、各自 validity / reason（有效性 / 原因）、`factorized_action_joint_valid`、`[B,6,2]` waypoint target（轨迹点目标）、current ego coordinate frame（当前自车坐标系）、0.5 秒 sampling interval（采样间隔）、3.0 秒 horizon（预测时域）、`[B,6]` valid mask（有效掩码）与 metrics（指标）已通过自动测试和人工审核；
 - Phase 0.4 模型已走通 forward、training、checkpoint save/load 与 inference；
 - Phase 0.4 semantic feature interface 已定义 shape、dtype、mask、normalization 与 feature version；
 - Phase 0.4 factorized action heads（因子化动作预测头）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）与 verifier contract（验证器协议）不再随意变化；
@@ -1415,12 +1440,17 @@ Training-only targets 可以包括：
 future_waypoints [B, 6, 2]
 trajectory_valid_mask [B, 6]
 longitudinal_action
+longitudinal_action_valid
+longitudinal_action_reason
 lateral_action
+lateral_action_valid
+lateral_action_reason
+factorized_action_joint_valid
 GT current 3D annotations
 GT-derived current BEV occupancy
 ```
 
-Future waypoints（未来轨迹点）、trajectory valid mask（轨迹有效掩码）与 factorized meta-action target（因子化元动作目标）继续沿用 Phase 0.4 contract（协议）。GT current 3D annotations（当前真值三维标注）只用于生成 occupancy target（占用目标）、offline geometry audit（离线几何审计）与 evaluation reference（评估参考）；GT occupancy（真值占用表征）是 training-only target（仅训练目标）和 offline evaluation reference（离线评估参考），只进入 occupancy loss（占用损失）和离线指标，不进入模型 inference input（推理输入）或 fusion feature（融合特征）。
+Future waypoints（未来轨迹点）、trajectory valid mask（轨迹有效掩码）与 factorized meta-action target（因子化元动作目标）继续沿用 Phase 0.4 contract（协议）。`L_longitudinal` 与 `L_lateral` 分别继承 `longitudinal_action_valid` 与 `lateral_action_valid`，Phase 0.5 不得重新合并成统一动作掩码；`factorized_action_joint_valid` 只服务完整动作对相关的条件化、审核与联合指标。GT current 3D annotations（当前真值三维标注）只用于生成 occupancy target（占用目标）、offline geometry audit（离线几何审计）与 evaluation reference（评估参考）；GT occupancy（真值占用表征）是 training-only target（仅训练目标）和 offline evaluation reference（离线评估参考），只进入 occupancy loss（占用损失）和离线指标，不进入模型 inference input（推理输入）或 fusion feature（融合特征）。
 
 永久禁止：
 
@@ -1670,7 +1700,7 @@ L_occupancy:
 current vehicle/VRU occupancy supervision
 ```
 
-第一版独立多通道 occupancy（占用表征）可以使用 class-balanced `BCEWithLogits`（类别平衡二元交叉熵），并将 Dice / overlap-oriented term（Dice / 重叠项）保留为 validation-controlled optional（验证集控制的可选项）。`occupancy_valid_mask` 外不计算 loss（损失）；class weights（类别权重）和 normalization（归一化）只由 train（训练集）统计；occupancy threshold（占用阈值）、`lambda_occ`、checkpoint（检查点）与 optional overlap term（可选重叠项）只由 validation（验证集）选择；validation target（验证目标）不参与梯度；GT occupancy（真值占用表征）不进入 inference（推理）。Phase 0.4 的 `lambda_traj / lambda_long / lambda_lat` 及 predicted-action conditioning（预测动作条件化）继续生效，不恢复六分类损失。
+第一版独立多通道 occupancy（占用表征）可以使用 class-balanced `BCEWithLogits`（类别平衡二元交叉熵），并将 Dice / overlap-oriented term（Dice / 重叠项）保留为 validation-controlled optional（验证集控制的可选项）。`occupancy_valid_mask` 外不计算 loss（损失）；class weights（类别权重）和 normalization（归一化）只由 train（训练集）统计；occupancy threshold（占用阈值）、`lambda_occ`、checkpoint（检查点）与 optional overlap term（可选重叠项）只由 validation（验证集）选择；validation target（验证目标）不参与梯度；GT occupancy（真值占用表征）不进入 inference（推理）。Phase 0.4 的 `lambda_traj / lambda_long / lambda_lat` 及 predicted-action conditioning（预测动作条件化）继续生效，其中 `L_longitudinal` 只由 `longitudinal_action_valid` 控制、`L_lateral` 只由 `lateral_action_valid` 控制，不恢复统一动作掩码或六分类损失。
 
 本阶段不加入 safety loss、collision penalty、RL objective 或 DPO loss。若 occupancy 指标提升但 trajectory 明显退化，不得仅按 occupancy 选择 checkpoint，也不得把 occupancy improvement 写成 planning improvement。
 
@@ -1678,7 +1708,7 @@ current vehicle/VRU occupancy supervision
 
 ##### Phase 0.5a：范围、依赖与资源预检
 
-1. 核对 Phase 0.4 semantic feature（语义特征）、predicted longitudinal / lateral actions（预测纵向 / 横向动作）、`[B,6,2]` predicted waypoints（预测轨迹点）、`[B,6]` mask（掩码）、consistency output（一致性输出）与 checkpoint contract（检查点协议）。
+1. 核对 Phase 0.4 semantic feature（语义特征）、longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]`、`predicted_waypoints [B,6,2]`、`trajectory_valid_mask [B,6]`、consistency output（一致性输出）与 checkpoint contract（检查点协议）。
 2. 核对正式 camera set、calibration、timestamp 与 ego-pose 数据可用性。
 3. 核对本地验证环境和受控训练环境资源。
 4. 对 Candidate A/B 做有限 compatibility spike。
@@ -1725,7 +1755,7 @@ multi-camera
 1. 加载并冻结或受控训练 Phase 0.4 semantic branch。
 2. 接入 geometry tokens、positional embedding 与 mask。
 3. 核对 projection、token scale、normalization 和 fusion attention。
-4. 核对 longitudinal action（纵向动作）、lateral action（横向动作）、meta-action-conditioned waypoint（元动作条件化轨迹点）、consistency（动作—轨迹一致性）与 occupancy（占用表征）输出合同。
+4. 核对 longitudinal / lateral logits、probabilities 与 predicted class（纵向 / 横向逻辑值、概率与预测类别）、`predicted_waypoints [B,6,2]`、consistency（动作—轨迹一致性）与 occupancy（占用表征）输出合同。
 5. 核对 `L_trajectory / L_longitudinal / L_lateral / L_occupancy` 四项 loss（损失）与各模块梯度路径。
 6. 核对 checkpoint save/load 与相同输入下的 inference。
 7. 完成 small-subset overfit。
@@ -1757,10 +1787,12 @@ semantic + BEV geometry + occupancy auxiliary
 最终冻结供 Phase 0.6 使用的接口：
 
 ```text
-predicted longitudinal action
-predicted lateral action
-predicted_waypoints [B, 6, 2]
-trajectory_valid_mask [B, 6]
+longitudinal logits/probabilities [B,4]
+longitudinal predicted class [B]
+lateral logits/probabilities [B,3]
+lateral predicted class [B]
+predicted_waypoints [B,6,2]
+trajectory_valid_mask [B,6]
 action-trajectory consistency output
 predicted occupancy probabilities
 BEV grid metadata
@@ -1797,6 +1829,8 @@ longitudinal macro-F1
 lateral macro-F1
 joint action accuracy
 ```
+
+上述动作指标沿用 Phase 0.4 的独立有效性合同：纵向指标只使用 `longitudinal_action_valid`，横向指标只使用 `lateral_action_valid`，联合准确率只使用 `factorized_action_joint_valid`，并分别报告有效样本数。
 
 Occupancy 至少报告：
 
@@ -1838,7 +1872,8 @@ Model/contract tests 至少覆盖：
 - camera/BEV mask 和 positional information；
 - masked occupancy loss；
 - semantic-geometric fusion forward 与梯度；
-- Phase 0.4 `[B,4]` / `[B,3]` action head（动作头）、soft embedding conditioning（软嵌入条件化）、`[B,6,2]` waypoint（轨迹点）、`[B,6]` mask（掩码）与 verifier output（验证器输出）合同不变；
+- Phase 0.4 longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]`、`predicted_waypoints [B,6,2]`、`trajectory_valid_mask [B,6]` 与 verifier output（验证器输出）合同不变；
+- Phase 0.4 逐方向 validity / reason（有效性 / 原因）与 `factorized_action_joint_valid` 可被真实 consumer intake（消费者接入）读取，且纵向 / 横向 loss mask（损失掩码）互不覆盖；
 - checkpoint save/load；
 - inference path 不要求 GT occupancy；
 - test split guard。
@@ -1900,9 +1935,11 @@ historical CAM_FRONT
 → temporal semantic features
 + BEV geometry
 → current occupancy prediction
-→ longitudinal action [B, 4]
-+ lateral action [B, 3]
-→ 3-second waypoints [B, 6, 2]
+→ longitudinal logits/probabilities [B,4]
+→ longitudinal predicted class [B]
++ lateral logits/probabilities [B,3]
+→ lateral predicted class [B]
+→ predicted_waypoints [B,6,2]
 → action-trajectory consistency
 ```
 
