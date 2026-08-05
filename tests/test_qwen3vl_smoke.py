@@ -23,7 +23,6 @@ from src.phase0.qwen3vl_smoke import (
     load_smoke_config,
     parse_action_output,
     run_smoke,
-    select_first_sample,
     smoke_exit_code,
     write_smoke_artifact,
 )
@@ -171,6 +170,29 @@ class FakeModel:
         return self.output_ids
 
 
+class FakeNuScenes:
+    def __init__(
+        self,
+        *,
+        sample_token: str = "sample-1",
+        scene_token: str = "scene-sample-1",
+        cam_front_path: str = "samples/CAM_FRONT/sample-1.jpg",
+    ):
+        self.records = {
+            ("sample", sample_token): {
+                "token": sample_token,
+                "scene_token": scene_token,
+                "data": {"CAM_FRONT": "cam-front-token"},
+            },
+            ("sample_data", "cam-front-token"): {
+                "filename": cam_front_path,
+            },
+        }
+
+    def get(self, table_name: str, token: str):
+        return self.records[(table_name, token)]
+
+
 def _git_runner(root: Path, arguments: tuple[str, ...]) -> str:
     del root
     return {
@@ -193,20 +215,39 @@ def _write_manifest(path: Path, rows: list[dict[str, object]]) -> None:
     )
 
 
-def _row(
-    token: str,
-    *,
-    split: str = "train",
-    path: str | None = None,
-    label: str = "stop",
-) -> dict[str, object]:
+def _manifest_row(token: str, *, split: str = "test") -> dict[str, object]:
     return {
         "sample_token": token,
         "scene_token": f"scene-{token}",
         "split": split,
-        "cam_front_path": path or f"samples/CAM_FRONT/{token}.jpg",
-        "meta_action": label,
+        "cam_front_path": f"samples/CAM_FRONT/{token}.jpg",
+        "meta_action": "stop",
         "future_ego_trajectory": [[999.0, 999.0]],
+    }
+
+
+def _locator_record(
+    *,
+    sample_token: str = "sample-1",
+    scene_token: str = "scene-sample-1",
+    split: str = "validation",
+) -> dict[str, object]:
+    return {
+        "sample_token": sample_token,
+        "scene_token": scene_token,
+        "split": split,
+        "ground_truth_action": "stop",
+        "predicted_action": "keep",
+        "motion_availability": "full",
+        "speed_mps": 3.5,
+    }
+
+
+def _selected_rule(manifest_sha256: str) -> dict[str, object]:
+    return {
+        "manifest_sha256": manifest_sha256,
+        "split_mapping_sha256": "b" * 64,
+        "test_evaluation_performed": False,
     }
 
 
@@ -219,6 +260,7 @@ def _runtime(
     model_error: Exception | None = None,
     generation_error: Exception | None = None,
     image_error: Exception | None = None,
+    nuscenes: FakeNuScenes | None = None,
 ):
     torch = FakeTorch(
         available=available,
@@ -229,7 +271,13 @@ def _runtime(
         revision=model_revision,
         generation_error=generation_error,
     )
-    calls: dict[str, object] = {"processor": [], "model": []}
+    reader = nuscenes or FakeNuScenes()
+    calls: dict[str, object] = {
+        "processor": [],
+        "model": [],
+        "image": [],
+        "nuscenes": [],
+    }
 
     def processor_loader(*args):
         calls["processor"].append(args)
@@ -243,16 +291,22 @@ def _runtime(
         return model
 
     def image_loader(path: Path):
+        calls["image"].append(path)
         if image_error is not None:
             raise image_error
         with Image.open(path) as image:
             return image.convert("RGB")
+
+    def nuscenes_loader(path: Path):
+        calls["nuscenes"].append(path)
+        return reader
 
     dependencies = RuntimeDependencies(
         torch=torch,
         processor_loader=processor_loader,
         model_loader=model_loader,
         image_loader=image_loader,
+        nuscenes_loader=nuscenes_loader,
         package_version=lambda package: "4.57.6",
     )
     return dependencies, processor, model, calls
@@ -263,7 +317,10 @@ def _run(
     monkeypatch: pytest.MonkeyPatch,
     config,
     *,
-    rows: list[dict[str, object]] | None = None,
+    manifest_rows: list[dict[str, object]] | None = None,
+    locator: dict[str, object] | None = None,
+    locator_state: str = "present",
+    selected_rule_overrides: dict[str, object] | None = None,
     create_image: bool = True,
     runtime=None,
 ):
@@ -276,16 +333,35 @@ def _run(
     monkeypatch.setenv("HF_HOME", str(cache_root))
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
     manifest_path = derived_root / config.manifest_relative_path
-    actual_rows = rows or [_row("sample-1")]
-    _write_manifest(manifest_path, actual_rows)
-    selected_path = actual_rows[0]["cam_front_path"]
-    if create_image and isinstance(selected_path, str):
+    _write_manifest(
+        manifest_path,
+        manifest_rows
+        or [
+            _manifest_row("consumed-test-first"),
+            _manifest_row("train-later", split="train"),
+        ],
+    )
+    manifest_sha256 = sha256_file(manifest_path)
+    locator_path = derived_root / config.sample_locator_relative_path
+    locator_path.parent.mkdir(parents=True, exist_ok=True)
+    if locator_state == "present":
+        _write_manifest(locator_path, [locator or _locator_record()])
+    elif locator_state == "empty":
+        locator_path.write_text("", encoding="utf-8")
+    selected_rule_path = derived_root / config.selected_rule_relative_path
+    selected_rule_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_rule = _selected_rule(manifest_sha256)
+    if selected_rule_overrides:
+        selected_rule.update(selected_rule_overrides)
+    selected_rule_path.write_text(json.dumps(selected_rule), encoding="utf-8")
+    selected_path = "samples/CAM_FRONT/sample-1.jpg"
+    if create_image:
         image_path = nuscenes_root / selected_path
         image_path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (32, 24), "white").save(image_path)
     pinned_config = replace(
         config,
-        expected_manifest_sha256=sha256_file(manifest_path),
+        expected_manifest_sha256=manifest_sha256,
     )
     dependencies = runtime or _runtime()[0]
     return run_smoke(
@@ -302,6 +378,8 @@ def test_config_is_valid(config):
     assert config.model_revision == FIXED_REVISION
     assert config.allowed_actions == ACTION_SCHEMA
     assert dict(config.generation_kwargs) == FIXED_GENERATION_KWARGS
+    assert config.allowed_split == "validation"
+    assert config.selection_strategy == "first_validation_prediction_record"
 
 
 def test_config_rejects_missing_model_revision(tmp_path):
@@ -327,7 +405,16 @@ def test_config_rejects_test_split(tmp_path):
     raw["allowed_split"] = "test"
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="train or validation"):
+    with pytest.raises(ValueError, match="must be validation"):
+        load_smoke_config(path)
+
+
+def test_config_rejects_locator_path_traversal(tmp_path):
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["sample_locator_relative_path"] = "../validation_predictions.jsonl"
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="traversal-free"):
         load_smoke_config(path)
 
 
@@ -358,7 +445,7 @@ def test_manifest_sha_mismatch_blocks_before_parsing(tmp_path, monkeypatch, conf
     monkeypatch.setenv("HF_HOME", str(cache_root))
     _write_manifest(
         derived_root / config.manifest_relative_path,
-        [_row("sample-1")],
+        [_manifest_row("consumed-test-first")],
     )
     artifact = run_smoke(
         config=config,
@@ -373,37 +460,187 @@ def test_manifest_sha_mismatch_blocks_before_parsing(tmp_path, monkeypatch, conf
     assert artifact["failures"][0]["code"] == "manifest_sha256_mismatch"
 
 
-def test_selects_first_legal_train_sample(tmp_path):
-    path = tmp_path / "manifest.jsonl"
-    _write_manifest(
-        path,
-        [
-            _row("validation", split="validation"),
-            _row("first"),
-            _row("second"),
+def test_formal_smoke_never_calls_combined_manifest_iterator(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    import src.phase0.protocol as protocol
+
+    def forbidden_iterator(path):
+        raise AssertionError(f"combined manifest parsed: {path}")
+
+    monkeypatch.setattr(protocol, "iter_manifest_rows", forbidden_iterator)
+    artifact = _run(tmp_path, monkeypatch, config)
+    assert artifact["status"] == "passed"
+    assert artifact["manifest_records_parsed"] == 0
+
+
+def test_test_first_frozen_manifest_is_hashed_without_record_parsing(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        manifest_rows=[
+            _manifest_row("consumed-test-first", split="test"),
+            _manifest_row("train-later", split="train"),
         ],
     )
-    sample, count = select_first_sample(path, "train")
-    assert sample.sample_token == "first"
-    assert sample.manifest_line_number == 2
-    assert count == 2
+    assert artifact["status"] == "passed"
+    assert artifact["manifest_records_parsed"] == 0
+    assert artifact["sample"]["sample_token"] == "sample-1"
 
 
-def test_selection_does_not_depend_on_label(tmp_path):
-    path = tmp_path / "manifest.jsonl"
-    _write_manifest(
-        path,
-        [_row("first", label="stop"), _row("second", label="keep")],
+def test_first_validation_locator_record_selects_sample(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    artifact = _run(tmp_path, monkeypatch, config)
+    assert artifact["status"] == "passed"
+    assert artifact["sample"] == {
+        "locator_line_number": 1,
+        "sample_token": "sample-1",
+        "scene_token": "scene-sample-1",
+        "split": "validation",
+        "cam_front_path": "samples/CAM_FRONT/sample-1.jpg",
+    }
+    assert artifact["locator_records_parsed"] == 1
+
+
+def test_test_locator_fails_before_image_processor_and_model(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    dependencies, _, _, calls = _runtime()
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        locator=_locator_record(split="test"),
+        runtime=dependencies,
     )
-    sample, _ = select_first_sample(path, "train")
-    assert sample.sample_token == "first"
+    assert artifact["status"] == "failed"
+    assert artifact["locator_records_parsed"] == 1
+    assert calls == {"processor": [], "model": [], "image": [], "nuscenes": []}
 
 
-def test_cam_front_traversal_is_rejected(tmp_path):
-    path = tmp_path / "manifest.jsonl"
-    _write_manifest(path, [_row("bad", path="samples/CAM_FRONT/../secret.jpg")])
-    with pytest.raises(ValueError, match="CAM_FRONT"):
-        select_first_sample(path, "train")
+@pytest.mark.parametrize("locator_state", ["missing", "empty"])
+def test_missing_or_empty_locator_is_blocked(
+    tmp_path,
+    monkeypatch,
+    config,
+    locator_state,
+):
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        locator_state=locator_state,
+    )
+    assert artifact["status"] == "blocked"
+    assert artifact["locator_records_parsed"] == 0
+
+
+def test_selected_rule_manifest_sha_mismatch_is_failed(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        selected_rule_overrides={"manifest_sha256": "c" * 64},
+    )
+    assert artifact["status"] == "failed"
+    assert artifact["failures"][0]["code"] == "selected_rule_invalid"
+
+
+def test_selected_rule_test_evaluation_is_failed(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        selected_rule_overrides={"test_evaluation_performed": True},
+    )
+    assert artifact["status"] == "failed"
+    assert artifact["failures"][0]["code"] == "selected_rule_invalid"
+
+
+def test_locator_scene_mismatch_is_failed(tmp_path, monkeypatch, config):
+    dependencies, _, _, calls = _runtime(
+        nuscenes=FakeNuScenes(scene_token="different-scene")
+    )
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        runtime=dependencies,
+    )
+    assert artifact["status"] == "failed"
+    assert artifact["failures"][0]["code"] == "cam_front_lookup_failed"
+    assert calls["image"] == []
+    assert calls["processor"] == []
+    assert calls["model"] == []
+
+
+def test_nuscenes_cam_front_traversal_is_failed(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    dependencies, _, _, calls = _runtime(
+        nuscenes=FakeNuScenes(
+            cam_front_path="samples/CAM_FRONT/../secret.jpg",
+        )
+    )
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        runtime=dependencies,
+    )
+    assert artifact["status"] == "failed"
+    assert artifact["failures"][0]["code"] == "cam_front_lookup_failed"
+    assert calls["image"] == []
+
+
+def test_selected_rule_split_mapping_sha_is_required(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    artifact = _run(
+        tmp_path,
+        monkeypatch,
+        config,
+        selected_rule_overrides={"split_mapping_sha256": "invalid"},
+    )
+    assert artifact["status"] == "failed"
+    assert artifact["failures"][0]["code"] == "selected_rule_invalid"
+
+
+def test_locator_labels_do_not_enter_model_input_or_sample_artifact(
+    tmp_path,
+    monkeypatch,
+    config,
+):
+    dependencies, processor, _, _ = _runtime()
+    artifact = _run(tmp_path, monkeypatch, config, runtime=dependencies)
+    assert "ground_truth_action" not in artifact["sample"]
+    assert "predicted_action" not in artifact["sample"]
+    assert processor.messages[0]["content"][1]["text"] == config.task_prompt
+    assert "stop" not in processor.messages[0]["content"][1]["text"]
 
 
 def test_missing_image_is_blocked(tmp_path, monkeypatch, config):
@@ -567,10 +804,14 @@ def test_atomic_artifact_write(tmp_path):
 
 def test_test_isolation_fields_are_fixed(tmp_path, monkeypatch, config):
     artifact = _run(tmp_path, monkeypatch, config)
+    assert artifact["manifest_records_parsed"] == 0
+    assert artifact["locator_records_parsed"] == 1
+    assert artifact["locator_source"] == config.sample_locator_relative_path
     assert artifact["test_records_read"] == 0
     assert artifact["test_images_opened"] == 0
     assert artifact["test_labels_read"] == 0
     assert artifact["test_evaluation_performed"] is False
+    assert artifact["validation_label_used_as_model_input"] is False
 
 
 @pytest.mark.parametrize(

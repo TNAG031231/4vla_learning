@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
+import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -18,7 +19,6 @@ import yaml
 from src.actions.schema import ACTION_SCHEMA
 from src.phase0.protocol import (
     is_valid_cam_front_path,
-    iter_manifest_rows,
     validate_sha256,
 )
 from src.phase0.qwen_preflight import (
@@ -32,8 +32,9 @@ from src.phase0.qwen_preflight import (
 ARTIFACT_SCHEMA_VERSION = "phase0.3a2_qwen3vl_smoke_artifact_v0.1"
 FIXED_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 FIXED_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
-ALLOWED_SPLITS = frozenset({"train", "validation"})
-SELECTION_STRATEGY = "first_manifest_record_in_allowed_split"
+ALLOWED_SPLIT = "validation"
+SELECTION_STRATEGY = "first_validation_prediction_record"
+NUSCENES_VERSION = "v1.0-trainval"
 FIXED_GENERATION_KWARGS = {
     "do_sample": False,
     "num_beams": 1,
@@ -55,6 +56,8 @@ REQUIRED_CONFIG_FIELDS = frozenset(
         "generation_kwargs",
         "manifest_relative_path",
         "expected_manifest_sha256",
+        "sample_locator_relative_path",
+        "selected_rule_relative_path",
         "output_relative_path",
         "local_files_only",
     }
@@ -97,6 +100,11 @@ class TorchRuntime(Protocol):
         ...
 
 
+class NuScenesReader(Protocol):
+    def get(self, table_name: str, token: str) -> Mapping[str, object]:
+        ...
+
+
 @dataclass(frozen=True)
 class SmokeConfig:
     smoke_version: str
@@ -112,14 +120,24 @@ class SmokeConfig:
     generation_kwargs: Mapping[str, object]
     manifest_relative_path: str
     expected_manifest_sha256: str
+    sample_locator_relative_path: str
+    selected_rule_relative_path: str
     output_relative_path: str
     local_files_only: bool
     config_sha256: str
 
 
 @dataclass(frozen=True)
+class LocatorSample:
+    locator_line_number: int
+    sample_token: str
+    scene_token: str
+    split: str
+
+
+@dataclass(frozen=True)
 class SmokeSample:
-    manifest_line_number: int
+    locator_line_number: int
     sample_token: str
     scene_token: str
     split: str
@@ -132,6 +150,7 @@ class RuntimeDependencies:
     processor_loader: Callable[..., object]
     model_loader: Callable[..., object]
     image_loader: Callable[[Path], object]
+    nuscenes_loader: Callable[[Path], NuScenesReader]
     package_version: Callable[[str], str]
     timer: Callable[[], float] = time.perf_counter
 
@@ -188,8 +207,8 @@ def load_smoke_config(path: Path) -> SmokeConfig:
         raise ValueError(f"model and processor revisions must be {FIXED_REVISION}")
 
     allowed_split = _required_string(raw, "allowed_split")
-    if allowed_split not in ALLOWED_SPLITS:
-        raise ValueError("allowed_split must be train or validation")
+    if allowed_split != ALLOWED_SPLIT:
+        raise ValueError("allowed_split must be validation")
     selection_strategy = _required_string(raw, "selection_strategy")
     if selection_strategy != SELECTION_STRATEGY:
         raise ValueError(f"selection_strategy must be {SELECTION_STRATEGY}")
@@ -223,6 +242,14 @@ def load_smoke_config(path: Path) -> SmokeConfig:
         _required_string(raw, "manifest_relative_path"),
         "manifest_relative_path",
     )
+    sample_locator_relative_path = _relative_posix_path(
+        _required_string(raw, "sample_locator_relative_path"),
+        "sample_locator_relative_path",
+    )
+    selected_rule_relative_path = _relative_posix_path(
+        _required_string(raw, "selected_rule_relative_path"),
+        "selected_rule_relative_path",
+    )
     output_relative_path = _relative_posix_path(
         _required_string(raw, "output_relative_path"),
         "output_relative_path",
@@ -253,6 +280,8 @@ def load_smoke_config(path: Path) -> SmokeConfig:
             raw.get("expected_manifest_sha256"),
             "expected_manifest_sha256",
         ),
+        sample_locator_relative_path=sample_locator_relative_path,
+        selected_rule_relative_path=selected_rule_relative_path,
         output_relative_path=output_relative_path,
         local_files_only=local_files_only,
         config_sha256=hashlib.sha256(config_bytes).hexdigest(),
@@ -284,37 +313,118 @@ def parse_action_output(raw_output: object) -> dict[str, object]:
     }
 
 
-def select_first_sample(
-    manifest_path: Path,
-    allowed_split: str,
-) -> tuple[SmokeSample, int]:
-    if allowed_split not in ALLOWED_SPLITS:
-        raise ValueError("runtime allowed_split must be train or validation")
-    records_parsed = 0
-    for line_number, row in enumerate(iter_manifest_rows(manifest_path), 1):
-        records_parsed += 1
-        split = _required_string(row, "split")
-        if split == "test":
-            raise ValueError("test manifest records must not be consumed")
-        if split != allowed_split:
-            continue
-        cam_front_path = _required_string(row, "cam_front_path")
-        if not is_valid_cam_front_path(cam_front_path):
-            raise ValueError(
-                "cam_front_path must be under samples/CAM_FRONT/ and relative "
-                "to NUSCENES_ROOT"
-            )
-        return (
-            SmokeSample(
-                manifest_line_number=line_number,
-                sample_token=_required_string(row, "sample_token"),
-                scene_token=_required_string(row, "scene_token"),
-                split=split,
-                cam_front_path=cam_front_path,
-            ),
-            records_parsed,
-        )
-    raise ValueError(f"manifest contains no {allowed_split} sample")
+def _required_mapping(
+    mapping: Mapping[str, object],
+    key: str,
+) -> Mapping[str, object]:
+    value = mapping.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{key} must be a mapping")
+    return value
+
+
+def resolve_derived_input_path(
+    derived_root: Path,
+    relative_path: str,
+) -> Path:
+    root = derived_root.resolve()
+    resolved = (root / relative_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError("derived input path escapes VLA_DERIVED_ROOT") from error
+    return resolved
+
+
+def read_first_locator_record(path: Path) -> Mapping[str, object]:
+    if not path.is_file():
+        raise FileNotFoundError("validation sample locator is missing")
+    with path.open("r", encoding="utf-8") as locator_file:
+        first_line = locator_file.readline()
+    if not first_line.strip():
+        raise EOFError("validation sample locator is empty")
+    try:
+        payload = json.loads(first_line)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "validation sample locator first record is invalid JSON"
+        ) from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("validation sample locator first record must be an object")
+    return payload
+
+
+def parse_validation_locator(payload: Mapping[str, object]) -> LocatorSample:
+    split = _required_string(payload, "split")
+    if split != ALLOWED_SPLIT:
+        raise ValueError("validation sample locator first record must be validation")
+    return LocatorSample(
+        locator_line_number=1,
+        sample_token=_required_string(payload, "sample_token"),
+        scene_token=_required_string(payload, "scene_token"),
+        split=split,
+    )
+
+
+def read_selected_rule(
+    path: Path,
+    expected_manifest_sha256: str,
+) -> dict[str, object]:
+    if not path.is_file():
+        raise FileNotFoundError("selected rule artifact is missing")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError("selected rule artifact is invalid JSON") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("selected rule artifact must be an object")
+    manifest_sha256 = validate_sha256(
+        payload.get("manifest_sha256"),
+        "selected_rule.manifest_sha256",
+    )
+    if manifest_sha256 != expected_manifest_sha256:
+        raise ValueError("selected rule manifest SHA-256 does not match config")
+    if payload.get("test_evaluation_performed") is not False:
+        raise ValueError("selected rule must record test_evaluation_performed=false")
+    split_mapping_sha256 = validate_sha256(
+        payload.get("split_mapping_sha256"),
+        "selected_rule.split_mapping_sha256",
+    )
+    return {
+        "manifest_sha256": manifest_sha256,
+        "split_mapping_sha256": split_mapping_sha256,
+        "test_evaluation_performed": False,
+    }
+
+
+def locate_cam_front_sample(
+    nuscenes: NuScenesReader,
+    locator: LocatorSample,
+    nuscenes_root: Path,
+) -> tuple[SmokeSample, Path]:
+    sample_record = nuscenes.get("sample", locator.sample_token)
+    if not isinstance(sample_record, Mapping):
+        raise ValueError("nuScenes sample record must be an object")
+    scene_token = _required_string(sample_record, "scene_token")
+    if scene_token != locator.scene_token:
+        raise ValueError("locator scene_token does not match nuScenes sample")
+    sample_data = _required_mapping(sample_record, "data")
+    camera_token = _required_string(sample_data, "CAM_FRONT")
+    camera_record = nuscenes.get("sample_data", camera_token)
+    if not isinstance(camera_record, Mapping):
+        raise ValueError("nuScenes CAM_FRONT sample_data must be an object")
+    cam_front_path = _required_string(camera_record, "filename")
+    image_path = resolve_image_path(nuscenes_root, cam_front_path)
+    return (
+        SmokeSample(
+            locator_line_number=locator.locator_line_number,
+            sample_token=locator.sample_token,
+            scene_token=locator.scene_token,
+            split=locator.split,
+            cam_front_path=cam_front_path,
+        ),
+        image_path,
+    )
 
 
 def resolve_image_path(nuscenes_root: Path, relative_path: str) -> Path:
@@ -427,6 +537,16 @@ def _default_image_loader(path: Path) -> Image.Image:
         return image.convert("RGB")
 
 
+def _default_nuscenes_loader(root: Path) -> NuScenesReader:
+    from nuscenes.nuscenes import NuScenes
+
+    return NuScenes(
+        version=NUSCENES_VERSION,
+        dataroot=str(root),
+        verbose=False,
+    )
+
+
 def default_runtime_dependencies() -> RuntimeDependencies:
     import torch
 
@@ -435,6 +555,7 @@ def default_runtime_dependencies() -> RuntimeDependencies:
         processor_loader=_default_processor_loader,
         model_loader=_default_model_loader,
         image_loader=_default_image_loader,
+        nuscenes_loader=_default_nuscenes_loader,
         package_version=metadata.version,
     )
 
@@ -507,6 +628,8 @@ def _base_artifact(
                 "gt_boxes",
                 "occupancy",
                 "gt_meta_action",
+                "ground_truth_action",
+                "predicted_action",
             ],
         },
         "prompt": {
@@ -540,12 +663,16 @@ def _base_artifact(
         },
         "manifest": None,
         "manifest_records_parsed": 0,
+        "locator_records_parsed": 0,
+        "locator_source": config.sample_locator_relative_path,
+        "selected_rule": None,
         "warnings": [],
         "failures": [],
         "test_records_read": 0,
         "test_images_opened": 0,
         "test_labels_read": 0,
         "test_evaluation_performed": False,
+        "validation_label_used_as_model_input": False,
     }
 
 
@@ -585,8 +712,12 @@ def run_smoke(
     git_runner: Callable[[Path, tuple[str, ...]], str] | None = None,
 ) -> dict[str, object]:
     total_started = time.perf_counter()
-    if config.allowed_split not in ALLOWED_SPLITS:
-        raise ValueError("runtime allowed_split must be train or validation")
+    if config.allowed_split != ALLOWED_SPLIT:
+        raise ValueError("runtime allowed_split must be validation")
+    if config.selection_strategy != SELECTION_STRATEGY:
+        raise ValueError(
+            f"runtime selection_strategy must be {SELECTION_STRATEGY}"
+        )
     effective_local_only = (
         config.local_files_only
         if local_files_only is None
@@ -622,7 +753,10 @@ def run_smoke(
     if cache_failure is not None:
         failures.append(cache_failure)
 
-    manifest_path = (derived_root / config.manifest_relative_path).resolve()
+    manifest_path = resolve_derived_input_path(
+        derived_root,
+        config.manifest_relative_path,
+    )
     manifest, manifest_failures = check_manifest_integrity(
         manifest_path,
         config.expected_manifest_sha256,
@@ -632,35 +766,85 @@ def run_smoke(
     if failures:
         return finish(_status_from_failures(failures))
 
+    selected_rule_path = resolve_derived_input_path(
+        derived_root,
+        config.selected_rule_relative_path,
+    )
     try:
-        sample, records_parsed = select_first_sample(
-            manifest_path,
-            config.allowed_split,
+        selected_rule = read_selected_rule(
+            selected_rule_path,
+            config.expected_manifest_sha256,
         )
-        image_path = resolve_image_path(nuscenes_root, sample.cam_front_path)
+    except FileNotFoundError as error:
+        failures.append(_failure("selected_rule_missing", str(error), "blocked"))
+        return finish("blocked")
     except (OSError, ValueError) as error:
-        failures.append(_failure("sample_selection_failed", str(error), "failed"))
+        failures.append(_failure("selected_rule_invalid", str(error), "failed"))
         return finish("failed")
-    artifact["manifest_records_parsed"] = records_parsed
+    artifact["selected_rule"] = {
+        "source": config.selected_rule_relative_path,
+        **selected_rule,
+    }
+
+    locator_path = resolve_derived_input_path(
+        derived_root,
+        config.sample_locator_relative_path,
+    )
+    try:
+        locator_payload = read_first_locator_record(locator_path)
+    except (FileNotFoundError, EOFError) as error:
+        failures.append(_failure("sample_locator_unavailable", str(error), "blocked"))
+        return finish("blocked")
+    except (OSError, ValueError) as error:
+        failures.append(_failure("sample_locator_invalid", str(error), "failed"))
+        return finish("failed")
+    artifact["locator_records_parsed"] = 1
+    try:
+        locator = parse_validation_locator(locator_payload)
+    except ValueError as error:
+        failures.append(_failure("sample_locator_invalid", str(error), "failed"))
+        return finish("failed")
+
+    runtime = dependencies or default_runtime_dependencies()
+    try:
+        nuscenes = runtime.nuscenes_loader(nuscenes_root)
+    except Exception as error:
+        failures.append(
+            _failure(
+                "nuscenes_load_failed",
+                f"nuScenes could not be loaded: {error}",
+                "blocked",
+            )
+        )
+        return finish("blocked")
+    try:
+        sample, image_path = locate_cam_front_sample(
+            nuscenes,
+            locator,
+            nuscenes_root,
+        )
+    except Exception as error:
+        failures.append(
+            _failure(
+                "cam_front_lookup_failed",
+                f"CAM_FRONT lookup failed: {error}",
+                "failed",
+            )
+        )
+        return finish("failed")
     artifact["sample"] = {
-        "manifest_line_number": sample.manifest_line_number,
+        "locator_line_number": sample.locator_line_number,
         "sample_token": sample.sample_token,
         "scene_token": sample.scene_token,
         "split": sample.split,
         "cam_front_path": sample.cam_front_path,
     }
-    if sample.split == "test":
-        failures.append(
-            _failure("test_split_runtime_rejected", "test split is forbidden", "failed")
-        )
-        return finish("failed")
     if not image_path.is_file():
         failures.append(
             _failure("image_missing", "selected CAM_FRONT image is missing", "blocked")
         )
         return finish("blocked")
 
-    runtime = dependencies or default_runtime_dependencies()
     torch = runtime.torch
     environment.update(
         {
