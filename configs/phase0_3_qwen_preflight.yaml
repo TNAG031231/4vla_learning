@@ -1,0 +1,25 @@
+preflight_version: "phase0.3a-qwen-preflight-v0.1"
+required_conda_environment: "codex4vla_env"
+required_environment_variables:
+  - "NUSCENES_ROOT"
+  - "VLA_DERIVED_ROOT"
+optional_cache_environment_variables:
+  - "HF_HOME"
+  - "HUGGINGFACE_HUB_CACHE"
+  - "TRANSFORMERS_CACHE"
+  - "MODELSCOPE_CACHE"
+manifest_relative_path: "phase_0_1b/trainval_manifest_v1/manifest.jsonl"
+expected_manifest_sha256: "60517f985fec8fe3977a31660a5204942e9fd36baf09ea4d950328b1f225d1b3"
+output_relative_path: "phase_0_3/qwen3vl_preflight_v0_1/environment_preflight.json"
+required_packages:
+  - "torch"
+  - "transformers"
+  - "accelerate"
+  - "peft"
+  - "Pillow"
+  - "safetensors"
+  - "PyYAML"
+optional_packages:
+  - "qwen-vl-utils"
+  - "modelscope"
+minimum_free_disk_gib: 20.0
