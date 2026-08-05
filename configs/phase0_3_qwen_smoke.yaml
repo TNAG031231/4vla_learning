@@ -1,0 +1,24 @@
+smoke_version: phase0.3a2-qwen3vl-smoke-v0.1
+model_id: Qwen/Qwen3-VL-4B-Instruct
+model_revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+processor_revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+allowed_split: train
+selection_strategy: first_manifest_record_in_allowed_split
+task_prompt: "Observe the front-facing driving image and select exactly one current driving meta-action from the allowed labels. Return only the label and no explanation."
+allowed_actions:
+  - keep
+  - accelerate
+  - decelerate
+  - stop
+  - left_lateral
+  - right_lateral
+dtype_preference: bfloat16
+attention_implementation: sdpa
+generation_kwargs:
+  do_sample: false
+  num_beams: 1
+  max_new_tokens: 16
+manifest_relative_path: phase_0_1b/trainval_manifest_v1/manifest.jsonl
+expected_manifest_sha256: 60517f985fec8fe3977a31660a5204942e9fd36baf09ea4d950328b1f225d1b3
+output_relative_path: phase_0_3/qwen3vl_smoke_v0_1/smoke_result.json
+local_files_only: false
