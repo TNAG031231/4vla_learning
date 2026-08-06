@@ -2,8 +2,9 @@
 
 ## Current Phase
 
-- 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。
-- 当前状态不代表已经实现 neural baseline 或训练模型。
+- 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `active`。
+- Phase 0.3a-1 与 Phase 0.3a-2 均为 `completed`；Phase 0.3b dataset adapter 为 `next`。
+- 当前状态只确认 Qwen3-VL 单样本 AutoDL preflight 与 smoke inference 可运行，不代表 zero-shot baseline、准确率结论或模型训练已完成。
 
 ## Confirmed Milestones
 
@@ -17,6 +18,28 @@
 - 已完成 Phase 0.2a current/past ego-motion 输入审计：train/validation/test 的 `full/partial/unavailable` 分别为 `13476/392/385`、`3401/99/94`、`3594/106/99`；输入合同仅包含 speed、longitudinal acceleration、yaw rate、availability 与对应 past interval，test label 未用于统计或调参。
 - 已实现 Phase 0.2b deterministic ego-motion rule baseline：固定 625-candidate grid 在 validation 选择 `stop=0.2 m/s`、`lateral=0.05 rad/s`、`accelerate=0.5 m/s²`、`decelerate=0.3 m/s²`，macro-F1/accuracy 为 `0.615681/0.623817`；Majority Baseline 为 `0.087186/0.354201`。该阶段未使用 test。
 - 已建立环境检查与 workspace cleanup dry-run 脚本。
+
+## Phase 0.3 Status and AutoDL Evidence
+
+### Phase 0.3a-1 AutoDL Preflight
+
+- 状态为 `completed`：`status=passed`、`exit_code=0`、`git_commit=76f6688a140438b75e563d9aabb0c820469fad22`。
+- 硬件为 `1 × NVIDIA vGPU-32GB`；frozen manifest SHA matched。
+- 隔离证据为 `manifest records parsed=0`、`test evaluation performed=false`。
+
+### Phase 0.3a-2 Qwen3-VL Smoke
+
+- 状态为 `completed`；执行代码 merge commit 为 `a7bd0f89f94ebc360b2cb92fd859e2642d77294e`。
+- Artifact：`$VLA_DERIVED_ROOT/phase_0_3/qwen3vl_smoke_v0_1/smoke_result.json`。
+- 模型：`model_id=Qwen/Qwen3-VL-4B-Instruct`；configured/resolved revision 均为 `ebb281ec70b05090aa6165b016eac8ec08e71b17`；`dtype=torch.bfloat16`；`device=cuda:0`；attention implementation 为 `sdpa`；`model load performed=true`。
+- 样本：`split=validation`；`sample_token=43c8e708f0734128be1b7a5d56958f6c`；`scene_token=0053e9c440a94c1b84bd9c4223efc4b0`；`CAM_FRONT=samples/CAM_FRONT/n008-2018-07-27-12-07-38-0400__CAM_FRONT__1532708431412404.jpg`。
+- Processor：image size 为 `[1600, 900]`；`input_ids shape=[1, 1438]`；`attention_mask shape=[1, 1438]`；`pixel_values shape=[5600, 1536]`；`image_grid_thw shape=[1, 3]`；`pixel_values dtype=torch.float32`；`pixel_values device=cuda:0`。
+- Generation：`do_sample=false`；`num_beams=1`；`max_new_tokens=16`；`generation completed=true`；`generated token shape=[1, 3]`；`retry_count=0`；`raw_output="driving"`；`parser_success=false`；`invalid_reason=output_not_exact_allowed_action`；artifact `status=completed_with_invalid_output`；smoke `exit_code=0`。
+- 该 invalid output 是 strict parser 的预期可审计路径，不构成 Phase 0.3a-2 失败；不得把 `driving` 映射为任何合法动作。该结果不构成 zero-shot 准确率或模型性能结论。
+- Phase 0.3c 必须使用预先冻结的有限 prompt variants，不得根据该单样本反复调整 prompt。
+- Timing：processor `28.51041942834854` 秒；model load `171.9564354941249` 秒；generation `3.835577502846718` 秒；total `273.8810808286071` 秒。该结果来自首次冷缓存运行，不是稳定延迟 benchmark。
+- CUDA memory：allocated after load `8933453824` bytes；peak allocated `9332952576` bytes；peak reserved `9460252672` bytes。该证据只证明单样本推理可运行，不用于推断 LoRA 训练 batch size。
+- Isolation：`manifest_records_parsed=0`；`locator_records_parsed=1`；`test_records_read=0`；`test_images_opened=0`；`test_labels_read=0`；`test_evaluation_performed=false`；`validation_label_used_as_model_input=false`；`failures=[]`；`warnings=[]`。
 
 ## Active Source Files
 
