@@ -1,0 +1,39 @@
+projection_version: phase0.3b-development-projection-v0.1
+projection_schema_version: phase0_3_development_projection_v0.1
+
+nuscenes_version: v1.0-trainval
+
+combined_manifest_relative_path: phase_0_1b/trainval_manifest_v1/manifest.jsonl
+expected_combined_manifest_sha256: 60517f985fec8fe3977a31660a5204942e9fd36baf09ea4d950328b1f225d1b3
+
+scene_mapping_relative_path: phase_0_1b/trainval_manifest_v1/scene_split_mapping_v1.json
+selected_rule_relative_path: phase_0_2/ego_motion_rule_v0_1/selected_rule.json
+
+expected_manifest_schema_version: phase0_trainval_dataset_manifest_v1
+expected_label_rule_version: phase-1.6-meta-action-v0.2
+expected_split_seed: 20260710
+expected_split_strategy_version: official_train_scene_label_stratified_v1
+
+allowed_project_splits:
+  - train
+  - validation
+
+expected_scene_counts:
+  train: 560
+  validation: 140
+
+expected_sample_counts:
+  train: 14253
+  validation: 3594
+
+expected_motion_availability:
+  train:
+    full: 13476
+    partial: 392
+    unavailable: 385
+  validation:
+    full: 3401
+    partial: 99
+    unavailable: 94
+
+output_relative_dir: phase_0_3/development_projection_v0_1
