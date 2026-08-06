@@ -9,6 +9,8 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
+import subprocess
 import tempfile
 from typing import Protocol
 
@@ -66,6 +68,7 @@ OUTPUT_FILENAMES = (
     "validation.jsonl",
     "projection_receipt.json",
 )
+GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 class NuScenesReader(Protocol):
@@ -130,6 +133,14 @@ class ProducerInputs:
 
 
 @dataclass(frozen=True)
+class GitProvenance:
+    commit: str
+    branch: str | None
+    detached_head: bool
+    worktree_clean: bool
+
+
+@dataclass(frozen=True)
 class DevelopmentSceneSelection:
     scene_tokens_by_split: dict[str, tuple[str, ...]]
     scene_splits: dict[str, str]
@@ -145,6 +156,60 @@ class IsolationCounters:
     test_sample_records_read: int = 0
     test_images_opened: int = 0
     test_labels_read: int = 0
+
+
+GitRunner = Callable[[Path, tuple[str, ...]], str]
+
+
+def _run_git(repository_root: Path, arguments: tuple[str, ...]) -> str:
+    completed = subprocess.run(
+        ("git", *arguments),
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def validate_git_provenance(provenance: object) -> GitProvenance:
+    if not isinstance(provenance, GitProvenance):
+        raise ValueError("git_provenance must be a GitProvenance instance")
+    if GIT_COMMIT_PATTERN.fullmatch(provenance.commit) is None:
+        raise ValueError("git provenance commit must be a lowercase 40-character SHA")
+    if provenance.worktree_clean is not True:
+        raise ValueError("git provenance requires a clean worktree")
+    if provenance.detached_head:
+        if provenance.branch is not None:
+            raise ValueError("detached Git provenance must not record a branch")
+    elif not isinstance(provenance.branch, str) or not provenance.branch:
+        raise ValueError("attached Git provenance must record a branch")
+    return provenance
+
+
+def collect_projection_git_provenance(
+    repository_root: Path,
+    git_runner: GitRunner = _run_git,
+) -> GitProvenance:
+    resolved_root = repository_root.resolve()
+    top_level = Path(
+        git_runner(resolved_root, ("rev-parse", "--show-toplevel"))
+    ).resolve()
+    if top_level != resolved_root:
+        raise ValueError("repository root does not match Git top-level")
+    commit = git_runner(resolved_root, ("rev-parse", "HEAD"))
+    branch_value = git_runner(resolved_root, ("branch", "--show-current"))
+    status = git_runner(
+        resolved_root,
+        ("status", "--porcelain", "--untracked-files=all"),
+    )
+    provenance = GitProvenance(
+        commit=commit,
+        branch=branch_value or None,
+        detached_head=not branch_value,
+        worktree_clean=not status,
+    )
+    return validate_git_provenance(provenance)
 
 
 class GuardedNuScenesReader:
@@ -687,10 +752,58 @@ def _cleanup_staging_directory(path: Path) -> None:
     path.rmdir()
 
 
+def _receipt_mapping(
+    payload: Mapping[str, object],
+    key: str,
+) -> Mapping[str, object]:
+    value = payload.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"existing projection receipt is missing {key}")
+    return value
+
+
+def _validated_receipt_git(payload: Mapping[str, object]) -> GitProvenance:
+    git = _receipt_mapping(payload, "git")
+    commit = git.get("commit")
+    branch = git.get("branch")
+    detached_head = git.get("detached_head")
+    worktree_clean = git.get("worktree_clean")
+    if not isinstance(commit, str):
+        raise ValueError("existing projection Git commit must be a string")
+    if branch is not None and not isinstance(branch, str):
+        raise ValueError("existing projection Git branch must be a string or null")
+    if not isinstance(detached_head, bool):
+        raise ValueError("existing projection detached_head must be a boolean")
+    if not isinstance(worktree_clean, bool):
+        raise ValueError("existing projection worktree_clean must be a boolean")
+    return validate_git_provenance(
+        GitProvenance(
+            commit=commit,
+            branch=branch,
+            detached_head=detached_head,
+            worktree_clean=worktree_clean,
+        )
+    )
+
+
+def _require_exact_receipt_value(
+    payload: Mapping[str, object],
+    key: str,
+    expected: object,
+) -> None:
+    actual = payload.get(key)
+    if type(actual) is not type(expected) or actual != expected:
+        raise ValueError(f"existing projection receipt {key} mismatch")
+
+
 def _validate_existing_artifact(
     output_dir: Path,
     *,
     config: ProjectionConfig,
+    config_relative_path: str,
+    manifest_metadata: Mapping[str, object],
+    mapping: Mapping[str, object],
+    selected_rule: Mapping[str, object],
     split_mapping_sha256: str,
 ) -> dict[str, object]:
     if not output_dir.is_dir():
@@ -701,26 +814,87 @@ def _validate_existing_artifact(
     payload = json.loads(receipt_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("existing projection receipt must be an object")
-    config_metadata = payload.get("config")
-    combined_metadata = payload.get("combined_manifest")
-    mapping_metadata = payload.get("scene_mapping")
-    outputs = payload.get("outputs")
-    if not all(
-        isinstance(value, Mapping)
-        for value in (config_metadata, combined_metadata, mapping_metadata, outputs)
-    ):
-        raise ValueError("existing projection receipt metadata is incomplete")
-    if (
-        payload.get("projection_version") != config.projection_version
-        or payload.get("projection_schema_version")
-        != config.projection_schema_version
-        or config_metadata.get("sha256") != config.config_sha256
-        or combined_metadata.get("sha256")
-        != config.expected_combined_manifest_sha256
-        or mapping_metadata.get("split_mapping_sha256")
-        != split_mapping_sha256
-    ):
-        raise ValueError("existing projection provenance does not match config")
+    _require_exact_receipt_value(
+        payload,
+        "projection_version",
+        config.projection_version,
+    )
+    _require_exact_receipt_value(
+        payload,
+        "projection_schema_version",
+        config.projection_schema_version,
+    )
+    _require_exact_receipt_value(
+        payload,
+        "nuscenes_version",
+        config.nuscenes_version,
+    )
+    _validated_receipt_git(payload)
+
+    config_metadata = _receipt_mapping(payload, "config")
+    _require_exact_receipt_value(
+        config_metadata,
+        "relative_path",
+        config_relative_path,
+    )
+    _require_exact_receipt_value(
+        config_metadata,
+        "sha256",
+        config.config_sha256,
+    )
+
+    combined_metadata = _receipt_mapping(payload, "combined_manifest")
+    _require_exact_receipt_value(
+        combined_metadata,
+        "relative_path",
+        config.combined_manifest_relative_path,
+    )
+    file_size = combined_metadata.get("file_size_bytes")
+    if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size <= 0:
+        raise ValueError("existing combined manifest file size must be positive")
+    _require_exact_receipt_value(
+        combined_metadata,
+        "file_size_bytes",
+        manifest_metadata["file_size_bytes"],
+    )
+    _require_exact_receipt_value(
+        combined_metadata,
+        "sha256",
+        config.expected_combined_manifest_sha256,
+    )
+    _require_exact_receipt_value(combined_metadata, "records_parsed", 0)
+    if manifest_metadata.get("sha256") != combined_metadata.get("sha256"):
+        raise ValueError("current combined manifest SHA-256 differs from receipt")
+
+    mapping_metadata = _receipt_mapping(payload, "scene_mapping")
+    expected_mapping = {
+        "relative_path": config.scene_mapping_relative_path,
+        "mapping_schema_version": MAPPING_SCHEMA_VERSION,
+        "split_mapping_sha256": split_mapping_sha256,
+        "train_scene_count": config.expected_scene_counts["train"],
+        "validation_scene_count": config.expected_scene_counts["validation"],
+        "test_scene_count": 150,
+    }
+    for key, expected in expected_mapping.items():
+        _require_exact_receipt_value(mapping_metadata, key, expected)
+    if mapping.get("scene_split_mapping_sha256") != split_mapping_sha256:
+        raise ValueError("current scene mapping SHA-256 differs from receipt")
+
+    selected_rule_metadata = _receipt_mapping(payload, "selected_rule")
+    expected_rule = {
+        "relative_path": config.selected_rule_relative_path,
+        "manifest_sha256": selected_rule["manifest_sha256"],
+        "split_mapping_sha256": selected_rule["split_mapping_sha256"],
+        "test_evaluation_performed": False,
+    }
+    for key, expected in expected_rule.items():
+        _require_exact_receipt_value(selected_rule_metadata, key, expected)
+
+    outputs = _receipt_mapping(payload, "outputs")
+    if set(outputs) != set(PROJECT_SPLITS):
+        raise ValueError("existing projection output splits mismatch")
+    if (output_dir / "test.jsonl").exists():
+        raise ValueError("existing projection must not contain test.jsonl")
     for split in PROJECT_SPLITS:
         output_metadata = outputs.get(split)
         if not isinstance(output_metadata, Mapping):
@@ -728,10 +902,85 @@ def _validate_existing_artifact(
         output_path = output_dir / f"{split}.jsonl"
         if not output_path.is_file():
             raise ValueError(f"existing projection is missing {split}.jsonl")
-        if sha256_file(output_path) != output_metadata.get("sha256"):
+        expected_relative_path = f"{split}.jsonl"
+        _require_exact_receipt_value(
+            output_metadata,
+            "relative_path",
+            expected_relative_path,
+        )
+        output_sha256 = validate_sha256(
+            output_metadata.get("sha256"),
+            f"existing outputs.{split}.sha256",
+        )
+        if sha256_file(output_path) != output_sha256:
             raise ValueError(f"existing {split} projection SHA-256 mismatch")
-        if output_metadata.get("record_count") != config.expected_sample_counts[split]:
-            raise ValueError(f"existing {split} projection count mismatch")
+        _require_exact_receipt_value(
+            output_metadata,
+            "record_count",
+            config.expected_sample_counts[split],
+        )
+
+    motion_distribution = _receipt_mapping(
+        payload,
+        "motion_availability_distribution_by_split",
+    )
+    if set(motion_distribution) != set(PROJECT_SPLITS):
+        raise ValueError("existing projection motion distribution splits mismatch")
+    for split in PROJECT_SPLITS:
+        _require_exact_receipt_value(
+            motion_distribution,
+            split,
+            config.expected_motion_availability[split],
+        )
+
+    action_distribution = _receipt_mapping(
+        payload,
+        "action_distribution_by_split",
+    )
+    if set(action_distribution) != set(PROJECT_SPLITS):
+        raise ValueError("existing projection action distribution splits mismatch")
+    for split in PROJECT_SPLITS:
+        counts = action_distribution.get(split)
+        if not isinstance(counts, Mapping) or set(counts) != set(ACTION_SCHEMA):
+            raise ValueError(
+                f"existing {split} action distribution schema mismatch"
+            )
+        total = 0
+        for action in ACTION_SCHEMA:
+            count = counts.get(action)
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+            ):
+                raise ValueError(
+                    f"existing {split} action distribution count is invalid"
+                )
+            total += count
+        if total != config.expected_sample_counts[split]:
+            raise ValueError(
+                f"existing {split} action distribution total mismatch"
+            )
+
+    frozen_flags: dict[str, object] = {
+        "absolute_path_leak_count": 0,
+        "invalid_cam_front_path_count": 0,
+        "future_trajectory_used_for_target_derivation": True,
+        "future_trajectory_written_to_projection": False,
+        "nearby_agents_written_to_projection": False,
+        "current_ego_pose_written_to_projection": False,
+        "audit_records_read": 0,
+        "combined_manifest_records_parsed": 0,
+        "test_scene_traversal_attempts": 0,
+        "test_sample_records_read": 0,
+        "test_images_opened": 0,
+        "test_labels_read": 0,
+        "test_evaluation_performed": False,
+        "model_load_performed": False,
+        "processor_load_performed": False,
+    }
+    for key, expected in frozen_flags.items():
+        _require_exact_receipt_value(payload, key, expected)
     return payload
 
 
@@ -749,9 +998,10 @@ def build_development_projection(
     nuscenes: NuScenesReader,
     producer: RecordProducer,
     producer_inputs: ProducerInputs,
-    git_commit: str,
+    git_provenance: GitProvenance,
     now_utc: Callable[[], str] = _utc_now,
 ) -> dict[str, object]:
+    validated_git = validate_git_provenance(git_provenance)
     combined_path = resolve_derived_path(
         derived_root,
         config.combined_manifest_relative_path,
@@ -787,6 +1037,10 @@ def build_development_projection(
         receipt = _validate_existing_artifact(
             output_dir,
             config=config,
+            config_relative_path=config_relative_path,
+            manifest_metadata=manifest_metadata,
+            mapping=mapping,
+            selected_rule=selected_rule,
             split_mapping_sha256=split_mapping_sha256,
         )
         return {"status": "already_exists", "receipt": receipt}
@@ -846,9 +1100,7 @@ def build_development_projection(
             staged_path = staging_dir / f"{split}.jsonl"
             write_jsonl_records(records_by_split[split], staged_path)
             output_metadata[split] = {
-                "relative_path": (
-                    PurePosixPath(config.output_relative_dir) / f"{split}.jsonl"
-                ).as_posix(),
+                "relative_path": f"{split}.jsonl",
                 "sha256": sha256_file(staged_path),
                 "record_count": len(records_by_split[split]),
             }
@@ -856,7 +1108,12 @@ def build_development_projection(
             "projection_version": config.projection_version,
             "projection_schema_version": config.projection_schema_version,
             "generated_at_utc": now_utc(),
-            "git_commit": git_commit,
+            "git": {
+                "commit": validated_git.commit,
+                "branch": validated_git.branch,
+                "detached_head": validated_git.detached_head,
+                "worktree_clean": validated_git.worktree_clean,
+            },
             "config": {
                 "relative_path": config_relative_path,
                 "sha256": config.config_sha256,

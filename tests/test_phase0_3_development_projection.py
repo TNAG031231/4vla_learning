@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -18,10 +19,12 @@ import data.build_trainval_manifest as trainval_builder
 from src.actions.schema import LABEL_RULE_VERSION
 import src.phase0.development_projection as projection_module
 from src.phase0.development_projection import (
+    GitProvenance,
     GuardedNuScenesReader,
     IsolationCounters,
     ProducerInputs,
     build_development_projection,
+    collect_projection_git_provenance,
     load_config,
     project_record,
     select_development_scenes,
@@ -224,6 +227,19 @@ def _write_inputs(
     return config
 
 
+def _clean_git(
+    *,
+    commit: str = "e" * 40,
+    branch: str | None = "feature",
+) -> GitProvenance:
+    return GitProvenance(
+        commit=commit,
+        branch=branch,
+        detached_head=branch is None,
+        worktree_clean=True,
+    )
+
+
 def _build(
     tmp_path: Path,
     config,
@@ -232,6 +248,7 @@ def _build(
     producer=None,
     mapping=None,
     selected_rule_overrides=None,
+    git_provenance=None,
     now_utc=lambda: "2026-08-06T00:00:00Z",
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -263,7 +280,7 @@ def _build(
             time_tolerance_sec=0.075,
             agent_radius_m=30.0,
         ),
-        git_commit="e" * 40,
+        git_provenance=git_provenance or _clean_git(),
         now_utc=now_utc,
     )
     return result, derived_root, config, active_producer
@@ -275,6 +292,112 @@ def _rewrite_config(tmp_path: Path, change) -> Path:
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return path
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ("git", *arguments),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _initialized_git_repository(tmp_path: Path) -> Path:
+    repository = tmp_path / "git-repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "projection-test")
+    _git(repository, "config", "user.name", "Projection Test")
+    _git(repository, "config", "user.email", "projection@example.com")
+    (repository / "tracked.txt").write_text("frozen\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-m", "test: initialize repository")
+    return repository
+
+
+def _rerun_existing(
+    tmp_path: Path,
+    derived_root: Path,
+    config,
+    *,
+    git_provenance: GitProvenance | None = None,
+):
+    class ForbiddenProducer:
+        def __call__(self, **kwargs: object) -> SimpleNamespace:
+            raise AssertionError("existing artifact must bypass producer")
+
+    return build_development_projection(
+        config=config,
+        config_relative_path="configs/phase0_3_development_projection.yaml",
+        repository_root=tmp_path / "repository",
+        nuscenes_root=tmp_path / "nuscenes",
+        derived_root=derived_root,
+        nuscenes=FakeNuScenes(),
+        producer=ForbiddenProducer(),
+        producer_inputs=ProducerInputs(object(), 3.0, 0.5, 0.075, 30.0),
+        git_provenance=git_provenance or _clean_git(commit="f" * 40),
+    )
+
+
+def _tamper_receipt(
+    derived_root: Path,
+    config,
+    mutate,
+) -> None:
+    receipt_path = (
+        derived_root / config.output_relative_dir / "projection_receipt.json"
+    )
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    mutate(payload)
+    receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_dirty_tracked_modification_blocks_git_provenance(tmp_path: Path) -> None:
+    repository = _initialized_git_repository(tmp_path)
+    (repository / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="clean worktree"):
+        collect_projection_git_provenance(repository)
+
+
+def test_staged_modification_blocks_git_provenance(tmp_path: Path) -> None:
+    repository = _initialized_git_repository(tmp_path)
+    (repository / "tracked.txt").write_text("staged\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+
+    with pytest.raises(ValueError, match="clean worktree"):
+        collect_projection_git_provenance(repository)
+
+
+def test_untracked_file_blocks_git_provenance(tmp_path: Path) -> None:
+    repository = _initialized_git_repository(tmp_path)
+    (repository / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="clean worktree"):
+        collect_projection_git_provenance(repository)
+
+
+def test_clean_branch_git_provenance_is_collected(tmp_path: Path) -> None:
+    repository = _initialized_git_repository(tmp_path)
+    provenance = collect_projection_git_provenance(repository)
+
+    assert provenance.commit == _git(repository, "rev-parse", "HEAD")
+    assert provenance.branch == "projection-test"
+    assert provenance.detached_head is False
+    assert provenance.worktree_clean is True
+
+
+def test_detached_head_git_provenance_is_recorded(tmp_path: Path) -> None:
+    repository = _initialized_git_repository(tmp_path)
+    _git(repository, "checkout", "--detach", "HEAD")
+
+    provenance = collect_projection_git_provenance(repository)
+
+    assert provenance.branch is None
+    assert provenance.detached_head is True
+    assert provenance.worktree_clean is True
 
 
 def test_config_missing_required_field(tmp_path: Path) -> None:
@@ -330,8 +453,55 @@ def test_combined_manifest_sha_mismatch(
             nuscenes=FakeNuScenes(),
             producer=FakeProducer(source_records),
             producer_inputs=ProducerInputs(object(), 3.0, 0.5, 0.075, 30.0),
-            git_commit="e" * 40,
+            git_provenance=_clean_git(),
         )
+
+
+def test_library_rejects_invalid_git_commit(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    with pytest.raises(ValueError, match="40-character SHA"):
+        _build(
+            tmp_path,
+            synthetic_config,
+            source_records,
+            git_provenance=_clean_git(commit="invalid"),
+        )
+
+
+def test_library_rejects_dirty_git_provenance_before_producer_or_output(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    class ForbiddenProducer:
+        called = False
+
+        def __call__(self, **kwargs: object) -> SimpleNamespace:
+            self.called = True
+            raise AssertionError("dirty Git provenance must block producer")
+
+    producer = ForbiddenProducer()
+    dirty = GitProvenance(
+        commit="e" * 40,
+        branch="feature",
+        detached_head=False,
+        worktree_clean=False,
+    )
+    with pytest.raises(ValueError, match="clean worktree"):
+        _build(
+            tmp_path,
+            synthetic_config,
+            source_records,
+            producer=producer,
+            git_provenance=dirty,
+        )
+    output_parent = tmp_path / "derived" / "phase_0_3"
+    assert producer.called is False
+    assert not (output_parent / "development_projection_v0_1").exists()
+    assert not output_parent.exists()
 
 
 def test_invalid_json_combined_manifest_is_hashed_without_parsing(
@@ -595,6 +765,45 @@ def test_motion_availability_mismatch_hard_fails(
         _build(tmp_path, config, source_records)
 
 
+@pytest.mark.parametrize(
+    "provenance,expected",
+    (
+        (
+            GitProvenance("e" * 40, "projection-test", False, True),
+            {
+                "commit": "e" * 40,
+                "branch": "projection-test",
+                "detached_head": False,
+                "worktree_clean": True,
+            },
+        ),
+        (
+            GitProvenance("f" * 40, None, True, True),
+            {
+                "commit": "f" * 40,
+                "branch": None,
+                "detached_head": True,
+                "worktree_clean": True,
+            },
+        ),
+    ),
+)
+def test_validated_git_provenance_is_written_to_receipt(
+    tmp_path,
+    synthetic_config,
+    source_records,
+    provenance,
+    expected,
+) -> None:
+    result, _, _, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+        git_provenance=provenance,
+    )
+    assert result["receipt"]["git"] == expected
+
+
 def test_existing_artifact_is_not_overwritten(
     tmp_path,
     synthetic_config,
@@ -609,25 +818,154 @@ def test_existing_artifact_is_not_overwritten(
         derived_root / config.output_relative_dir / "projection_receipt.json"
     )
     original_receipt = receipt_path.read_bytes()
-
-    class ForbiddenProducer:
-        def __call__(self, **kwargs: object) -> SimpleNamespace:
-            raise AssertionError("existing artifact must bypass producer")
-
-    second_result = build_development_projection(
-        config=config,
-        config_relative_path="configs/phase0_3_development_projection.yaml",
-        repository_root=tmp_path / "repository",
-        nuscenes_root=tmp_path / "nuscenes",
-        derived_root=derived_root,
-        nuscenes=FakeNuScenes(),
-        producer=ForbiddenProducer(),
-        producer_inputs=ProducerInputs(object(), 3.0, 0.5, 0.075, 30.0),
-        git_commit="f" * 40,
+    second_result = _rerun_existing(
+        tmp_path,
+        derived_root,
+        config,
+        git_provenance=_clean_git(commit="f" * 40),
     )
     assert first_result["status"] == "created"
     assert second_result["status"] == "already_exists"
+    assert first_result["receipt"]["git"]["commit"] == "e" * 40
+    assert second_result["receipt"]["git"]["commit"] == "e" * 40
     assert receipt_path.read_bytes() == original_receipt
+
+
+def test_existing_receipt_missing_isolation_field_fails(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    _, derived_root, config, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+    )
+    _tamper_receipt(
+        derived_root,
+        config,
+        lambda payload: payload.pop("test_labels_read"),
+    )
+
+    with pytest.raises(ValueError, match="test_labels_read mismatch"):
+        _rerun_existing(tmp_path, derived_root, config)
+
+
+def test_existing_receipt_nonzero_isolation_counter_fails(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    _, derived_root, config, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+    )
+    _tamper_receipt(
+        derived_root,
+        config,
+        lambda payload: payload.__setitem__("test_sample_records_read", 1),
+    )
+
+    with pytest.raises(ValueError, match="test_sample_records_read mismatch"):
+        _rerun_existing(tmp_path, derived_root, config)
+
+
+def test_existing_receipt_motion_distribution_mismatch_fails(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    _, derived_root, config, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+    )
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["motion_availability_distribution_by_split"]["train"][
+            "full"
+        ] = 2
+
+    _tamper_receipt(derived_root, config, mutate)
+    with pytest.raises(ValueError, match="receipt train mismatch"):
+        _rerun_existing(tmp_path, derived_root, config)
+
+
+def test_existing_receipt_action_distribution_total_mismatch_fails(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    _, derived_root, config, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+    )
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["action_distribution_by_split"]["train"]["keep"] = 1
+
+    _tamper_receipt(derived_root, config, mutate)
+    with pytest.raises(ValueError, match="action distribution total mismatch"):
+        _rerun_existing(tmp_path, derived_root, config)
+
+
+def test_existing_receipt_selected_rule_provenance_mismatch_fails(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    _, derived_root, config, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+    )
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["selected_rule"]["split_mapping_sha256"] = "a" * 64
+
+    _tamper_receipt(derived_root, config, mutate)
+    with pytest.raises(ValueError, match="split_mapping_sha256 mismatch"):
+        _rerun_existing(tmp_path, derived_root, config)
+
+
+def test_existing_receipt_combined_manifest_file_size_mismatch_fails(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    _, derived_root, config, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+    )
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["combined_manifest"]["file_size_bytes"] += 1
+
+    _tamper_receipt(derived_root, config, mutate)
+    with pytest.raises(ValueError, match="file_size_bytes mismatch"):
+        _rerun_existing(tmp_path, derived_root, config)
+
+
+def test_existing_receipt_output_relative_path_mismatch_fails(
+    tmp_path,
+    synthetic_config,
+    source_records,
+) -> None:
+    _, derived_root, config, _ = _build(
+        tmp_path,
+        synthetic_config,
+        source_records,
+    )
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["outputs"]["train"]["relative_path"] = "tampered.jsonl"
+
+    _tamper_receipt(derived_root, config, mutate)
+    with pytest.raises(ValueError, match="relative_path mismatch"):
+        _rerun_existing(tmp_path, derived_root, config)
 
 
 def test_staging_failure_leaves_no_formal_artifact(

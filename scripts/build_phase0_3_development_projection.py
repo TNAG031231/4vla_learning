@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 from nuscenes.nuscenes import NuScenes
@@ -29,6 +28,7 @@ from src.actions.schema import LABEL_RULE_VERSION  # noqa: E402
 from src.phase0.development_projection import (  # noqa: E402
     ProducerInputs,
     build_development_projection,
+    collect_projection_git_provenance,
     load_config,
 )
 
@@ -64,19 +64,9 @@ def _environment_root(name: str) -> Path:
     return resolved
 
 
-def _git_commit() -> str:
-    completed = subprocess.run(
-        ("git", "rev-parse", "HEAD"),
-        cwd=REPOSITORY_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return completed.stdout.strip()
-
-
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    git_provenance = collect_projection_git_provenance(REPOSITORY_ROOT)
     config_path = arguments.config
     if not config_path.is_absolute():
         config_path = REPOSITORY_ROOT / config_path
@@ -137,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             agent_radius_m=trajectory_config.nearby_radius_m,
         ),
-        git_commit=_git_commit(),
+        git_provenance=git_provenance,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
