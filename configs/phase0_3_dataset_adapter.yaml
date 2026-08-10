@@ -1,0 +1,51 @@
+adapter_version: phase0.3b-qwen3vl-dataset-adapter-v0.1
+adapter_schema_version: phase0_3_qwen3vl_dataset_adapter_v0.1
+
+source_projection_relative_dir: phase_0_3/development_projection_v0_1
+source_projection_receipt: projection_receipt.json
+expected_source_projection_version: phase0.3b-development-projection-v0.1
+expected_source_projection_schema_version: phase0_3_development_projection_v0.1
+expected_source_projection_git_commit: ee50005caaa2ba3fa28074a70bbe9178b089b6a8
+expected_source_receipt_sha256: 16fd73b069b61061fdf3f81e0b31ee7367003e13fcfe3196df2482d50150673b
+
+source_files:
+  train:
+    relative_path: train.jsonl
+    sha256: 32dd520c87921804e6640273bb1a4ad663acc72c82a43e0f6f092759389dfb5a
+    record_count: 14253
+  validation:
+    relative_path: validation.jsonl
+    sha256: 0cbd4cf94bde422d6810caa5a302d079e4770a49dd6c3f05548d9b8c12fac94a
+    record_count: 3594
+
+variants:
+  - image_only
+  - image_ego_state
+
+allowed_actions:
+  - keep
+  - accelerate
+  - decelerate
+  - stop
+  - left_lateral
+  - right_lateral
+
+task_prompt: >-
+  Observe the front-facing driving image and select exactly one current
+  driving meta-action. Allowed labels: keep, accelerate, decelerate,
+  stop, left_lateral, right_lateral. Return only the label and no
+  explanation.
+
+ego_state:
+  prefix: "Current ego state:"
+  field_order:
+    - speed_mps
+    - longitudinal_acceleration_mps2
+    - yaw_rate_radps
+    - history_interval_sec
+    - acceleration_interval_sec
+    - availability
+  float_precision: 6
+  unavailable_token: unavailable
+
+output_relative_dir: phase_0_3/qwen3vl_dataset_adapter_v0_1
