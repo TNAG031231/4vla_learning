@@ -282,13 +282,24 @@ def _rehash_source(artifact: SyntheticArtifact) -> None:
 def test_frozen_config_loads_exact_source_hashes() -> None:
     config = load_config(CONFIG_PATH)
     assert config.expected_source_receipt_sha256 == (
-        "16fd73b069b61061fdf3f81e0b31ee7367003e13fcfe3196df2482d50150673b"
+        "16fd73b069b61061fdf3f81e0b31ee7367003e13fcfe3196fd2482d50150673b"
     )
     assert config.source_files["train"].sha256 == (
         "32dd520c87921804e6640273bb1a4ad663acc72c82a43e0f6f092759389dfb5a"
     )
     assert config.source_files["validation"].sha256 == (
         "0cbd4cf94bde422d6810caa5a302d079e4770a49dd6c3f05548d9b8c12fac94a"
+    )
+
+
+def test_source_receipt_sha_constant_matches_frozen_config() -> None:
+    expected = (
+        "16fd73b069b61061fdf3f81e0b31ee7367003e13fcfe3196fd2482d50150673b"
+    )
+    assert (
+        load_config(CONFIG_PATH).expected_source_receipt_sha256
+        == adapter_module.SOURCE_RECEIPT_SHA256
+        == expected
     )
 
 
