@@ -1,0 +1,60 @@
+artifact_version: zero_shot_smoke_v0_1
+artifact_schema_version: phase0_3c1_zero_shot_artifact_v0.1
+prompt_version: phase0.3c-zero-shot-v0.1
+parser_version: phase0.3a2-strict-legacy-action-v0.1
+generation_config_version: phase0.3a2-deterministic-generation-v0.1
+
+model_id: Qwen/Qwen3-VL-4B-Instruct
+model_revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+processor_revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+dtype_preference: bfloat16
+attention_implementation: sdpa
+device: cuda:0
+local_files_only: false
+
+generation_kwargs:
+  do_sample: false
+  num_beams: 1
+  max_new_tokens: 16
+retry_count: 0
+
+allowed_split: validation
+variants:
+  - image_only
+  - image_ego_state
+allowed_actions:
+  - keep
+  - accelerate
+  - decelerate
+  - stop
+  - left_lateral
+  - right_lateral
+
+task_prompt: |-
+  Based only on the provided current observation, predict the ego vehicle's
+  near-future coarse driving action.
+
+  Choose exactly one action from:
+
+  keep
+  accelerate
+  decelerate
+  stop
+  left_lateral
+  right_lateral
+
+  Output exactly the action name and nothing else.
+
+adapter:
+  relative_dir: phase_0_3/qwen3vl_dataset_adapter_v0_1
+  receipt_relative_path: adapter_receipt.json
+  config_relative_path: configs/phase0_3_dataset_adapter.yaml
+  config_sha256: 5a28a0528b291e9623bb3a40cacfc76f8822e0ca9e420818a034b6c530bd71ba
+  version: phase0.3b-qwen3vl-dataset-adapter-v0.1
+  schema_version: phase0_3_qwen3vl_dataset_adapter_v0.1
+  validation_record_count: 3594
+  validation_files:
+    image_only: validation_image_only.jsonl
+    image_ego_state: validation_image_ego_state.jsonl
+
+output_relative_dir: phase_0_3/qwen3vl_zero_shot_smoke_v0_1
