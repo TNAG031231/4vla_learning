@@ -33,6 +33,19 @@
 - 不可逆正式执行前必须完成不访问 sealed data 的 full shadow execution，覆盖真实 producer shape、adapter、consumer、输出持久化与 rerun guard。
 - 测试数量不能替代真实 artifact shape 核验与 producer → adapter → consumer 端到端证据。
 
+### Minimal Change and Anti-Overengineering
+
+- 修改前必须明确当前任务的 success criteria、failure criteria 与 verification method；达到验收标准后停止，不得以“更加严谨”或“理论上更安全”为由继续追加无关加固。测试数量、校验字段数量和 abstraction 数量本身不代表更高质量。
+- 默认只实现解决当前明确问题所需的最小改动；不得因“以后可能会用到”提前增加功能、helper、class、抽象层、配置项或 fallback，也不得顺手重构与任务无关的代码。
+- 只清理由本轮修改直接产生的问题。历史遗留问题若不阻塞当前任务，应记录为 optional cleanup 或 future hardening；一次性或简单流程优先直接实现，不为形式上的架构完整性增加 wrapper 或 abstraction。
+- 已由仓库 contract、producer、framework 或现有测试保证的内部状态默认按其合同使用。完成必需的外部 artifact intake 后，不得为理论上不应出现的内部状态层层重复 SHA、schema、metadata 或 provenance 校验，也不得穷举防护人为篡改内部 artifact。
+- 只有存在真实历史失败、明确外部输入边界、不可逆操作风险或当前任务可复现的问题时，才增加对应 validation、fallback 或 recovery path。严格校验应集中在用户输入、CLI 参数、外部 API / 网络、文件系统输入、外部 artifact intake、train / validation / test 边界、model inference input contract、GT / future information leakage 与不可逆正式执行。
+- 真实错误必须 fail fast 并暴露根因。禁止使用 broad `except Exception`、silent fallback、nil / empty fallback、模糊默认值、改变实验条件的自动重试、fuzzy mapping 或静默纠正 invalid output 让程序“看起来继续工作”；违反正式 contract 的输入必须 hard fail，不得猜测意图或自动修复。
+- **Blocking：** 任何可能影响实验结果正确性、train / validation / test isolation、test / target / future / GT leakage、输入输出 contract、label / schema、metrics、sample alignment、数据或模型真实执行链路、不可逆正式执行真实风险或后续阶段实际兼容性的问题，都必须修复后才能继续。典型情况包括读取 test 数据、future trajectory 进入模型输入、baseline sample set 不一致、invalid prediction 使 F1 虚高、label / schema 不匹配、真实 producer / consumer contract mismatch 或模型实际无法运行。
+- **Non-blocking：** 仅涉及极端人为篡改、理论上不可能的内部状态、重复 provenance 字段的穷举校验、不改变实验结果的 receipt 防篡改增强、一次性流程的额外 abstraction、为“完整”增加 helper / wrapper / class，或没有真实 failure evidence 的 fallback / recovery，默认不阻塞当前 Phase；可以记录，但不得无限延后模型实验和主线推进。
+- 本节不得用于削弱 Contract-First Irreversible Workflows、Data Rules、Evaluation Rules、test isolation、future / GT leakage guard，以及 Git、secret 和 dataset protection。Minimal code 不等于少做必要校验，trust internal contracts 不等于信任外部输入，avoid defensive coding 不等于吞掉异常，fast iteration 不等于降低实验可信度；发生冲突时，数据泄漏、实验正确性和不可逆风险规则优先。
+- 多个实现方案都合理时，优先选择能直接提升模型能力、自动驾驶 / VLA 技术含量、系统完整性、实验可解释性和面试展示价值的方案；纯内部防御且不改变模型结果、实验可信度或后续系统能力的工作降低优先级，但不得以 demo 为由牺牲 correctness。
+
 ## Environment Rules
 
 - 本项目默认使用 conda 环境 `codex4vla_env`。
