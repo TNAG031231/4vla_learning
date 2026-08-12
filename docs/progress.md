@@ -3,8 +3,8 @@
 ## Current Phase
 
 - 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `active`。
-- Phase 0.3a-1 与 Phase 0.3a-2 均为 `completed`；Phase 0.3b dataset adapter 为 `next`。
-- 当前状态只确认 Qwen3-VL 单样本 AutoDL preflight 与 smoke inference 可运行，不代表 zero-shot baseline、准确率结论或模型训练已完成。
+- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b 与 Phase 0.3c 均为 `completed`；Phase 0.3d 轻量 LoRA smoke baseline 为 `next`。
+- 当前状态已确认 Qwen3-VL full-validation zero-shot baseline 完成；不代表 test performance 或模型训练已完成。
 
 ## Confirmed Milestones
 
@@ -40,6 +40,48 @@
 - Timing：processor `28.51041942834854` 秒；model load `171.9564354941249` 秒；generation `3.835577502846718` 秒；total `273.8810808286071` 秒。该结果来自首次冷缓存运行，不是稳定延迟 benchmark。
 - CUDA memory：allocated after load `8933453824` bytes；peak allocated `9332952576` bytes；peak reserved `9460252672` bytes。该证据只证明单样本推理可运行，不用于推断 LoRA 训练 batch size。
 - Isolation：`manifest_records_parsed=0`；`locator_records_parsed=1`；`test_records_read=0`；`test_images_opened=0`；`test_labels_read=0`；`test_evaluation_performed=false`；`validation_label_used_as_model_input=false`；`failures=[]`；`warnings=[]`。
+
+### Phase 0.3b Dataset Adapter
+
+- 状态为 `completed`；Phase 0.3c 的两个 input variants 均消费该 adapter 的 3,594 条 validation records，并保持相同 sample set。
+
+### Phase 0.3c Full-validation Zero-shot Baseline
+
+- 状态为 `completed`；正式 AutoDL artifacts 已生成并人工核验。两组实验均为 `split=validation`、`sample_count=3594`，不构成 test performance。
+- 共同 provenance：`model_id=Qwen/Qwen3-VL-4B-Instruct`；model/processor revision 均为 `ebb281ec70b05090aa6165b016eac8ec08e71b17`；`execution_git_commit=43756aa8487c5d7b760f3e19c5e6ce6d602ae6a5`；`prompt_version=phase0.3c-zero-shot-v0.1`；`parser_version=phase0.3a2-strict-legacy-action-v0.1`；`generation_config_version=phase0.3a2-deterministic-generation-v0.1`。
+- Generation：`do_sample=false`；`num_beams=1`；`max_new_tokens=16`。
+
+| input variant | accuracy | macro-F1 | parser success rate | invalid output rate | metrics SHA-256 | predictions SHA-256 |
+|---|---:|---:|---:|---:|---|---|
+| `image_only` | 0.42042292710072343 | 0.23312016560472856 | 1.0 | 0.0 | `cc3fb152d163ce886c5d183a77d31e21726dcaa176d5bb5f8fae7c957d472bd0` | `2b31e463eca05ad1bfd8e18812173d9a2e5cc13fa3b42130a1e48c31ce8b31eb` |
+| `image_ego_state` | 0.4602114635503617 | 0.29861793313306656 | 1.0 | 0.0 | `a615e655f43794d4680b5ca55b06b76be4d96b444ad0d2db7f790a90d32a8648` | `00e5f15f524a9008ddebe893cd37b149295a86c551a7761c3629b4f74e269064` |
+
+Prediction distribution：
+
+| input variant | keep | accelerate | decelerate | stop | left_lateral | right_lateral |
+|---|---:|---:|---:|---:|---:|---:|
+| `image_only` | 2478 | 24 | 540 | 533 | 0 | 19 |
+| `image_ego_state` | 2542 | 228 | 330 | 476 | 0 | 18 |
+
+Per-class F1：
+
+| input variant | keep | accelerate | decelerate | stop | left_lateral | right_lateral |
+|---|---:|---:|---:|---:|---:|---:|
+| `image_only` | 0.5657158091175687 | 0.005025125628140704 | 0.17562724014336917 | 0.5881326352530541 | 0.0 | 0.06422018348623854 |
+| `image_ego_state` | 0.5619921363040629 | 0.1794019933554817 | 0.282560706401766 | 0.7125803489439853 | 0.0 | 0.05517241379310344 |
+
+- 在当前固定 zero-shot protocol 下，加入 deterministic current/past ego-state serialization 后，validation accuracy 从 0.420423 提高至 0.460211，macro-F1 从 0.233120 提高至 0.298618；主要增益出现在 `accelerate`、`decelerate` 与 `stop` 等纵向动作类别。该结果是 observation，不构成机制证明。
+- Lateral targets 是当前 zero-shot 的主要 failure mode：两个 variants 的 `left_lateral` prediction count 与 F1 均为 0；`right_lateral` F1 分别约为 0.0642 与 0.0552。
+- Isolation：两个正式 baseline receipts 均为 `test_records_read=0`、`test_images_opened=0`、`test_labels_read=0`、`test_evaluation_performed=false`、`validation_label_used_as_model_input=false`、`validation_images_opened=3594`。已消费的 project test 仍禁止重新使用。
+
+Validation baseline comparison：
+
+| baseline | macro-F1 | accuracy |
+|---|---:|---:|
+| Majority baseline | 0.087186 | 0.354201 |
+| Phase 0.2 ego-motion rule baseline | 0.615681 | 0.623817 |
+| Qwen3-VL image-only zero-shot | 0.233120 | 0.420423 |
+| Qwen3-VL image + ego-state zero-shot | 0.298618 | 0.460211 |
 
 ## Active Source Files
 
@@ -126,5 +168,6 @@ source_audit_record
 ## Next Gate
 
 - 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
+- Phase 0.3 overall 保持 `active`；下一子阶段为 Phase 0.3d 轻量 LoRA smoke baseline，当前为 `planned / next`，本轮未开始。
 - Phase 0.3 可继续使用 train/validation 进行开发与模型选择，但不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
 - 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
