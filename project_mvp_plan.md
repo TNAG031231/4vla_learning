@@ -719,6 +719,8 @@ ACTION: keep
 
 ##### Phase 0.3c：zero-shot baseline
 
+- **状态：** `completed`。已在相同 3,594 条 validation samples 上完成 image-only 与 image + ego-state 两组正式 baseline；Phase 0.3 overall 仍为 `active`。
+
 只运行有限、预定义的 prompt templates，至少比较：
 
 ```text
@@ -729,6 +731,8 @@ image + ego state
 两组实验使用同一 model revision、generation config、parser 和 validation protocol，输出 sample-level predictions 与完整 action metrics。Zero-shot 较弱不触发无限 prompt 调参。
 
 ##### Phase 0.3d：轻量 LoRA smoke baseline
+
+- **状态：** `planned / next`；尚未开始。
 
 该子阶段不是最终模型训练，只验证：
 
