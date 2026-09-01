@@ -657,9 +657,19 @@ class Qwen3VLSupervisedCollator:
                 raise ValueError(
                     "assistant prefix is not a prefix of full conversation"
                 )
-            target_positions = active_positions[len(prefix_ids) :]
-            if not target_positions:
+            target_action_ids = self.processor.tokenizer.encode(
+                sample.target_action, add_special_tokens=False
+            )
+            if not target_action_ids:
                 raise ValueError("assistant target token span is empty")
+            suffix_ids = full_ids[len(prefix_ids) :]
+            if suffix_ids[: len(target_action_ids)] != target_action_ids:
+                raise ValueError(
+                    "assistant action tokens do not match target action"
+                )
+            target_positions = active_positions[
+                len(prefix_ids) : len(prefix_ids) + len(target_action_ids)
+            ]
             supervised_ids = [
                 input_rows[index][position].item() for position in target_positions
             ]

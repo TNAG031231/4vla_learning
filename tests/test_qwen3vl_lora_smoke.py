@@ -47,6 +47,25 @@ ADAPTER_CONFIG_PATH = REPOSITORY_ROOT / "configs/phase0_3_dataset_adapter.yaml"
 ACTION_TOKEN_IDS = {
     action: 200 + index for index, action in enumerate(ACTION_SCHEMA)
 }
+ACTION_TOKEN_SEQUENCES = {
+    action: (token_id,) for action, token_id in ACTION_TOKEN_IDS.items()
+}
+ACTION_TOKEN_SEQUENCES["left_lateral"] = (
+    ACTION_TOKEN_IDS["left_lateral"],
+    300,
+)
+TOKEN_TEXT = {
+    ACTION_TOKEN_IDS["keep"]: "keep",
+    ACTION_TOKEN_IDS["accelerate"]: "accelerate",
+    ACTION_TOKEN_IDS["decelerate"]: "decelerate",
+    ACTION_TOKEN_IDS["stop"]: "stop",
+    ACTION_TOKEN_IDS["left_lateral"]: "left",
+    300: "_lateral",
+    ACTION_TOKEN_IDS["right_lateral"]: "right_lateral",
+    777: "driving",
+}
+IM_END_TOKEN_ID = 999
+NEWLINE_TOKEN_ID = 998
 
 
 def _sample(
@@ -88,6 +107,12 @@ class FakeProcessor:
     def __init__(self, generation_output: str = "keep") -> None:
         self.generation_output = generation_output
         self.full_conversations = []
+        self.tokenizer = self
+
+    @staticmethod
+    def encode(text: str, *, add_special_tokens: bool) -> list[int]:
+        assert add_special_tokens is False
+        return list(ACTION_TOKEN_SEQUENCES[text])
 
     @staticmethod
     def _prefix_ids(conversation) -> list[int]:
@@ -102,7 +127,12 @@ class FakeProcessor:
             row = self._prefix_ids(conversation)
             if conversation[-1]["role"] == "assistant":
                 action = conversation[-1]["content"][0]["text"]
-                row = [*row, ACTION_TOKEN_IDS[action], 999]
+                row = [
+                    *row,
+                    *ACTION_TOKEN_SEQUENCES[action],
+                    IM_END_TOKEN_ID,
+                    NEWLINE_TOKEN_ID,
+                ]
                 self.full_conversations.append(conversation)
             rows.append(row)
         width = max(len(row) for row in rows)
@@ -124,21 +154,20 @@ class FakeProcessor:
 
     def batch_decode(self, values, **kwargs):
         rows = values.tolist() if hasattr(values, "tolist") else values
+        skip_special_tokens = kwargs.get("skip_special_tokens", False)
         decoded = []
         for row in rows:
-            tokens = [int(token) for token in row if int(token) != 999]
-            if 777 in tokens:
-                decoded.append("driving")
-                continue
-            action = next(
-                (
-                    name
-                    for name, token_id in ACTION_TOKEN_IDS.items()
-                    if token_id in tokens
-                ),
-                self.generation_output,
-            )
-            decoded.append(action)
+            pieces = []
+            for value in row:
+                token = int(value)
+                if token == IM_END_TOKEN_ID:
+                    if not skip_special_tokens:
+                        pieces.append("<|im_end|>")
+                elif token == NEWLINE_TOKEN_ID:
+                    pieces.append("\n")
+                elif token in TOKEN_TEXT:
+                    pieces.append(TOKEN_TEXT[token])
+            decoded.append("".join(pieces))
         return decoded
 
 
@@ -167,11 +196,13 @@ class FakeModel(torch.nn.Module):
 
     def generate(self, input_ids, **kwargs):
         self.operation_history.append("generate")
-        token = 777 if self.generation_output == "driving" else ACTION_TOKEN_IDS[
-            self.generation_output
-        ]
-        generated = torch.full(
-            (input_ids.shape[0], 1), token, dtype=input_ids.dtype
+        token_ids = (
+            (777,)
+            if self.generation_output == "driving"
+            else ACTION_TOKEN_SEQUENCES[self.generation_output]
+        )
+        generated = torch.tensor(token_ids, dtype=input_ids.dtype).repeat(
+            input_ids.shape[0], 1
         )
         return torch.cat((input_ids, generated), dim=1)
 
@@ -375,13 +406,27 @@ def test_collator_masks_prompt_image_ego_and_padding_tokens() -> None:
         labels = batch["labels"][index]
         mask = batch["attention_mask"][index]
         supervised = labels[labels != IGNORE_INDEX].tolist()
+        expected_ids = list(ACTION_TOKEN_SEQUENCES[sample.target_action])
+        assert supervised == expected_ids
         assert processor.batch_decode([supervised])[0] == sample.target_action
         supervised_positions = torch.nonzero(
             labels != IGNORE_INDEX, as_tuple=False
         ).flatten()
-        assert len(supervised_positions) == 2
+        assert len(supervised_positions) == len(expected_ids)
         assert torch.all(
             labels[: supervised_positions[0]] == IGNORE_INDEX
+        )
+        suffix_start = len(
+            FakeProcessor._prefix_ids(processor.full_conversations[index])
+        )
+        terminator_start = suffix_start + len(expected_ids)
+        active_length = int(mask.sum().item())
+        terminator_ids = batch["input_ids"][index][
+            terminator_start:active_length
+        ].tolist()
+        assert terminator_ids == [IM_END_TOKEN_ID, NEWLINE_TOKEN_ID]
+        assert torch.all(
+            labels[terminator_start:active_length] == IGNORE_INDEX
         )
         assert torch.all(labels[mask == 0] == IGNORE_INDEX)
         assert labels[0].item() == IGNORE_INDEX
@@ -389,6 +434,39 @@ def test_collator_masks_prompt_image_ego_and_padding_tokens() -> None:
         assert labels[2].item() == IGNORE_INDEX
     assert torch.equal(batch["mm_token_type_ids"], batch["attention_mask"])
     assert batch["pixel_values"].shape[0] == 2 * len(samples)
+
+
+def test_fake_processor_reproduces_template_newline_regression() -> None:
+    processor = FakeProcessor()
+    suffix_ids = [
+        *ACTION_TOKEN_SEQUENCES["keep"],
+        IM_END_TOKEN_ID,
+        NEWLINE_TOKEN_ID,
+    ]
+    decoded = processor.batch_decode(
+        [suffix_ids], skip_special_tokens=True
+    )[0]
+    assert decoded == "keep\n"
+    assert decoded != "keep"
+
+
+@pytest.mark.parametrize("action", ACTION_SCHEMA)
+def test_collator_supervises_only_action_tokens_for_all_actions(
+    action: str,
+) -> None:
+    processor = FakeProcessor()
+    collator = Qwen3VLSupervisedCollator(
+        processor=processor,
+        image_loader=lambda path: object(),
+        nuscenes_root=Path("/dataset"),
+        config=load_config(CONFIG_PATH),
+    )
+    batch = collator([_sample(0, action=action)], expected_split="train")
+    labels = batch["labels"][0]
+    supervised_ids = labels[labels != IGNORE_INDEX].tolist()
+    assert supervised_ids == list(ACTION_TOKEN_SEQUENCES[action])
+    assert processor.batch_decode([supervised_ids])[0] == action
+    assert len(supervised_ids) == len(ACTION_TOKEN_SEQUENCES[action])
 
 
 def test_collator_rejects_test_before_image_access() -> None:
