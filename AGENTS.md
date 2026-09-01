@@ -287,6 +287,97 @@ docs: report experiments and limitations
 9. PR 和 handoff 必须说明 changed / why / how to verify、当前 phase / gate、未运行的验证及原因，并确认 diff 仅包含相关文件。
 10. 永远不得提交数据集、模型权重、checkpoint、日志、缓存、`.env`、API key、个人文件或大型二进制文件；不得把 planned work 写成 completed work，也不得跳过当前 phase gate。
 
+## PR Learning & Capability Closeout
+
+从本规则生效后，每一个正式 PR merge 后、开始下一个独立任务或 Phase 前，必须在刚刚 merge 的 GitHub PR Conversation 页面发布一条顶层 comment，标题固定为：
+
+```markdown
+## Learning & Capability Closeout
+```
+
+标准顺序为：
+
+```text
+implementation
+↓
+tests / real execution
+↓
+PR review
+↓
+merge
+↓
+Learning & Capability Closeout comment
+↓
+next task / next Phase
+```
+
+不得跳过 Closeout 直接进入下一项独立工作。核心 Phase、model、data 或 evaluation PR 的完整协作流程为：
+
+```text
+Codex implementation
+↓
+commit + push
+↓
+Draft PR
+↓
+ChatGPT review actual PR diff
+↓
+fix on SAME branch and SAME PR if needed
+↓
+merge
+↓
+Learning & Capability Closeout
+↓
+next task
+```
+
+同一 PR 的 review fix 必须继续使用原 branch 和原 PR，不得另建任务分支。
+
+### Closeout Evidence and Structure
+
+Closeout 必须以该 PR 的 actual diff、merged code、tests、实际执行过的 runtime / experiment results、artifact 和已确认事实为依据。禁止把 planned 工作写成 completed、把 synthetic test 写成 real model evidence、把未执行的 GPU / training / evaluation 写成已掌握能力，或为了丰富简历而虚构能力；不得使用“熟悉了 LoRA”“学会了训练模型”等无法由该 PR 证明的空泛表述。
+
+重要 PR 默认使用以下结构：
+
+```markdown
+## Learning & Capability Closeout
+
+### 1. What — 这次具体做了什么
+
+### 2. How — 工程上是怎么实现的
+
+### 3. Why — 为什么这样设计
+
+### 4. Capability — 这次能体现什么能力
+
+### 5. Interview Explanation — 面试时怎么讲
+
+### 6. Follow-up Questions — 面试官可能继续追问什么
+
+### 7. Current Boundary — 当前能力边界
+
+### Closeout Status
+```
+
+- **What：** 用 input → processing → output 描述实际完成的工程链路，不能只写“完成数据处理”“实现 LoRA”或“实现模型训练”。
+- **How：** 解释与本 PR 真正相关的 input、processing、output、model interface、data flow、training target、label construction、metric、checkpoint 和关键实现细节；不为模板完整硬凑无关项目。
+- **Why：** 说明主要设计选择、工程判断与 trade-off，以及为何使用当前验证路径。
+- **Capability：** 只把该 PR 的真实工作映射为可由代码和结果支撑的求职能力。
+- **Interview Explanation：** 形成一段可直接用于技术面试的项目说明，回答任务、实现、设计原因和验证方式；不写成简历 bullet 或论文摘要。
+- **Follow-up Questions：** 围绕技术原理、实现、取舍、debug、alternatives 和 failure cases 列出真实可能被追问的问题。重要 PR 通常为 5–15 个，简单 PR 可以更少，不为数量添加无关问题。
+- **Current Boundary：** 强制区分已完成与尚不能声称的能力，例如 `代码和 synthetic tests 已验证 ≠ 真实 GPU LoRA 已验证`，以及 `validation result 已确认 ≠ test result 可以重复使用`。
+- **Closeout Status：** 明确 comment 是否已经成功发布，以及是否仍需人工操作。
+
+Closeout 长度按 PR 重要程度控制：multimodal dataset、VLM inference、LoRA / SFT、trajectory model、BEV / OCC、evaluator、reranking 和 model deployment 等核心能力 PR 使用完整解释；typo、dependency fix、CLI bugfix 或小型文档修订仍需 Closeout，但允许明显缩短。不得把该制度变成新的过度工程。
+
+### Storage and Publication
+
+- 每次具体 Closeout 的唯一主要存放位置是对应的 GitHub merged PR Conversation comment。
+- `project_mvp_plan.md` 只保存项目路线、Phase 设计、执行原则和本制度；`docs/progress.md` 只保存已确认的项目状态、指标、artifact、gate 与实验事实；不得把每个 PR 的完整 Closeout 重复复制到项目文档。
+- 环境已安装并登录 `gh` 时，优先通过 `gh pr comment <PR_NUMBER> --body-file <temporary-closeout-file>` 发布；临时文件不得提交仓库，发布成功后必须删除。也可使用不产生仓库文件的 stdin 方式。
+- 若 GitHub 写权限、authentication 或网络导致发布失败，不得改写进项目文档替代；必须在任务回复中给出完整 Markdown，并明确标注 `GitHub comment NOT posted. Manual paste required.`。
+- 本规则从现在开始执行，不 retroactively 批量补写历史 PR。PR #32 的 Closeout 已由用户手动添加，不得修改；其他历史 PR 仅在未来确有面试复盘需求时按需补充。
+
 ## 9. First Task Reminder
 
 项目启动后的第一条工程任务是实现并验证：
