@@ -149,6 +149,7 @@ class FakeModel(torch.nn.Module):
         self.config = SimpleNamespace(use_cache=True)
         self.generation_output = generation_output
         self.forward_input_ids = []
+        self.operation_history = []
         self.gradient_checkpointing_enabled = False
         self.input_grads_enabled = False
 
@@ -159,11 +160,13 @@ class FakeModel(torch.nn.Module):
         self.input_grads_enabled = True
 
     def forward(self, input_ids, **kwargs):
+        self.operation_history.append("forward")
         self.forward_input_ids.append(input_ids.detach().clone())
         loss = (self.lora_A - 1.0).pow(2).mean()
         return SimpleNamespace(loss=loss)
 
     def generate(self, input_ids, **kwargs):
+        self.operation_history.append("generate")
         token = 777 if self.generation_output == "driving" else ACTION_TOKEN_IDS[
             self.generation_output
         ]
@@ -177,7 +180,11 @@ class FakeModel(torch.nn.Module):
         (path / "adapter_model.safetensors").write_bytes(b"fake-lora")
 
 
-def _runtime(generation_output: str = "keep"):
+def _runtime(
+    generation_output: str = "keep",
+    *,
+    reloaded_generation_output: str | None = None,
+):
     state = {
         "models": [],
         "lora_kwargs": None,
@@ -206,6 +213,8 @@ def _runtime(generation_output: str = "keep"):
 
     def adapter_loader(model, path):
         state["adapter_path"] = path
+        if reloaded_generation_output is not None:
+            model.generation_output = reloaded_generation_output
         return add_lora(model, {})
 
     def image_loader(path):
@@ -494,10 +503,17 @@ def test_cli_rejects_test_before_environment_or_runtime_access(
     assert cli_module.main(["--optimization-split", "test"]) == 2
 
 
-def test_checkpoint_save_reload_and_strict_parser_control_flow(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    ("max_steps", "expected_status"),
+    [
+        (2, "smoke_passed"),
+        (1, "smoke_completed_without_loss_decrease"),
+    ],
+)
+def test_before_after_learning_evidence_and_smoke_status(
+    tmp_path: Path, monkeypatch, max_steps: int, expected_status: str
 ) -> None:
-    train_samples = _class_covered_samples(1)
+    train_samples = (*_class_covered_samples(1), _sample(99, action="keep"))
     validation_samples = tuple(
         _sample(index + 20, split="validation", action=ACTION_SCHEMA[index])
         for index in range(2)
@@ -519,13 +535,15 @@ def test_checkpoint_save_reload_and_strict_parser_control_flow(
     )
     config = replace(
         load_config(CONFIG_PATH),
-        train_subset_size=6,
+        train_subset_size=7,
         validation_subset_size=2,
-        max_steps=2,
+        max_steps=max_steps,
         gradient_accumulation_steps=1,
         learning_rate=0.1,
     )
-    dependencies, _, state = _runtime()
+    dependencies, _, state = _runtime(
+        "stop", reloaded_generation_output="keep"
+    )
     repository_root = tmp_path / "repository"
     derived_root = tmp_path / "derived"
     nuscenes_root = tmp_path / "nuscenes"
@@ -548,7 +566,7 @@ def test_checkpoint_save_reload_and_strict_parser_control_flow(
     assert (checkpoint / "adapter_model.safetensors").is_file()
     assert result["checkpoint"]["full_model_saved"] is False
     assert result["checkpoint_reload_result"]["completed"] is True
-    assert result["training_sample_count"] == 6
+    assert result["training_sample_count"] == 7
     assert result["validation_smoke_sample_count"] == 2
     assert set(result["selected_train_action_distribution"]) == set(ACTION_SCHEMA)
     assert result["test_records_read"] == 0
@@ -557,8 +575,35 @@ def test_checkpoint_save_reload_and_strict_parser_control_flow(
     assert result["test_evaluation_performed"] is False
     assert result["validation_smoke_metrics"]["parser_success_count"] == 2
     assert (checkpoint.parent / "smoke_result.json").is_file()
-    assert all("/train-" in str(path) for path in state["opened_images"][:2])
+    pretrain_tokens = [
+        prediction["sample_token"]
+        for prediction in result["pretrain_tiny_predictions"]
+    ]
+    posttrain_tokens = [
+        prediction["sample_token"]
+        for prediction in result["tiny_overfit_predictions"]
+    ]
+    assert pretrain_tokens == posttrain_tokens
+    before_metrics = result["pretrain_tiny_metrics"]
+    after_metrics = result["tiny_overfit_metrics"]
+    summary = result["learning_summary"]
+    assert summary["train_accuracy_before"] == before_metrics["accuracy"]
+    assert summary["train_accuracy_after"] == after_metrics["accuracy"]
+    assert summary["train_accuracy_delta"] == pytest.approx(
+        after_metrics["accuracy"] - before_metrics["accuracy"]
+    )
+    assert summary["train_macro_f1_before"] == before_metrics["macro_f1"]
+    assert summary["train_macro_f1_after"] == after_metrics["macro_f1"]
+    assert summary["train_macro_f1_delta"] == pytest.approx(
+        after_metrics["macro_f1"] - before_metrics["macro_f1"]
+    )
+    assert summary["checkpoint_reload_completed"] is True
+    assert summary["loss_decreased"] is (max_steps > 1)
+    assert result["status"] == expected_status
+    assert all("/train-" in str(path) for path in state["opened_images"][:7])
     trained_model = state["models"][0]
+    assert trained_model.operation_history[:7] == ["generate"] * 7
+    assert trained_model.operation_history[7] == "forward"
     assert trained_model.gradient_checkpointing_enabled is True
     assert trained_model.input_grads_enabled is True
     assert trained_model.config.use_cache is False

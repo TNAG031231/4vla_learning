@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                "status": "completed",
+                "status": result["status"],
                 "checkpoint": result["checkpoint"]["adapter_path"],
             },
             sort_keys=True,

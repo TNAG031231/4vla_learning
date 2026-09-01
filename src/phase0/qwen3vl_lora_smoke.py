@@ -964,6 +964,17 @@ def run_lora_smoke(
         config.attention_implementation,
         config.local_files_only,
     )
+    base_model.to(device)
+    pretrain_tiny_predictions = _predict_samples(
+        model=base_model,
+        processor=processor,
+        samples=train_samples,
+        nuscenes_root=nuscenes_root,
+        config=config,
+        device=device,
+        dependencies=runtime,
+    )
+    pretrain_tiny_metrics = build_metrics(pretrain_tiny_predictions)
     model = inject_lora(base_model, config=config, dependencies=runtime)
     model.to(device)
     model.gradient_checkpointing_enable()
@@ -1032,10 +1043,41 @@ def run_lora_smoke(
         device=device,
         dependencies=runtime,
     )
+    tiny_overfit_metrics = build_metrics(train_predictions)
+    checkpoint_reload_completed = True
+    initial_loss = loss_history[0]
+    final_loss = loss_history[-1]
+    loss_finite = all(math.isfinite(value) for value in loss_history)
+    loss_decreased = final_loss < initial_loss
+    learning_summary = {
+        "loss_finite": loss_finite,
+        "loss_decreased": loss_decreased,
+        "initial_loss": initial_loss,
+        "final_loss": final_loss,
+        "train_accuracy_before": pretrain_tiny_metrics["accuracy"],
+        "train_accuracy_after": tiny_overfit_metrics["accuracy"],
+        "train_accuracy_delta": (
+            tiny_overfit_metrics["accuracy"]
+            - pretrain_tiny_metrics["accuracy"]
+        ),
+        "train_macro_f1_before": pretrain_tiny_metrics["macro_f1"],
+        "train_macro_f1_after": tiny_overfit_metrics["macro_f1"],
+        "train_macro_f1_delta": (
+            tiny_overfit_metrics["macro_f1"]
+            - pretrain_tiny_metrics["macro_f1"]
+        ),
+        "checkpoint_reload_completed": checkpoint_reload_completed,
+    }
+    smoke_status = (
+        "smoke_passed"
+        if loss_finite and loss_decreased and checkpoint_reload_completed
+        else "smoke_completed_without_loss_decrease"
+    )
     result: dict[str, object] = {
         "artifact_version": config.artifact_version,
         "artifact_schema_version": config.artifact_schema_version,
         "run_kind": "tiny_overfit_smoke",
+        "status": smoke_status,
         "config": {
             "relative_path": config_relative_path,
             "sha256": config.config_sha256,
@@ -1053,14 +1095,17 @@ def run_lora_smoke(
         "validation_smoke_sample_count": len(validation_samples),
         "selected_train_action_distribution": _action_distribution(train_samples),
         "training_loss_history": loss_history,
-        "initial_loss": loss_history[0],
-        "final_loss": loss_history[-1],
+        "initial_loss": initial_loss,
+        "final_loss": final_loss,
         "trainable_parameter_summary": parameter_report,
         "lora_config": lora_config_kwargs(config),
+        "pretrain_tiny_predictions": pretrain_tiny_predictions,
+        "pretrain_tiny_metrics": pretrain_tiny_metrics,
         "tiny_overfit_predictions": train_predictions,
-        "tiny_overfit_metrics": build_metrics(train_predictions),
+        "tiny_overfit_metrics": tiny_overfit_metrics,
         "validation_smoke_predictions": validation_predictions,
         "validation_smoke_metrics": build_metrics(validation_predictions),
+        "learning_summary": learning_summary,
         "checkpoint": {
             "adapter_path": str(checkpoint_dir),
             "weights_path": str(checkpoint_file),
@@ -1068,7 +1113,7 @@ def run_lora_smoke(
             "full_model_saved": False,
         },
         "checkpoint_reload_result": {
-            "completed": True,
+            "completed": checkpoint_reload_completed,
             "parser_version": config.parser_version,
             "prediction_count": len(train_predictions)
             + len(validation_predictions),
