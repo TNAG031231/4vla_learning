@@ -23,6 +23,22 @@
 - 阶段状态、contract、rule 或 evaluation protocol 变化时，必须记录版本与 provenance；不得覆盖 frozen artifact。
 - Phase 0.3 及后续阶段必须按第 5.2 节统一模板补全；尚未在本文展开的阶段只保留骨架，不得用概述冒充可执行规格。
 
+### 0.3 工程、学习与面试证据优先级
+
+本项目是面向求职、技术面试和工程能力积累的自动驾驶 VLA 项目，不是以发表科研论文为目标的项目。项目评价优先级固定为：
+
+1. 工程链路真实跑通；
+2. 能够解释 input / processing / output；
+3. 能解释核心技术原理；
+4. 能解释为什么这样设计；
+5. 有可展示的实际结果；
+6. 能形成面试谈资和岗位能力证据；
+7. 最后才是额外的科研严谨性。
+
+除非实验正确性确实需要，不得用多 seed、statistical significance、exhaustive ablation、大规模 hyperparameter search、论文级 benchmark、复杂 artifact framework，或与求职能力无关的 defensive engineering 拖慢主线。以下问题仍是 blocking：data leakage、test misuse、错误 label、错误 metric、模型未真正运行、训练未真正更新目标参数、checkpoint 无法使用、错误的数据 / 模型 interface，以及任何会导致结论错误的 implementation bug。工程与面试优先不削弱数据隔离、实验正确性、真实执行和可复现性要求。
+
+每个正式 PR merge 后、进入下一独立任务或 Phase 前，必须按 `AGENTS.md` 的 **PR Learning & Capability Closeout** workflow，在该 merged PR 的 GitHub Conversation 中记录真实完成的 What / How / Why、Capability、Interview Explanation、Follow-up Questions 与 Current Boundary。GitHub PR comment 是每次具体 Closeout 的唯一主要存放位置；本文只维护路线、Phase 设计、执行原则和制度，`docs/progress.md` 只维护已确认状态、指标、artifact、gate 与实验事实，不重复收纳逐 PR 的完整学习总结。
+
 ## 1. 信息边界与总体数据流
 
 ### 1.1 项目定位与最终主线
