@@ -748,20 +748,24 @@ image + ego state
 
 ##### Phase 0.3d：轻量 LoRA smoke baseline
 
-- **状态：** `planned / next`；尚未开始。
+- **状态：** `completed`。真实 AutoDL smoke 在 `execution_git_commit=74aaed2ebcc53fa03c93e208a15e1e47f11b35f8` 上完成，artifact `status=smoke_passed`；模型为 `Qwen/Qwen3-VL-4B-Instruct`，revision 为 `ebb281ec70b05090aa6165b016eac8ec08e71b17`。
 
-该子阶段不是最终模型训练，只验证：
+已确认的 real LoRA smoke evidence：
 
-- supervised conversation format 与 action target placement；
-- label masking 只对 assistant target 计算监督；
-- collator 和 processor 输出可组成 batch；
-- LoRA injection points 与 trainable parameter report 可核验；
-- loss 在小样本上下降，且少量样本可以 overfit；
-- checkpoint 可以保存、加载并走通相同 parser 推理。
+- 12 条 exact tiny train subset 覆盖 `accelerate=2`、`decelerate=2`、`keep=4`、`left_lateral=1`、`right_lateral=1`、`stop=2`；6 条样本用于 validation smoke；
+- 20 个 optimizer steps、gradient accumulation 4、共 80 个 micro-batches；initial/final/minimum loss 为 `5.255437068641186 / 0.373084731050767 / 0.25869851280003786`，loss 有限且下降；
+- 总参数 `4,443,714,048`，可训练参数 `5,898,240`，占比 `0.13273221310571603%`；LoRA target modules 为 `q_proj / k_proj / v_proj / o_proj`；
+- 训练后只读检查 `adapter_model.safetensors`：144 个 LoRA B tensors 中 `144/144` 含非零权重，被检查 tensors 具有非零 norm 与非零元素，直接证明 adapter parameters 在真实 optimization 中发生更新；
+- exact tiny train subset 的 accuracy / macro-F1 在训练前为 `0.5 / 0.32478632478632474`，adapter 保存并经 fresh base/adapter reload 后为 `0.75 / 0.6481481481481481`，delta 为 `+0.25 / +0.3233618233618234`；
+- 已保存 `adapter_model.safetensors`，`full_model_saved=false`，checkpoint SHA-256 为 `cc29acfd4dd8205e8c23bbee0527ab72294c4ca02f2b46823f06b0780fcbb3c5`；checkpoint reload completed，reload prediction count 为 18；
+- 6 条 validation smoke 的 accuracy / macro-F1 为 `0.6666666666666666 / 0.2916666666666667`，parser success rate 为 `1.0`，invalid output rate 为 `0.0`；
+- isolation 为 `test_files_opened=0`、`test_records_read=0`、`test_images_opened=0`、`test_labels_read=0`、`test_evaluation_performed=false`。
 
-只使用小规模 train subset 和 validation smoke，不进行大规模超参数搜索，也不以它替代 Phase 0.4 trajectory model。
+该证据证明 real Qwen3-VL LoRA training chain、真实 loss/backward/optimizer path、adapter checkpoint save/reload 均可运行，且训练后 model behavior 在 exact tiny train subset 上发生变化。LoRA B parameter update 本身不证明泛化或 full-validation improvement；6 条 validation smoke 因样本数小且类别覆盖不完整，不能作为正式 validation performance 结论。不得声称 full-validation LoRA performance 已完成、LoRA 已超过 rule baseline、LoRA 泛化能力已证明、test performance 已获得或 final VLA model 已训练完成；本子阶段也不替代 Phase 0.4 trajectory model。
 
 ##### Phase 0.3e：failure analysis 与接口冻结
+
+- **状态：** `planned / next`。Phase 0.3 overall 继续保持 `active`，完成本子阶段并满足 Phase 0.3 Gate 后才能更新 overall 状态。
 
 至少分析：
 
