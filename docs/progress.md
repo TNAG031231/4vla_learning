@@ -3,8 +3,8 @@
 ## Current Phase
 
 - 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `active`。
-- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b 与 Phase 0.3c 均为 `completed`；Phase 0.3d 轻量 LoRA smoke baseline 为 `next`。
-- 当前状态已确认 Qwen3-VL full-validation zero-shot baseline 完成；不代表 test performance 或模型训练已完成。
+- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c 与 Phase 0.3d 均为 `completed`；下一子阶段为 Phase 0.3e failure analysis 与接口冻结。
+- 当前状态已确认 Qwen3-VL full-validation zero-shot baseline 与 real LoRA smoke training chain 完成；不代表 full-validation LoRA performance、test performance 或最终 VLA model training 已完成。
 
 ## Confirmed Milestones
 
@@ -82,6 +82,28 @@ Validation baseline comparison：
 | Phase 0.2 ego-motion rule baseline | 0.615681 | 0.623817 |
 | Qwen3-VL image-only zero-shot | 0.233120 | 0.420423 |
 | Qwen3-VL image + ego-state zero-shot | 0.298618 | 0.460211 |
+
+### Phase 0.3d Real Qwen3-VL LoRA Smoke
+
+- 状态为 `completed`，artifact `status=smoke_passed`；`execution_git_commit=74aaed2ebcc53fa03c93e208a15e1e47f11b35f8`。
+- 模型为 `Qwen/Qwen3-VL-4B-Instruct`，revision 为 `ebb281ec70b05090aa6165b016eac8ec08e71b17`。
+- 训练使用 12 条 exact tiny train subset，validation smoke 使用 6 条样本。Train action distribution 为 `accelerate=2`、`decelerate=2`、`keep=4`、`left_lateral=1`、`right_lateral=1`、`stop=2`。
+- Optimization：optimizer steps 为 20，gradient accumulation 为 4，total micro-batches 为 80；initial/final/minimum loss 分别为 `5.255437068641186`、`0.373084731050767`、`0.25869851280003786`，`loss_finite=true`、`loss_decreased=true`。
+- Trainable parameter evidence：total parameters 为 `4,443,714,048`，trainable parameters 为 `5,898,240`，trainable percentage 为 `0.13273221310571603%`；LoRA target modules 为 `q_proj / k_proj / v_proj / o_proj`。
+- Direct parameter-update evidence：训练后的 `adapter_model.safetensors` 经只读检查，144 个 LoRA B tensors 中 `144/144` 含非零权重；被检查的 LoRA B tensors 均具有非零 norm 与非零元素。这是 LoRA adapter parameters 在真实 optimization 中发生更新的直接 checkpoint-level evidence，但 parameter change 本身不证明泛化或 full-validation improvement。
+- Checkpoint：已保存 `adapter_model.safetensors`，`full_model_saved=false`；checkpoint SHA-256 为 `cc29acfd4dd8205e8c23bbee0527ab72294c4ca02f2b46823f06b0780fcbb3c5`。Fresh base/adapter reload 已完成，reload prediction count 为 18。
+
+Exact tiny train subset 在训练前后（adapter save 后通过 fresh base/adapter reload 评测）的结果为：
+
+| exact tiny train subset | accuracy | macro-F1 |
+|---|---:|---:|
+| before training | 0.5 | 0.32478632478632474 |
+| after fresh reload | 0.75 | 0.6481481481481481 |
+| delta | +0.25 | +0.3233618233618234 |
+
+- Validation smoke：`sample_count=6`、accuracy `0.6666666666666666`、macro-F1 `0.2916666666666667`、parser success rate `1.0`、invalid output rate `0.0`。由于样本数小且类别覆盖不完整，这 6 条结果不能作为正式 validation performance 结论。
+- Isolation：`test_files_opened=0`、`test_records_read=0`、`test_images_opened=0`、`test_labels_read=0`、`test_evaluation_performed=false`。
+- 该证据证明 real Qwen3-VL LoRA training chain、真实 loss/backward/optimizer path、adapter checkpoint save/reload 均可运行，且训练后 model behavior 在 exact tiny train subset 上发生变化；不得据此声称 full-validation LoRA performance 已完成、LoRA 已超过 rule baseline、LoRA 泛化能力已证明、test performance 已获得或 final VLA model 已训练完成。
 
 ## Active Source Files
 
@@ -168,6 +190,6 @@ source_audit_record
 ## Next Gate
 
 - 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
-- Phase 0.3 overall 保持 `active`；下一子阶段为 Phase 0.3d 轻量 LoRA smoke baseline，当前为 `planned / next`，本轮未开始。
+- Phase 0.3 overall 保持 `active`；Phase 0.3d 已完成，下一子阶段为现有路线定义的 Phase 0.3e failure analysis 与接口冻结。
 - Phase 0.3 可继续使用 train/validation 进行开发与模型选择，但不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
 - 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
