@@ -21,6 +21,7 @@ from src.phase0.qwen3vl_dataset_adapter import (
     ADAPTER_RECORD_FIELDS,
     AdapterConfig,
     GitProvenance,
+    VARIANTS,
     _validate_adapter_output_record,
     canonical_json_bytes,
     load_config as load_adapter_config,
@@ -31,10 +32,6 @@ from src.phase0.qwen3vl_dataset_adapter import (
 from src.phase0.qwen3vl_interface import (
     FIXED_MODEL_ID,
     FIXED_REVISION,
-    FIXED_TASK_PROMPT,
-    PROMPT_VERSION,
-    VARIANTS,
-    build_multimodal_messages,
     validate_processor_inputs,
 )
 from src.phase0.qwen3vl_smoke import parse_action_output, resolve_image_path
@@ -44,6 +41,19 @@ ARTIFACT_VERSION = "zero_shot_smoke_v0_1"
 ARTIFACT_SCHEMA_VERSION = "phase0_3c1_zero_shot_artifact_v0.1"
 PARSER_VERSION = "phase0.3a2-strict-legacy-action-v0.1"
 GENERATION_CONFIG_VERSION = "phase0.3a2-deterministic-generation-v0.1"
+PROMPT_VERSION = "phase0.3c-zero-shot-v0.1"
+FIXED_TASK_PROMPT = (
+    "Based only on the provided current observation, predict the ego vehicle's\n"
+    "near-future coarse driving action.\n\n"
+    "Choose exactly one action from:\n\n"
+    "keep\n"
+    "accelerate\n"
+    "decelerate\n"
+    "stop\n"
+    "left_lateral\n"
+    "right_lateral\n\n"
+    "Output exactly the action name and nothing else."
+)
 ALLOWED_SPLIT = "validation"
 FIXED_GENERATION_KWARGS = {
     "do_sample": False,
@@ -660,6 +670,32 @@ def select_adapter_samples(
         else:
             raise ValueError("counterpart validation file exceeds receipt count")
     return tuple(samples)
+
+
+def build_multimodal_messages(
+    *,
+    variant: str,
+    image: object,
+    ego_state_text: str | None,
+) -> list[dict[str, object]]:
+    if variant not in VARIANTS:
+        raise ValueError("unsupported input variant")
+    prompt = FIXED_TASK_PROMPT
+    if variant == "image_ego_state":
+        if ego_state_text is None:
+            raise ValueError("image_ego_state input is missing adapter serialization")
+        prompt = f"{ego_state_text}\n\n{prompt}"
+    elif ego_state_text is not None:
+        raise ValueError("image_only input must not contain ego-state text")
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
 
 
 def build_inference_messages(

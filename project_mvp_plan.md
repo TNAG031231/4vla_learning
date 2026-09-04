@@ -154,9 +154,9 @@ lateral_action:
 - right
 ```
 
-真实驾驶动作通常是组合行为，例如 `decelerate + left`、`keep + right` 或 `accelerate + straight`。原六类互斥动作每次只能表达一种主导语义，无法同时说明纵向速度趋势与横向方向；如果不断向单一类别集合增加组合类，类别数量、长尾问题、标签维护和错误解释都会迅速复杂化。因子化表示让两个 head（预测头）共享同一多模态特征但分别学习纵向与横向语义，更容易扩展、审核和复用。
+真实驾驶动作通常是组合行为，例如 `decelerate + left`、`keep + right` 或 `accelerate + straight`。原六类互斥动作每次只能表达一种主导语义，无法同时说明纵向速度趋势与横向方向；如果不断向单一类别集合增加组合类，类别数量、长尾问题、标签维护和错误解释都会迅速复杂化。Phase 0.4 因此由 Qwen3-VL semantic decision branch（语义决策分支）生成 one-step structured factorized meta-action（单步结构化因子化元动作），而不是把两个独立 classifier head（分类头）作为主语义接口。
 
-评测时分别报告 longitudinal macro-F1（纵向宏平均 F1）和 lateral macro-F1（横向宏平均 F1），并以 joint accuracy（联合准确率）检查两个 head（预测头）是否同时正确。高层动作因此仍然可解释、可验证，但不再承担连续路径的全部信息。
+评测时分别报告 longitudinal macro-F1（纵向宏平均 F1）和 lateral macro-F1（横向宏平均 F1），并以 joint accuracy（联合准确率）检查结构化动作对是否同时正确。具体 tokenizer-level serialization（token 级序列化）、assistant masking（助手掩码）与 strict parser version（严格解析器版本）必须在 Phase 0.4b 以真实 Qwen3-VL 输出验证后冻结；本计划只冻结 `longitudinal` / `lateral` 语义，不假装相应文本协议已实现。
 
 第一版不直接增加 `lane_change`、`turn`、`follow_road_curve`、`overtake` 或 `yield`。仅靠单帧 `CAM_FRONT` 与 ego trajectory（自车轨迹），通常无法稳定区分 lane change（变道）、turn（转弯）和 follow-road-curve（沿弯道行驶），也无法可靠判断超车或让行意图。只有后续加入经过审核的 map（地图）、lane topology（车道拓扑）、intersection topology（路口拓扑）、route command（导航指令）或 temporal input（时序输入）中的至少一部分后，才允许定义、版本化并重新审核 fine-grained maneuver type（细粒度机动类型）。
 
@@ -183,15 +183,21 @@ unit: meter
 第一版主结构在后续 Phase（阶段）中按以下接口实现：
 
 ```text
-shared multimodal backbone
-├── longitudinal action head
-├── lateral action head
-└── meta-action-conditioned waypoint head
+shared pinned Qwen3-VL
+├── semantic decision branch
+│   └── structured factorized meta-action
+└── planning visual branch
+    └── per-frame image_embeds → temporal / ego fusion
+
+structured factorized meta-action
+→ decision adapter
+→ action-conditioned waypoint planner [B,6,2]
+→ trajectory-to-action verifier
 ```
 
-shared multimodal backbone（共享多模态主干模型）提取图像、`task_prompt` 和自车状态特征；longitudinal action head（纵向动作头）预测四类纵向动作；lateral action head（横向动作头）预测三类横向动作；meta-action-conditioned waypoint head（元动作条件化轨迹点头）同时接收共享特征和高层动作 embedding（嵌入），输出 `[B, 6, 2]` 连续轨迹点。高层动作回答“准备做什么”，轨迹回答“具体怎么移动”，两者共享信息但分别接受分类与几何验证。
+Semantic decision branch（语义决策分支）执行完整 Qwen3-VL multimodal forward（多模态前向），保留模型原生 DeepStack，并输出可解释的纵向 / 横向结构化元动作。Planning visual branch（规划视觉分支）只通过冻结的 public `get_image_features` 接口取得 per-frame primary `image_embeds`，再结合时序与自车状态；decision adapter（决策适配器）把高层动作转成紧凑规划条件，waypoint planner（轨迹点规划器）输出 `[B,6,2]`。高层动作回答“准备做什么”，轨迹回答“具体怎么移动”，verifier（验证器）检查两者是否一致。
 
-Legacy coarse action schema（旧版粗粒度动作模式）继续作为历史基线、辅助监督和解释接口，但不替代上述三个主要输出 head（预测头）。新增 factorized target（因子化目标）和 waypoint target（轨迹点目标）时必须提升相应 schema version（模式版本）并保留旧字段兼容；具体模型代码、loss weight（损失权重）和训练超参数留给后续 Phase（阶段）规格，本节不预设。
+Legacy coarse action schema（旧版粗粒度动作模式）继续作为 Phase 0.3 历史基线，不替代结构化 factorized decision（因子化决策）与连续规划接口。若未来保留 `[B,4]` / `[B,3]` classifier heads（分类头），只能作为 optional auxiliary diagnostic（可选辅助诊断），不得成为 Phase 0.4 主 semantic decision interface（语义决策接口）。
 
 ### 2.5 Trajectory-to-action verifier（轨迹到动作验证器）
 
@@ -467,7 +473,7 @@ contract / regression tests
 | Phase 0.2c | failure analysis 与 rule freeze | `frozen` | `phase0.2-ego-motion-rule-v0.1` |
 | Phase 0.2d | sealed one-shot evaluation | `consumed_failed` | 无正式 test metrics；原 test 永久消费 |
 | Phase 0.3 | Qwen3-VL 数据接口与 legacy coarse action baseline（旧版粗粒度动作基线） | `active` | 可复用视觉/多模态特征接口与六类历史兼容基线 |
-| Phase 0.4 | factorized meta-action（因子化元动作）+ action-conditioned waypoint（动作条件化轨迹点）+ verification（验证） | `planned` | `[B,4]` / `[B,3]` 动作头、`[B,6,2]` 轨迹点头与一致性验证器 |
+| Phase 0.4 | factorized meta-action（因子化元动作）+ action-conditioned waypoint（动作条件化轨迹点）+ verification（验证） | `planned` | Qwen3-VL 结构化语义决策、decision adapter、`[B,6,2]` 轨迹规划与一致性验证器 |
 | Phase 0.5 | BEV/OCC（鸟瞰图 / 占用表征）几何表示与离线空间评估，以及条件式轻量预测分支 | `planned` | Core：类型明确的时序对象张量与元数据、temporal occupancy 与对象—栅格一致性；Enhancement：可选当前占用预测 |
 | Phase 0.6 | factorized-action-conditioned candidates（因子化动作条件化候选）+ GT-derived safety reranking（真值派生安全重排序） | `planned` | `[B,6,6,2]` 固定候选库、双几何后端、configured oracle reranker（配置化真值重排序器）与独立 candidate-set ceiling（候选库上限） |
 | Phase 0.7 | receding-horizon logged sequential evaluation（滚动时域日志序列评估）与 planning interface（规划接口） | `planned` | 跨锚点轨迹一致性、动作稳定性、接口、无效 / 回退与真实硬件延迟证据 |
@@ -765,7 +771,7 @@ image + ego state
 
 ##### Phase 0.3e：failure analysis 与接口冻结
 
-- **状态：** `active`。Phase 0.3e-1 failure analysis 已完成，Phase 0.3e-2 interface freeze 为下一子阶段；Phase 0.3 overall 继续保持 `active`，只有完成 interface freeze 并满足 Phase 0.3 Gate 后才能更新为 `completed`。
+- **状态：** `active`。Phase 0.3e-1 failure analysis 已完成；Phase 0.3e-2 real interface verification 已通过，当前等待 Draft PR #37 人工 review / merge。Phase 0.3 overall 继续保持 `active`，只有完成该 review / merge 并满足 Phase 0.3 Gate 后才能更新为 `completed`。
 
 ###### Phase 0.3e-1：Qwen3-VL baseline failure analysis
 
@@ -791,7 +797,7 @@ representative-label consistency
 
 ###### Phase 0.3e-2：interface freeze
 
-- **状态：** `planned / next`。本子阶段只冻结下列 producer contracts，并完成 Phase 0.3 Gate 核验；不得把 Phase 0.3e-1 的 reviewer-only future information 纳入 inference interface。
+- **状态：** real interface verification `passed`，等待 Draft PR #37 人工 review / merge。本子阶段只冻结下列 producer contracts，并完成 Phase 0.3 Gate 核验；不得把 Phase 0.3e-1 的 reviewer-only future information 纳入 inference interface。
 
 最终冻结的主要 producer contract（生产者协议）为：
 
@@ -806,7 +812,9 @@ legacy action parser
 legacy baseline prediction format
 ```
 
-其中 visual / multimodal feature interface（视觉 / 多模态特征接口）及其 model / processor revision（模型 / 处理器修订版）是 Phase 0.4 的核心输入合同；legacy action parser（旧版动作解析器）和 legacy baseline prediction format（旧版基线预测格式）只服务 Phase 0.3 基线与历史兼容，不限制 Phase 0.4 的 longitudinal / lateral action head（纵向 / 横向动作预测头）。冻结前必须以真实 adapter record（适配器记录）和真实 processor output（处理器输出）核验 shape（形状），不能手写猜测 consumer schema（消费者模式）。
+其中 planning visual feature interface（规划视觉特征接口）及其 model / processor revision（模型 / 处理器修订版）是 Phase 0.4 的核心输入合同；legacy action parser（旧版动作解析器）、legacy six-action prompt（旧六类动作提示）和 legacy baseline prediction format（旧版基线预测格式）只服务 Phase 0.3 基线与历史兼容，不限制 Phase 0.4 的 structured factorized meta-action（结构化因子化元动作）。冻结前必须以真实 adapter record（适配器记录）、真实 processor output（处理器输出）和真实 pinned model visual output（固定模型视觉输出）核验 shape（形状），不能手写猜测 consumer schema（消费者模式）。
+
+真实验证已确认 planning branch（规划分支）使用 public `Qwen3VLForConditionalGeneration.get_image_features(...)`，获得按输入图像顺序排列的 primary `image_embeds [N_i,2560] bfloat16`；`N_i` 由 `image_grid_thw` 与 `spatial_merge_size=2` 决定并保持动态。真实样本观察到 `image_grid_thw=[[1,56,100]]`、`pixel_values [5600,1536]` 与 `image_embeds [1400,2560]`，其中 `5600 / 1400` 不是全局固定维度。Native DeepStack 的 3 个 observed levels 均为 `[1400,2560] bfloat16`，但只保留在完整 Qwen3-VL semantic branch 内，不成为 planner mandatory public interface。
 
 #### 10.1.6 涉及实现、配置、artifact 与 provenance
 
@@ -876,14 +884,16 @@ Zero-shot 不要求超过 frozen ego-motion rule；较弱结果不阻塞 Phase 0
 
 本阶段可展示：多模态数据适配、`task_prompt` / output protocol（固定任务提示 / 输出协议）、VLM inference（视觉语言模型推理）、LoRA（低秩适配）基础训练、invalid output handling（无效输出处理）、传统 rule（规则）与 VLM（视觉语言模型）对照，以及 sample-level failure analysis（样本级失败分析）。可交付的 Demo（演示）是 `CAM_FRONT + optional ego-state text → task_prompt → raw output → legacy parsed coarse action`，并展示输入边界、版本和代表性失败案例；该 Demo（演示）不代表最终 VLA（视觉-语言-动作模型）动作空间。
 
-### 10.2 Phase 0.4：最终 VLA 核心——factorized meta-action（因子化元动作）、meta-action-conditioned waypoint（元动作条件化轨迹点）与 trajectory-to-action verification（轨迹到动作验证）
+### 10.2 Phase 0.4：最终 VLA 核心——semantic decision（语义决策）、action-conditioned waypoint（动作条件化轨迹点）与 trajectory-to-action verification（轨迹到动作验证）
 
 > Phase 0.4 不是新的临时版本，而是后续 BEV / OCC（鸟瞰图 / 占用表征）离线评估、safety scorer（安全评分器）、logged sequential evaluation（日志序列评估）和条件式 preference learning（偏好学习）共用的最终核心模型骨架。核心链路固定为 factorized meta-action（因子化元动作）→ meta-action-conditioned waypoint prediction（元动作条件化轨迹点预测）→ trajectory-to-action verification（轨迹到动作验证）。
 
 #### 可迁移技术来源与项目化取舍
 
-- DriveMA（可验证元动作驾驶视觉-语言-动作模型）：迁移 `x → m → τ` 的高层动作到低层轨迹接口，以及 trajectory-to-action verification（轨迹到动作验证）；不复现全参数训练、海量数据或 GRPO（组相对策略优化）。
-- TransFuser（基于 Transformer 的传感器融合驾驶模型）：迁移 waypoint prediction（轨迹点预测）作为低层规划输出的思想；本项目不直接预测 steering / throttle / brake（转向角 / 油门 / 制动）。
+- DriveMA（可验证元动作驾驶视觉-语言-动作模型）：迁移 `observation → concise meta-action → action-conditioned trajectory` 与 trajectory-to-action verification（轨迹到动作验证）；不复现全参数训练、海量数据或 GRPO（组相对策略优化）。
+- Senna（视觉语言驾驶模型）：迁移 VLM high-level planning decision（高层规划决策）与 dedicated precise trajectory planner（专用精确轨迹规划器）的职责分离。
+- Senna-2：迁移 `VLM decision → decision adapter → E2E low-level policy` 的高低层对齐接口，并显式验证 decision / trajectory consistency（决策 / 轨迹一致性）。
+- DriveVLM-Dual（双系统驾驶视觉语言模型）：迁移 VLM semantic reasoning（语义推理）与 dedicated low-level geometric / planning system（专用低层几何 / 规划系统）协同的双分支思路。
 - Ego-status shortcut analysis（自车状态捷径分析）：迁移 ego-only baseline（仅自车状态基线）与 shuffled-image diagnostic（图像打乱诊断），用于核验模型是否真实利用视觉，而不是只依赖自车运动状态。
 
 以上仅说明可迁移的工程接口和诊断方法；论文结果数字、训练规模和外部模型能力不得写成本项目已完成结果。
@@ -891,9 +901,9 @@ Zero-shot 不要求超过 frozen ego-motion rule；较弱结果不阻塞 Phase 0
 #### 10.2.1 阶段状态、目的与边界
 
 - **阶段状态：** `planned`。
-- **阶段目的：** 从 Phase 0.3 的 legacy six-class baseline（旧六分类基线）升级为同时输出 longitudinal action（纵向动作）、lateral action（横向动作）与连续 future waypoints（未来轨迹点）的 planning model（规划模型），并用规则化 verifier（验证器）检查动作与轨迹是否一致。
+- **阶段目的：** 从 Phase 0.3 的 legacy six-class baseline（旧六分类基线）升级为 Qwen3-VL 结构化 factorized meta-action（因子化元动作）与 action-conditioned continuous future waypoints（动作条件化连续未来轨迹点）的双分支 planning model（规划模型），并用规则化 verifier（验证器）检查动作与轨迹是否一致。
 - **为什么需要：** 单帧六分类不能表达纵向与横向动作组合，也不能描述未来路径；factorized action（因子化动作）提供可解释高层意图，action-conditioned waypoint（动作条件化轨迹点）提供可评估低层运动，verifier（验证器）把两者连接成可核查证据链。
-- **前置条件：** Phase 0.3 的 dataset adapter interface（数据集适配器接口）、model / processor revision（模型 / 处理器修订版）、visual / multimodal feature interface（视觉 / 多模态特征接口）、`task_prompt` schema（固定任务提示模式）与 ego-state serialization（自车状态序列化）已冻结。Legacy action parser（旧版动作解析器）只用于历史兼容，不是本阶段 action head（动作预测头）的 consumer contract（消费者协议）。
+- **前置条件：** Phase 0.3 的 dataset adapter interface（数据集适配器接口）、model / processor revision（模型 / 处理器修订版）、planning visual feature interface（规划视觉特征接口）与 ego-state serialization（自车状态序列化）已冻结。Phase 0.4 使用独立 fixed task prompt（固定任务提示）；其 tokenizer-level output protocol、assistant masking 与 strict parser version 必须在 Phase 0.4b 真实验证后冻结。Legacy action parser（旧版动作解析器）只用于历史兼容，不是本阶段 consumer contract（消费者协议）。
 
 本阶段解决：
 
@@ -901,7 +911,7 @@ Zero-shot 不要求超过 frozen ego-motion rule；较弱结果不阻塞 Phase 0
 - 使用 current/past ego motion 提供运动状态；
 - 派生并版本化 longitudinal / lateral factorized targets（纵向 / 横向因子化目标）；
 - 输出固定 3 秒、6 个时间步的 continuous future waypoints（连续未来轨迹点）；
-- 使用模型自身预测的 soft action embedding（软动作嵌入）条件化 waypoint head（轨迹点头）；
+- 通过 decision adapter（决策适配器）将模型自身预测的结构化 factorized meta-action 条件化 waypoint planner（轨迹点规划器）；
 - 以 trajectory-to-action verifier（轨迹到动作验证器）生成纵向、横向和联合一致性证据；
 - 建立 Phase 0.5 的离线 geometry evaluator（几何评估器）、Phase 0.6 的 scorer / candidate（评分器 / 候选）、Phase 0.7 的 logged sequential interface（日志序列接口）和 Phase 0.8 条件式 preference head（偏好头）可复用的 model / policy interface（模型 / 策略接口）。
 
@@ -918,40 +928,47 @@ closed-loop RL
 fine-grained turn / lane-change taxonomy
 ```
 
-Learned multimodal candidate trajectories（学习式多模态候选轨迹）是 optional（可选）；第一版以可靠单轨迹输出为主。Legacy six-class head（旧六分类头）只允许作为 optional compatibility auxiliary head（可选兼容辅助头），默认主线不依赖它，也不得用它替代 longitudinal / lateral action heads（纵向 / 横向动作预测头）。模型 contract（协议）可预留 geometry token（几何 token）和 policy optimization（策略优化）接口，但不得把它们写成已经实现。
+Learned multimodal candidate trajectories（学习式多模态候选轨迹）是 optional（可选）；第一版以可靠单轨迹输出为主。Legacy six-class head（旧六分类头）继续仅服务历史基线；`[B,4]` / `[B,3]` classifier heads（分类头）若保留，只允许作为 optional auxiliary diagnostic（可选辅助诊断），默认主线不依赖它们。模型 contract（协议）可预留 geometry token（几何 token）和 policy optimization（策略优化）接口，但不得把它们写成已经实现。
 
 #### 10.2.2 最终核心架构
 
 ```text
-historical CAM_FRONT frames
-+ current / past ego motion
-        ↓
-Qwen3-VL visual / semantic features
-        ↓
-temporal fusion
-        ↓
-shared driving representation h
-        ├── longitudinal action head → logits/probabilities [B,4] → predicted class [B]
-        ├── lateral action head      → logits/probabilities [B,3] → predicted class [B]
-        └── meta-action-conditioned waypoint head → predicted_waypoints [B,6,2]
+current / past CAM_FRONT
++ current / past ego state
++ fixed task prompt
+        │
+        ▼
+shared pinned Qwen3-VL
+        │
+        ├─────────────────────────────┐
+        │                             │
+Semantic decision branch       Planning visual branch
+        │                             │
+full Qwen3-VL multimodal       model.get_image_features()
+forward                               │
+        │                       per-frame image_embeds
+native DeepStack                     [N_i, 2560]
+inside Qwen3-VL                       │
+        │                       temporal fusion
+structured factorized                 │
+meta-action                           + ego encoder
+        │                             │
+        └──── decision adapter ───────┤
+                                      ▼
+                         action-conditioned waypoint
+                              predicted [B,6,2]
+                                      │
+                                      ▼
+                         trajectory-to-action verifier
 ```
 
-Longitudinal action head（纵向动作头）输出 `[B,4]` logits / probabilities（逻辑值 / 概率）和 `[B]` predicted class（预测类别），lateral action head（横向动作头）输出 `[B,3]` logits / probabilities（逻辑值 / 概率）和 `[B]` predicted class（预测类别），两个动作 head（预测头）共享同一 driving representation（驾驶表征）`h`。Waypoint head（轨迹点头）不只读取 `h`，还必须读取纵向和横向动作 embedding（嵌入）：高层动作回答“准备怎么驾驶”，waypoint（轨迹点）负责输出“具体怎么移动”。
+Semantic decision branch（语义决策分支）执行完整 Qwen3-VL multimodal forward，原生 DeepStack 只在 Qwen3-VL 内部参与语义建模；主输出是 one-step structured factorized meta-action，语义固定为 `longitudinal ∈ {stop, decelerate, keep, accelerate}` 与 `lateral ∈ {left, straight, right}`。Canonical serialization（规范序列化）可采用 `longitudinal=<value>; lateral=<value>`，但具体 token 序列、mask 与 parser 尚为 `planned`，必须在 Phase 0.4b 真实验证后冻结。
 
-动作条件化采用可微的 soft embedding（软嵌入）：
+Planning visual branch（规划视觉分支）固定调用 `Qwen3VLForConditionalGeneration.get_image_features(pixel_values, image_grid_thw)`，消费 primary `image_embeds` 的 per-image `[N_i,2560]` 表示；`N_i` 随图像网格动态变化，`2560` 是当前 pinned revision 经 merger / projector 后的稳定 feature dimension。该分支不直接绑定 `model.model.visual(...)`，不暴露 ViT block private API，也不把三个 DeepStack level 作为 temporal planner（时序规划器）的 mandatory public input（必需公共输入）。
 
-```text
-p_long = softmax(longitudinal_logits)  # [B, 4]
-p_lat  = softmax(lateral_logits)       # [B, 3]
+Decision adapter（决策适配器）只冻结职责与 I/O 语义：将 Qwen3-VL factorized meta-action decision 转换为 compact conditioning representation（紧凑条件表示），再与 temporal visual representation（时序视觉表示）及 ego representation（自车表示）共同输入 waypoint planner。具体采用 action-token hidden-state pooling（动作 token 隐状态池化）、lightweight projection（轻量投影）或其他最小表示，必须根据 Phase 0.4 真实 hidden state 与资源证据决定；本阶段不猜测 hidden-state shape，也不提前实现 adapter。
 
-e_long = p_long @ E_long
-e_lat  = p_lat  @ E_lat
-
-trajectory_input = concat(h, e_long, e_lat)
-trajectory_head(trajectory_input) → [B, 6, 2]
-```
-
-`E_long` 是可训练纵向动作 embedding table（嵌入表），`E_lat` 是可训练横向动作 embedding table（嵌入表）。概率加权的 soft embedding（软嵌入）使梯度可以从 waypoint loss（轨迹点损失）回到两个动作 head（预测头）。Inference（推理）只能使用模型自身预测的 `p_long` 与 `p_lat`；禁止使用 GT action（真值动作）或由 future trajectory（未来轨迹）派生的动作作为推理条件。
+Inference（推理）只能使用模型自身从 current / past observation（当前 / 历史观测）产生的 decision conditioning（决策条件）；禁止使用 GT action（真值动作）或由 future trajectory（未来轨迹）派生的动作作为推理条件。
 
 Phase 0.5 Core（核心）只构造 evaluator-only geometry（仅评估器几何），不得接入 shared fusion（共享融合）；只有条件式 Enhancement（增强）成功时，才可把 predicted BEV / OCC feature（预测鸟瞰图 / 占用表征特征）作为推理兼容输入，同时继续输出相同的 longitudinal action（纵向动作）、lateral action（横向动作）、waypoint（轨迹点）和 consistency（动作—轨迹一致性）协议。Phase 0.6 消费 predicted waypoints（预测轨迹点）及其 mask（掩码）；Phase 0.7 通过稳定 inference / planning interface（推理 / 规划接口）重复调用模型；Phase 0.8 若启动，只在候选层训练 inference-compatible preference head（推理兼容偏好头）。不得为这些阶段分别重建不兼容的 backbone（主干模型）或 trajectory schema（轨迹模式）。
 
@@ -971,10 +988,9 @@ factorized_action_joint_valid: [B]
 future_waypoints:            [B, 6, 2]
 trajectory_valid_mask:       [B, 6]
 
-longitudinal logits/probabilities: [B,4]
-longitudinal predicted class:      [B]
-lateral logits/probabilities:      [B,3]
-lateral predicted class:           [B]
+planning_image_embeds:             per image [N_i,2560], bfloat16
+structured_meta_action:            one longitudinal + one lateral value
+decision_conditioning:             [B,D_decision] (shape planned)
 predicted_waypoints:               [B,6,2]
 ```
 
@@ -982,6 +998,8 @@ predicted_waypoints:               [B,6,2]
 - `T_hist`：历史帧数；
 - `E`：版本化 ego-motion feature dimension；
 - `H, W`：processor 接收的图像尺寸。
+- `N_i`：第 `i` 帧由 `image_grid_thw` 与 `spatial_merge_size=2` 决定的动态 visual token 数；
+- `D_decision`：decision adapter 输出维度，必须在 Phase 0.4c 根据真实 hidden state 与资源 smoke 冻结。
 
 `T_hist`、`H/W` 与 batch size（批大小）允许根据数据可用性和 resource preflight（资源预检）配置；`K=6`、prediction horizon（预测时域）`=3.0 s` 与 sampling interval（采样间隔）`=0.5 s` 是当前主线固定合同，不得由资源预检改变。六个轨迹点依次对应当前时刻后的 `0.5 / 1.0 / 1.5 / 2.0 / 2.5 / 3.0 s`，全部位于 current ego frame（当前自车坐标系），`x` 轴向前为正，`y` 轴向左为正，单位为米。任何其他 horizon（预测时域）或采样间隔只能作为 optional extension（可选扩展）使用独立 schema version（模式版本），不得替换当前主线。
 
@@ -1065,15 +1083,18 @@ Temporal / factorized manifest（时序 / 因子化清单）至少追溯：ancho
 
 ```text
 historical images
-→ shared Qwen3-VL visual encoder
-→ per-frame visual tokens
+→ pinned Qwen3-VL processor
+→ Qwen3VLForConditionalGeneration.get_image_features
+→ primary per-frame image_embeds [N_i,2560] bfloat16
 ```
 
-第一版复用 Phase 0.3 的 model/processor revision，优先冻结大部分 VLM，通过 LoRA 或上层 adapter 控制可训练范围，不从零训练视觉 backbone。每帧使用同一 encoder 和 extraction policy。
+第一版复用 Phase 0.3 冻结的 model / processor revision 与 public extraction policy。真实 pinned model 已确认内部 visual encoder 为 `Qwen3VLVisionModel`，primary `image_embeds` 已经过模型原生 merger / projector；每帧按输入 image 与 `image_grid_thw` 的同一顺序一一对齐。`N_i = T_i × H_i × W_i / 2²`，因此 visual token 维动态，不能把真实样本观察到的 `1400` 写成全局固定值；stable feature dimension 为 `2560`。
+
+Native DeepStack（原生深层堆叠特征）保留在完整 Qwen3-VL semantic decision branch 内运行。真实样本观察到三个 DeepStack levels，各为 `[1400,2560]` bfloat16；这只是该样本 observation，不是 planning branch 的 mandatory public interface，也不得自行重实现 Qwen DeepStack。
 
 ##### Temporal fusion
 
-候选模块包括 temporal transformer、temporal attention pooling、GRU / lightweight sequence encoder。模块接口必须统一接收 per-frame features、relative timestamps 与 `history_valid_mask`。第一版默认优先实现结构简单、便于 shape/mask 调试的 lightweight temporal attention pooling；其他方案只作为后续消融，不同时并行实现全部候选。若 resource preflight 或 smoke evidence 否定默认方案，必须记录替换原因并提升 config/version。
+模块接口统一接收 primary per-frame `image_embeds [N_i,2560]`、relative timestamps 与 `history_valid_mask`。第一版默认优先实现结构简单、便于 dynamic-token shape / mask 调试的 lightweight temporal attention pooling；其他方案只作为后续备选，不同时并行实现论文级消融。若 resource preflight 或 smoke evidence 否定默认方案，必须记录替换原因并提升 config/version。
 
 ##### Ego-state encoder
 
@@ -1088,55 +1109,37 @@ availability / valid mask
 
 输入 normalization statistics 只从 train 计算并持久化；validation 只用于评估。Missing values 不得被无记录地替换为真实零运动。
 
-##### Shared fusion
+##### Decision adapter
+
+```text
+structured factorized meta-action
+→ compact decision conditioning
+```
+
+本阶段只冻结 decision adapter 的职责与 I/O 语义，不冻结尚未实测的 hidden-state pooling、projection 结构或 `D_decision`。候选实现必须在 Phase 0.4c 使用真实 Qwen hidden state 与 resource evidence 选择；不得让 planner 接收 GT action 或 future-derived action。
+
+##### Planning fusion 与输出
 
 ```text
 temporal visual representation
 + ego representation
-→ shared driving feature
++ predicted decision conditioning
+→ action-conditioned waypoint planner
+→ predicted_waypoints [B,6,2]
 ```
 
-Shared fusion 输出稳定 feature contract，包括 shape、dtype、mask、normalization 与 feature version。Phase 0.5 可将 geometry tokens 作为额外输入接入该模块，而不改写 Phase 0.4 trajectory target/output contract。
-
-##### Output heads
-
-```text
-longitudinal action head:
-h → logits/probabilities [B,4] → predicted class [B]
-
-lateral action head:
-h → logits/probabilities [B,3] → predicted class [B]
-
-meta-action-conditioned waypoint head:
-concat(h, e_long, e_lat) → predicted_waypoints [B,6,2]
-```
-
-两个 factorized action heads（因子化动作预测头）共享 `h`，但分别预测纵向与横向语义。Meta-action-conditioned waypoint head（元动作条件化轨迹点头）读取 `h` 以及由动作概率和可训练 embedding table（嵌入表）产生的 `e_long / e_lat`。主线输出固定为 longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]` 与 `predicted_waypoints [B,6,2]`。
-
-Legacy six-class head（旧六分类头）不再是 Phase 0.4 主输出；若历史兼容确有需要，可配置为 optional compatibility auxiliary head（可选兼容辅助头），但默认关闭、单独标记版本，且不得替代两个 factorized action heads（因子化动作预测头）或影响正式推理协议。
+主 semantic decision interface 是 Qwen3-VL 生成的 structured factorized meta-action，主 planning output 是 `predicted_waypoints [B,6,2]`。Legacy six-class parser / prompt 保持 Phase 0.3 冻结状态但不进入本接口；`[B,4]` / `[B,3]` classifier heads 若未来保留，只能默认关闭并标记为 optional auxiliary diagnostic，不得替代 semantic decision branch 或影响正式推理协议。
 
 #### 10.2.7 Training target（训练目标）、conditioning（条件化）、loss（损失）与 consistency（动作—轨迹一致性）
 
-基础训练目标为：
+Phase 0.4b 与 Phase 0.4c 使用职责分离的训练目标：
 
 ```text
-L_total
-= lambda_traj * L_trajectory
-+ lambda_long * L_longitudinal
-+ lambda_lat * L_lateral
-```
+Phase 0.4b:
+L_action_token = assistant-only structured meta-action SFT loss
 
-其中：
-
-```text
-L_trajectory:
-masked SmoothL1 / Huber waypoint regression
-
-L_longitudinal:
-4-class cross entropy
-
-L_lateral:
-3-class cross entropy
+Phase 0.4c:
+L_trajectory = masked SmoothL1 / Huber waypoint regression
 ```
 
 统一 training target（训练目标）为：
@@ -1151,13 +1154,9 @@ future_waypoints:           [B, 6, 2]
 trajectory_valid_mask:      [B, 6]
 ```
 
-正式实现时在 SmoothL1 / Huber（平滑 L1 / Huber）等价配置中选择并版本化一个方案。`L_trajectory` 只在 `trajectory_valid_mask` 为真处计算；`L_longitudinal` 只由 `longitudinal_action_valid` 控制，`L_lateral` 只由 `lateral_action_valid` 控制。横向无效不得屏蔽有效的纵向交叉熵，纵向无效也不得屏蔽有效的横向交叉熵；`factorized_action_joint_valid` 不作为两个分类 loss（损失）的统一掩码。具体 loss weight（损失权重）只在 validation（验证集）上从少量预定义配置中选择，不进行大规模网格搜索。
+Phase 0.4b 使用 LoRA / parameter-efficient tuning（参数高效微调）训练完整 Qwen3-VL semantic branch 输出结构化纵向 / 横向动作，并保留 native DeepStack。Assistant supervision 只覆盖真实结构化动作 token；serialization、mask 与 parser 必须先通过真实 tokenizer / processor regression，再允许优化。
 
-训练只分两个简单步骤：
-
-**Stage A：GT-action conditioning warmup（阶段 A：真值动作条件化预热）。** 完整 GT action pair conditioning（真值动作对条件化）只能使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的样本，以纵向与横向 GT action（真值动作）的 one-hot embedding（独热嵌入）查询 `E_long / E_lat`，先让 waypoint head（轨迹点头）学习“给定完整正确高层动作时如何生成轨迹”。联合无效的样本不能用缺失方向伪造 GT action pair（真值动作对），但其中仍然有效的单方向标签继续训练对应 action head（动作预测头）。该阶段只用于检查 target（目标）、conditioning（条件化）和 waypoint capacity（轨迹点头容量），其结果必须保存并标为 `GT-action-conditioned warmup result` 诊断产物，不得作为正式 inference（推理）结果。
-
-**Stage B：predicted-action joint training（阶段 B：预测动作联合训练）。** 使用两个 action head（动作预测头）产生的 `p_long / p_lat` 计算 soft action embedding（软动作嵌入），联合训练 longitudinal action head（纵向动作头）、lateral action head（横向动作头）与 waypoint head（轨迹点头）。正式 inference（推理）使用相同 predicted-action conditioning（预测动作条件化）路径，禁止注入 GT action（真值动作）。
+Phase 0.4c 冻结或按已批准范围复用 semantic branch，使用 primary per-frame `image_embeds`、temporal fusion、ego encoder 与 predicted decision conditioning 训练 waypoint planner。正式实现时在 SmoothL1 / Huber（平滑 L1 / Huber）等价配置中选择并版本化一个方案；`L_trajectory` 只在 `trajectory_valid_mask` 为真处计算。`factorized_action_joint_valid` 决定完整动作对能否作为 action-conditioning 监督或诊断依据，但正式 inference 只能消费模型预测 decision，禁止注入 GT action。
 
 第一版不引入复杂 scheduled sampling（计划采样）、GRPO（组相对策略优化）、不可微 safety loss（安全损失）或复杂 consistency loss（一致性损失）。Action-trajectory consistency（动作—轨迹一致性）首先作为规则化评测指标和 failure signal（失败信号），不进入梯度路径。Verifier（验证器）遵循以下语义：
 
@@ -1180,7 +1179,7 @@ left / straight / right
 
 具体投影阈值必须由 train / validation protocol（训练集 / 验证集协议）版本化，不在计划中猜测。Action（动作）与 trajectory（轨迹）冲突时保留 sample-level failure case（样本级失败案例），不修改 GT label（真值标签）迁就模型输出。`L_consistency`、`L_occupancy` 和 RL objective（强化学习目标）均不得标为本阶段已实现。
 
-#### 10.2.8 详细训练步骤
+#### 10.2.8 工程阶段
 
 ##### Phase 0.4a：factorized target + temporal dataset contract（因子化目标与时序数据合同）
 
@@ -1193,41 +1192,29 @@ left / straight / right
 
 该子阶段未通过，不得开始模型训练。
 
-##### Phase 0.4b：minimal baselines and model smoke（最小基线与模型冒烟）
+##### Phase 0.4b：action-centric VLM SFT（动作中心视觉语言模型监督微调）
 
-1. 运行 constant-velocity baseline（匀速外推基线）与 ego-history MLP baseline（仅自车历史状态基线）。
-2. 训练 direct waypoint model without action conditioning（不使用动作条件化的直接轨迹模型）。
-3. 对主模型检查 forward（前向传播）、全部 tensor shape（张量形状）、history / trajectory mask（历史 / 轨迹掩码）和有限值。
-4. 检查 longitudinal / lateral / waypoint 三项 loss（损失）、梯度路径和 trainable parameter report（可训练参数报告）。
-5. 检查少量样本 overfit（过拟合）、checkpoint save / load（检查点保存 / 加载）和坐标反归一化。
+1. 为 Qwen3-VL semantic decision branch 冻结独立 fixed task prompt 与 one-step structured factorized meta-action serialization。
+2. 使用真实 tokenizer / processor 验证 assistant-only supervision boundary、strict parser、invalid output 与多 token target，再运行 LoRA / parameter-efficient SFT。
+3. 保留 Qwen3-VL native DeepStack，不把三个 DeepStack levels 拆成 planner 公共输入。
+4. 检查少量 train sample overfit、checkpoint save / load、trainable parameter report 与 validation action metrics；不访问 test。
 
-##### Phase 0.4c：Stage A GT-action conditioning warmup（阶段 A：真值动作条件化预热）
+##### Phase 0.4c：action-conditioned waypoint planning（动作条件化轨迹点规划）
 
-1. 完整 GT action pair conditioning（真值动作对条件化）只能使用 `factorized_action_joint_valid=true` 且 waypoint target（轨迹点目标）有效的 train（训练集）样本；只有纵向有效的样本仍可训练纵向动作头，只有横向有效的样本仍可训练横向动作头，但单方向有效样本不得用于完整真值动作对条件化 waypoint head（轨迹点头）。
-2. 用 GT factorized action（真值因子化动作）的 one-hot embedding（独热嵌入）条件化 waypoint head（轨迹点头）。
-3. 核对正确动作条件下 waypoint loss（轨迹点损失）能下降，并完成小样本 overfit（过拟合）。
-4. 在 validation（验证集）保存 `GT-action-conditioned warmup result` 与 sample-level prediction（样本级预测）。
-5. 明确该结果只诊断 waypoint head（轨迹点头），不参与正式推理能力结论。
+1. 对每个 historical frame 使用同一 pinned processor 与 `get_image_features`，按 `image_grid_thw` 顺序取得 primary per-frame `image_embeds [N_i,2560]`。
+2. 构建 lightweight temporal fusion、ego encoder 与 decision adapter；decision adapter 的具体 hidden-state pooling / projection 只依据真实 smoke 冻结。
+3. 训练 `image_embeds + temporal fusion + ego + predicted decision conditioning → predicted_waypoints [B,6,2]`，使用 masked SmoothL1 / Huber。
+4. 运行 constant-velocity、ego-history MLP 与 direct waypoint without action conditioning 三个最小 baseline，并检查小样本 overfit、checkpoint round-trip 与坐标反归一化。
+5. 正式 inference 使用模型预测 decision conditioning；GT factorized action 只可用于清楚标记的 diagnostic，不得冒充正式推理。
 
-##### Phase 0.4d：Stage B predicted-action joint training（阶段 B：预测动作联合训练）
-
-1. 使用正式 train split（训练集切分）和模型预测的 soft action embedding（软动作嵌入）。
-2. 联合训练 longitudinal action head（纵向动作头）、lateral action head（横向动作头）与 waypoint head（轨迹点头）。
-3. 只根据 validation（验证集）从少量预定义配置中选择 loss weight（损失权重）、checkpoint（检查点）和必要超参数。
-4. 保存 model（模型）、optimizer（优化器）、scheduler（调度器）、normalization（归一化）与 training config（训练配置）。
-5. 记录 manifest（清单）、split（切分）、代码 commit（提交）、model / processor revision（模型 / 处理器修订版）与 checkpoint SHA-256。
-6. 正式结果必须标为 `predicted-action-conditioned inference result`，推理时禁止使用 GT action（真值动作）。
-7. 运行 shuffled-image diagnostic（图像打乱诊断），并保存视觉是否产生增益的证据。
-8. 不访问、恢复或重跑原 project test（项目测试集）。
-
-##### Phase 0.4e：trajectory-to-action verifier and failure analysis（轨迹到动作验证器与失败分析）
+##### Phase 0.4d：decision / trajectory consistency verification + validation evaluation（决策 / 轨迹一致性验证与验证集评估）
 
 Verifier（验证器）输入固定为：
 
 ```text
 predicted_waypoints [B,6,2]
-longitudinal_predicted_class [B]
-lateral_predicted_class [B]
+structured_longitudinal_action
+structured_lateral_action
 trajectory_valid_mask
 factorized_action_rule_version
 verifier_version
@@ -1257,15 +1244,13 @@ Verifier（验证器）依次执行：
 
 Synthetic tests（合成测试）至少覆盖 `stop + straight`、`accelerate + straight`、`decelerate + straight`、`keep + left`、`keep + right`、预测动作与轨迹冲突、无效轨迹和边界轨迹。Verifier（验证器）首先是诊断和评估工具，不进入第一版梯度路径。
 
-##### Phase 0.4f：接口冻结与 handoff（交接）
-
-冻结 factorized target（因子化目标）、`[B,6,2]` waypoint（轨迹点）、conditioning（条件化）、model output（模型输出）、verifier（验证器）与 prediction artifact（预测产物）协议。以真实 model output（模型输出）完成 producer artifact → Phase 0.5 consumer intake（生产者产物到 Phase 0.5 消费者接入）核验，不手写猜测下游 shape（形状）。
+本子阶段同时冻结 factorized target（因子化目标）、structured decision（结构化决策）、decision conditioning（决策条件）、`[B,6,2]` waypoint（轨迹点）、verifier（验证器）与 prediction artifact（预测产物）协议，并完成 validation evaluation（验证集评估）。以真实 model output（模型输出）完成 producer artifact → Phase 0.5 consumer intake（生产者产物到 Phase 0.5 消费者接入）核验，不手写猜测下游 shape（形状）。
 
 #### 10.2.9 配置、artifact 与 provenance
 
-本阶段计划新增 temporal / factorized data builder and validator（时序 / 因子化数据构建器与验证器）、最小 trajectory baselines（轨迹基线）、模块化 VLA core（视觉-语言-动作模型核心）、factorized action heads（因子化动作预测头）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）、masked losses（带掩码损失）、trajectory-to-action verifier（轨迹到动作验证器）、metrics（指标）、visualization（可视化）与 tests（测试）；具体文件名和 CLI（命令行入口）由实施子任务确定，本文不声称它们已经存在。
+本阶段计划新增 temporal / factorized data builder and validator（时序 / 因子化数据构建器与验证器）、最小 trajectory baselines（轨迹基线）、action-centric VLM SFT（动作中心视觉语言模型监督微调）、decision adapter（决策适配器）、action-conditioned waypoint planner（动作条件化轨迹点规划器）、masked loss（带掩码损失）、trajectory-to-action verifier（轨迹到动作验证器）、metrics（指标）、visualization（可视化）与 tests（测试）；具体文件名和 CLI（命令行入口）由实施子任务确定，本文不声称它们已经存在。
 
-本地 artifact（产物）至少包括：temporal / factorized manifest and sidecar（时序 / 因子化清单及边车文件）、逐方向 validity / reason（有效性 / 原因）与 `factorized_action_joint_valid`、target derivation audit（目标派生审计）、representative manual review（代表性人工审核）、contract validation receipt（协议验证回执）、normalization statistics（归一化统计）、最小 baseline predictions / metrics（基线预测 / 指标）、必须保存的 Stage A warmup diagnostic artifact（阶段 A 预热诊断产物）、Stage B predicted-action inference（阶段 B 预测动作推理）结果、training configs / curves（训练配置 / 曲线）、checkpoint provenance（检查点来源）、sample-level factorized action / trajectory predictions（样本级因子化动作 / 轨迹预测）、verifier outputs（验证器输出）、visualizations（可视化）和 failure cases（失败案例）。派生数据、checkpoint（检查点）、日志和正式输出不进入 Git（版本控制系统），frozen manifest（冻结清单）不得覆盖。
+本地 artifact（产物）至少包括：temporal / factorized manifest and sidecar（时序 / 因子化清单及边车文件）、逐方向 validity / reason（有效性 / 原因）与 `factorized_action_joint_valid`、target derivation audit（目标派生审计）、representative manual review（代表性人工审核）、contract validation receipt（协议验证回执）、normalization statistics（归一化统计）、最小 baseline predictions / metrics（基线预测 / 指标）、structured decision predictions（结构化决策预测）、decision adapter provenance（决策适配器来源）、predicted-decision-conditioned waypoint results（预测决策条件化轨迹点结果）、training configs / curves（训练配置 / 曲线）、checkpoint provenance（检查点来源）、verifier outputs（验证器输出）、visualizations（可视化）和 failure cases（失败案例）。派生数据、checkpoint（检查点）、日志和正式输出不进入 Git（版本控制系统），frozen manifest（冻结清单）不得覆盖。
 
 Artifact（产物）至少记录 temporal / factorized schema version（时序 / 因子化模式版本）、`factorized_action_rule_version`、`verifier_version`、history policy（历史策略）、固定 waypoint coordinate / time contract（轨迹点坐标 / 时间协议）、source manifest / split SHA-256（来源清单 / 切分哈希）、model / processor / feature revision（模型 / 处理器 / 特征修订版）、conditioning stage（条件化阶段）、config / Git SHA（配置 / 版本控制哈希）、checkpoint SHA-256、train / validation sample count（训练集 / 验证集样本数）与 metric protocol version（指标协议版本）。不要求用多随机种子统计替代上述可追溯性。
 
@@ -1289,11 +1274,11 @@ trajectory valid rate
 invalid prediction rate（无效预测率）
 ```
 
-Phase 0.4 的 `invalid prediction rate` 统计模型张量与规划输出失败，至少包括 NaN / Inf（非数 / 无穷值）、tensor shape（张量形状）错误、有效轨迹点不足、mask（掩码）错误、坐标反归一化失败、action logits（动作逻辑值）异常，以及 verifier（验证器）无法完成动作投影。该指标不同于 Phase 0.3 基于文本 parser（解析器）的 `invalid output rate`：Phase 0.3 继续按旧六分类生成文本是否可解析统计，Phase 0.4 不得把解析失败率与张量预测失败率混为同一指标。
+Phase 0.4 的 `invalid prediction rate` 统计 structured decision（结构化决策）与规划输出失败，至少包括新版本 strict parser 拒绝、NaN / Inf（非数 / 无穷值）、tensor shape（张量形状）错误、有效轨迹点不足、mask（掩码）错误、坐标反归一化失败，以及 verifier（验证器）无法完成动作投影。该指标不同于 Phase 0.3 legacy six-class parser 的 `invalid output rate`：两个 parser / prompt / artifact version 必须分开记录，不能混用。
 
 `longitudinal macro-F1` 只在 `longitudinal_action_valid=true` 的目标上计算，`lateral macro-F1` 只在 `lateral_action_valid=true` 的目标上计算，`joint action accuracy` 只在 `factorized_action_joint_valid=true` 的完整动作对上计算；报告必须同时给出三个指标各自的有效样本数，避免用统一过滤条件静默丢弃单方向监督。
 
-可选报告 legacy six-class compatibility metric（旧六分类兼容指标），但六分类 macro-F1（宏平均 F1）不再是 Phase 0.4 的主要动作指标。所有轨迹表必须明确区分 `GT-action-conditioned warmup result` 与 `predicted-action-conditioned inference result`：前者是必须保存的 diagnostic artifact（诊断产物），只诊断 waypoint head（轨迹点头）在正确动作条件下的能力；后者才代表正式 inference（推理）。本阶段不要求置信区间、多随机种子统计、显著性检验或论文级复杂消融。
+可选报告 legacy six-class compatibility metric（旧六分类兼容指标），但六分类 macro-F1（宏平均 F1）不再是 Phase 0.4 的主要动作指标。所有正式轨迹表必须使用 `predicted-decision-conditioned inference result`；若使用 GT factorized action 做 planner diagnostic（规划器诊断），必须单独标记且不得冒充正式 inference。本阶段不要求置信区间、多随机种子统计、显著性检验或论文级复杂消融。
 
 VRU presence（弱势道路使用者存在性）只作为 offline stratification metadata（离线分组元数据），不得进入模型输入。若本阶段尚无经过验证的 collision evaluator（碰撞评估器），不报告或推断 collision / safety（碰撞 / 安全）结果；正式 safety metrics（安全指标）在 Phase 0.6 建立。
 
@@ -1306,15 +1291,16 @@ VRU presence（弱势道路使用者存在性）只作为 offline stratification
 - factorized target derivation（因子化目标派生）的四类纵向、三类横向、逐方向 invalid / uncertain（无效 / 不确定）、`factorized_action_joint_valid` 和 rule version（规则版本）；测试必须覆盖纵向有效而横向无效、横向有效而纵向无效，并证明有效方向的监督仍被保留；
 - current ego frame transform 和左右轴方向；
 - 固定 `[B,6,2]` waypoint（轨迹点）、`[B,6]` mask（掩码）、3.0 秒时域、0.5 秒间隔、单位与 collator batch（批处理整理）；
-- longitudinal logits / probabilities（纵向逻辑值 / 概率）`[B,4]`、longitudinal predicted class（纵向预测类别）`[B]`、lateral logits / probabilities（横向逻辑值 / 概率）`[B,3]`、lateral predicted class（横向预测类别）`[B]`、`predicted_waypoints [B,6,2]` 与 model forward shape（模型前向形状）；
-- soft embedding（软嵌入）的概率加权、梯度路径，以及 inference（推理）不接受 GT action（真值动作）；
-- masked loss（带掩码损失）分别使用 `longitudinal_action_valid`、`lateral_action_valid` 与 `trajectory_valid_mask`，且一个动作方向无效时另一方向的有效分类 loss（损失）不被清零；
-- `invalid prediction rate` 对 NaN / Inf、shape（形状）、有效点数量、mask（掩码）、坐标反归一化、action logits（动作逻辑值）和 verifier projection（验证器投影）失败的确定性计数；
+- structured factorized meta-action serialization / assistant masking / strict parser（结构化因子化元动作序列化 / 助手掩码 / 严格解析器）与 `predicted_waypoints [B,6,2]`；
+- `get_image_features` primary `image_embeds` 的 dynamic `N_i`、stable `2560`、bfloat16、grid / spatial-merge token count 与 frame alignment；
+- decision adapter 不接受 GT action、future trajectory、GT geometry 或 legacy six-class parser output 作为正式 inference conditioning；
+- masked SmoothL1 / Huber 只使用 `trajectory_valid_mask`，且 action-centric SFT 与 waypoint regression 的监督边界分离；
+- `invalid prediction rate` 对 structured parser、NaN / Inf、shape（形状）、有效点数量、mask（掩码）、坐标反归一化和 verifier projection（验证器投影）失败的确定性计数；
 - normalization 只由 train 生成；
 - checkpoint save/load 与 deterministic small fixture；
-- Stage A / Stage B（阶段 A / 阶段 B）conditioning path（条件化路径）分离；
+- predicted-decision conditioning 与明确标记的 GT-action diagnostic path（真值动作诊断路径）分离；
 - trajectory-to-action verifier（轨迹到动作验证器）的输入、输出和八类 synthetic case（合成案例）；
-- legacy compatibility head（旧版兼容头）默认关闭且不替代因子化动作头；
+- legacy parser / prompt 保持历史兼容但不进入 Phase 0.4 接口，optional classifier heads 默认关闭且不替代 semantic decision branch；
 - test split guard。
 
 真实数据 smoke test（冒烟测试）只用 train / validation（训练集 / 验证集），覆盖 factorized / temporal record（因子化 / 时序记录）→ batch（批次）→ forward（前向传播）→ conditioning（条件化）→ loss（损失）→ action / waypoint prediction（动作 / 轨迹点预测）→ verifier（验证器）→ metrics（指标）→ persistence（持久化）全链路。人工审核查看历史图像排列、当前帧、GT / predicted factorized actions（真值 / 预测因子化动作）、GT / predicted trajectory（真值 / 预测轨迹）与 consistency reason（一致性原因），覆盖已规定的四类纵向、三类横向、典型组合、边界和无效轨迹。
@@ -1326,40 +1312,41 @@ Phase 0.4 通过条件：
 - factorized target（因子化目标）从同一 frozen future trajectory（冻结未来轨迹）独立派生；逐方向 validity / reason（有效性 / 原因）、`factorized_action_joint_valid`、版本、invalid / uncertain（无效 / 不确定）处理和代表性人工审核通过，且未由 legacy 六分类标签直接映射；
 - temporal dataset（时序数据集）、固定 `[B,6,2]` waypoint（轨迹点）、`[B,6]` mask（掩码）、坐标与时间 contract（协议）完整且审核通过；
 - 模型可稳定训练、保存、加载和推理；
-- longitudinal action head（纵向动作头）输出 logits / probabilities（逻辑值 / 概率）`[B,4]` 与 predicted class（预测类别）`[B]`，lateral action head（横向动作头）输出 logits / probabilities（逻辑值 / 概率）`[B,3]` 与 predicted class（预测类别）`[B]`，waypoint head（轨迹点头）使用模型预测的 soft action embedding（软动作嵌入）输出 `predicted_waypoints [B,6,2]`；
+- Qwen3-VL semantic decision branch 使用经过真实 tokenizer / processor 验证的独立 prompt、assistant masking 与 strict parser，输出 one-step structured longitudinal / lateral meta-action；
+- planning branch 使用冻结的 `get_image_features → per-image image_embeds [N_i,2560]` 接口，decision adapter 使用模型预测的结构化动作条件化 `predicted_waypoints [B,6,2]`；
 - predicted trajectory（预测轨迹）的 current ego frame（当前自车坐标系）、轴方向、单位和 0.5 秒间隔正确；
 - constant-velocity（匀速外推）、ego-history MLP（仅自车历史状态）、direct waypoint（直接轨迹点）与 factorized conditioned VLA（因子化条件视觉-语言-动作模型）完成同协议比较；
 - shuffled-image diagnostic（图像打乱诊断）能够回答视觉是否真实发挥作用，结果无论正负均保留；
 - longitudinal / lateral / joint consistency（纵向 / 横向 / 联合一致性）可由 verifier（验证器）稳定复现并回溯到 sample-level reason（样本级原因）；
 - `invalid prediction rate` 能稳定覆盖张量、轨迹、掩码、反归一化、动作输出与 verifier projection（验证器投影）失败，且不与 Phase 0.3 parser-based invalid-output rate（基于解析器的无效输出率）混用；
-- 正式结论使用 predicted-action-conditioned inference result（预测动作条件化推理结果），不把 GT-action warmup（真值动作预热）冒充推理结果；
+- 正式结论使用 predicted-decision-conditioned inference result（预测决策条件化推理结果），不把 GT-action diagnostic（真值动作诊断）冒充推理结果；
 - 所有结果只来自 train / validation（训练集 / 验证集），没有访问已消费 test（测试集）；
 - model / feature / factorized-action / trajectory / consistency interface（模型 / 特征 / 因子化动作 / 轨迹 / 一致性接口）可供 Phase 0.5—0.8 复用。
 
 如果主模型未超过 constant-velocity baseline（匀速外推基线）或 ego-history MLP baseline（仅自车历史状态基线），不得直接扩大模型或训练预算；先审计坐标、normalization（归一化）、mask（掩码）、factorized target（因子化目标）、视觉 feature（特征）和 conditioning path（条件化路径），并保留负结果。若 shuffled-image diagnostic（图像打乱诊断）几乎不改变结果，必须记录 ego-status shortcut（自车状态捷径）风险，不能宣称视觉规划能力已建立。
 
-若 action conditioning（动作条件化）相对 direct waypoint model（直接轨迹点模型）明显损害 trajectory metrics（轨迹指标），先检查 factorized label（因子化标签）、embedding（嵌入）、Stage A / B（阶段 A / B）差异与 loss balance（损失平衡）；不得退回 legacy six-class head（旧六分类头）冒充最终输出。任何未来独立 evaluation（评估）都必须使用新的 untouched protocol（未访问协议）；本阶段没有访问、恢复或重跑 Phase 0.2d test（阶段 0.2d 测试集）的权限。
+若 decision conditioning（决策条件化）相对 direct waypoint model（直接轨迹点模型）明显损害 trajectory metrics（轨迹指标），先检查 factorized label（因子化标签）、structured parser（结构化解析器）、decision adapter 与 conditioning path（条件化路径）；不得退回 legacy six-class baseline 或 optional classifier heads 冒充最终输出。任何未来独立 evaluation（评估）都必须使用新的 untouched protocol（未访问协议）；本阶段没有访问、恢复或重跑 Phase 0.2d test（阶段 0.2d 测试集）的权限。
 
 #### 10.2.12 阶段学习目标与可交付证据
 
-本阶段可展示：factorized target derivation（因子化目标派生）、时序多模态数据构建、VLM feature extraction（视觉语言模型特征提取）、ego-state fusion（自车状态融合）、differentiable action conditioning（可微动作条件化）、waypoint regression（轨迹点回归）、trajectory verification（轨迹验证）、mask / 坐标处理、最小 baseline（基线）设计和 failure analysis（失败分析）。面试证据重点回答：模型是否超过简单运动学外推、视觉是否比 ego-only（仅自车状态）提供增益、动作条件化是否比直接 waypoint regression（轨迹点回归）更可解释、预测动作与预测轨迹是否一致。
+本阶段可展示：factorized target derivation（因子化目标派生）、时序多模态数据构建、Qwen3-VL semantic decision（语义决策）、稳定 public visual feature extraction（公共视觉特征提取）、ego-state fusion（自车状态融合）、decision adapter（决策适配器）、waypoint regression（轨迹点回归）、trajectory verification（轨迹验证）、mask / 坐标处理、最小 baseline（基线）设计和 failure analysis（失败分析）。面试证据重点回答：为什么区分高层语义决策与低层连续规划、模型是否超过简单运动学外推、视觉是否比 ego-only（仅自车状态）提供增益、预测动作与预测轨迹是否一致。
 
 核心 Demo：
 
 ```text
 historical CAM_FRONT sequence
 + current/past ego state
-→ longitudinal logits/probabilities [B,4]
-→ longitudinal predicted class [B]
-+ lateral logits/probabilities [B,3]
-→ lateral predicted class [B]
-→ predicted soft action embeddings
+ + fixed task prompt
+→ Qwen3-VL structured factorized meta-action
+→ decision adapter conditioning
++ per-frame primary image_embeds [N_i,2560]
++ temporal / ego fusion
 → predicted_waypoints [B,6,2]
 → trajectory-implied actions
 → longitudinal / lateral / joint consistency
 ```
 
-最终主 Demo（演示）默认只展示 Stage B predicted-action-conditioned inference（阶段 B 预测动作条件化推理），并明确动作 embedding（嵌入）来自模型自身预测，正式推理不使用 GT action（真值动作）。Stage A GT-action-conditioned warmup（阶段 A 真值动作条件化预热）结果仍必须保存为 diagnostic artifact（诊断产物），仅在分析 action error propagation（动作误差传播）时与 Stage B 对比展示；不得让主 Demo 暗示正式推理注入真值动作。Demo 同时展示模型真实输入、target（目标）与 offline metadata（离线元数据）的边界，并附带 config（配置）、checkpoint（检查点）和 sample provenance（样本来源）。
+最终主 Demo（演示）默认只展示 predicted-decision-conditioned inference（预测决策条件化推理），并明确 decision conditioning 来自模型自身结构化输出，正式推理不使用 GT action（真值动作）。GT-action-conditioned planner result 若用于分析 action error propagation（动作误差传播），必须保存为单独 diagnostic artifact（诊断产物）；不得让主 Demo 暗示正式推理注入真值动作。Demo 同时展示模型真实输入、target（目标）与 offline metadata（离线元数据）的边界，并附带 config（配置）、checkpoint（检查点）和 sample provenance（样本来源）。
 
 ### 10.3 Phase 0.5：BEV/OCC（鸟瞰图 / 占用表征）几何表示与离线空间评估，以及条件式轻量预测分支
 
@@ -1685,21 +1672,21 @@ Phase 0.5 Core 能通过以下证据证明能力：
 
 ### 10.4 Phase 0.6：factorized-action-conditioned candidate trajectories（因子化动作条件化候选轨迹）+ GT-derived BEV/OCC safety reranking（真值派生鸟瞰图 / 占用表征安全重排序）
 
-> 本阶段把 Phase 0.4 的 factorized action probabilities（因子化动作概率）、共享 driving feature（驾驶特征）、同一个 waypoint head（轨迹点头）与 trajectory-to-action verifier（轨迹到动作验证器）真正贯通到候选生成，再用 Phase 0.5 Core 的 GT-derived geometry（真值派生几何）完成 oracle offline reranking（真值离线重排序）。它是 open-loop（开环）离线评估与选择证据，不是可部署在线安全决策。
+> 本阶段把 Phase 0.4 的 structured factorized meta-action（结构化因子化元动作）、decision adapter（决策适配器）、同一个 waypoint head（轨迹点头）与 trajectory-to-action verifier（轨迹到动作验证器）贯通到候选生成，再用 Phase 0.5 Core 的 GT-derived geometry（真值派生几何）完成 oracle offline reranking（真值离线重排序）。它是 open-loop（开环）离线评估与选择证据，不是可部署在线安全决策。
 
 #### 10.4.1 阶段状态、目标、输入与信息边界
 
 - **阶段状态：** planned（计划中）。
-- **核心目标：** Phase 0.4 action probabilities → top action pairs（高概率动作对）→ action-conditioned candidate trajectories（动作条件化候选轨迹）→ trajectory-to-action verification（轨迹到动作验证）→ GT-derived geometric safety scoring（真值派生几何安全评分）→ offline candidate reranking（离线候选重排序）。
-- **前置条件：** Phase 0.4 的 p_long、p_lat、shared feature h、动作 embedding（嵌入）、waypoint head、verifier、[B,6,2] / [B,6] 坐标时间协议已冻结；Phase 0.5 Core 的对象数值 / 类别 / 有效性 / 运动来源张量、sidecar metadata（边车元数据）、`temporal_occupancy`、grid metadata、valid masks 与 provenance 已通过 Gate（门槛）。
+- **核心目标：** Phase 0.4 structured decision → versioned candidate decisions（版本化候选决策）→ action-conditioned candidate trajectories（动作条件化候选轨迹）→ trajectory-to-action verification（轨迹到动作验证）→ GT-derived geometric safety scoring（真值派生几何安全评分）→ offline candidate reranking（离线候选重排序）。
+- **前置条件：** Phase 0.4 的 structured action protocol、decision adapter、planning representation、waypoint head、verifier、`[B,6,2] / [B,6]` 坐标时间协议已冻结；Phase 0.5 Core 的对象数值 / 类别 / 有效性 / 运动来源张量、sidecar metadata（边车元数据）、`temporal_occupancy`、grid metadata、valid masks 与 provenance 已通过 Gate（门槛）。
 - **核心输出：** 固定候选库、逐候选动作一致性与运动学状态、对象级 / 栅格级风险分项、完整代价、`configured_oracle_reranker` 与 `candidate_set_oracle_ceiling` 各自的 selected trajectory / index / reason（选择轨迹 / 索引 / 原因），以及 sample-level artifact（样本级产物）。
 
 核心链路为：
 
 ~~~text
-p_long [B,4] + p_lat [B,3]
-→ top-3 action pairs
-→ raw soft + 3 hard action-pair + 2 fallback trajectories
+structured factorized meta-action
+→ versioned candidate-decision proposal
+→ primary + 3 candidate-decision + 2 fallback trajectories
 → per-candidate verifier + kinematic validation
 → GT typed temporal-agent tensors / occupancy evaluator
 → decomposed costs
@@ -1708,33 +1695,20 @@ p_long [B,4] + p_lat [B,3]
 
 GT boxes（真值三维框）、GT temporal occupancy（真值时序占用表征）和 future agents（未来交通参与者）只进入 evaluator（评估器），不得进入 action pair selection（动作对选择）、waypoint head、候选生成或 VLA inference（视觉-语言-动作模型推理）。核心结果必须命名为 oracle offline reranking（真值离线重排序），不得命名为 deployable selector（可部署选择器）、online safety policy（在线安全策略）、camera-only safety selection（仅相机安全选择）或 closed-loop safety controller（闭环安全控制器）。
 
-#### 10.4.2 动作组合概率与固定候选张量
+#### 10.4.2 结构化动作候选与固定候选张量
 
-Phase 0.4 输出：
+Phase 0.4 的正式 semantic output（语义输出）是一个经严格解析的 structured factorized meta-action，而不是 `p_long [B,4] / p_lat [B,3]` classifier outputs（分类器输出）。Phase 0.6 若需要多个动作候选，必须在本阶段先冻结独立、可复现的 candidate-decision proposal protocol（候选决策提议协议），并以真实 Phase 0.4 producer output 验证；不得从并不存在的分类头概率推导 `p_pair`，也不得把 optional diagnostic heads（可选诊断头）变成主线依赖。
 
-~~~text
-p_long: [B,4]
-p_lat:  [B,3]
-~~~
-
-动作组合概率定义为：
-
-~~~text
-p_pair(i,j) = p_long(i) * p_lat(j)
-~~~
-
-该公式是 factorized joint distribution assumption（因子化联合分布假设）：在共享表征 `h` 条件下，纵向和横向动作由两个 head（预测头）分解建模，再以边缘概率乘积形成 factorized joint probability（因子化联合概率）。该乘积只用于 candidate proposal（候选提议）和候选排序，不得描述为经过联合概率校准的真实动作概率，也不能证明两个动作维度条件独立。第一版不人为禁止明确可组合的纵向 / 横向动作，最多形成 4 × 3 = 12 个 action pairs（动作对）；对每个样本按 `p_pair` 降序选择 top-3，概率并列时使用冻结的 longitudinal class order（纵向类别顺序）、lateral class order（横向类别顺序）和稳定索引打破平局，保证结果确定且可复现。
-
-动作对 artifact（产物）必须同时保存 `p_long`、`p_lat`、完整 `p_pair`、`pair_rank` 与 `factorization_assumption_version`，使乘积、排序和假设版本可以逐样本复算。如果后续证据显示动作维度存在不可忽略的相关性，可把 joint action head（联合动作头）作为 Optional（可选）研究项，但它不得阻塞当前因子化主线，也不得静默替换两个已冻结动作 head（预测头）。
+候选提议协议如何从 semantic branch 获得三个有效且有序的 alternative decisions（替代决策）当前为 `planned`。它必须固定生成配置、解析规则、去重、排序 / tie-break、无效输出处理和 provenance，并保持只使用 inference-time information（推理时信息）；在该协议通过 Phase 0.6a contract gate 前，不得开始正式候选生成或安全重排序。
 
 固定候选库：
 
 | index | candidate_type | 生成方式 |
 |---:|---|---|
-| 0 | raw_soft_conditioned | 使用完整 p_long / p_lat 的 soft action embedding（软动作嵌入）得到 Phase 0.4 原始轨迹 |
-| 1 | top1_hard_action_pair | top-1 动作对的纵向 / 横向 one-hot embedding（独热嵌入） |
-| 2 | top2_hard_action_pair | top-2 动作对的纵向 / 横向 one-hot embedding |
-| 3 | top3_hard_action_pair | top-3 动作对的纵向 / 横向 one-hot embedding |
+| 0 | primary_decision_conditioned | 使用 Phase 0.4 主 structured decision 经同一 decision adapter 得到原始轨迹 |
+| 1 | candidate_decision_1 | 第 1 个版本化候选动作对经同一 decision adapter 条件化 |
+| 2 | candidate_decision_2 | 第 2 个版本化候选动作对经同一 decision adapter 条件化 |
+| 3 | candidate_decision_3 | 第 3 个版本化候选动作对经同一 decision adapter 条件化 |
 | 4 | controlled_braking_fallback | 受控制动回退 |
 | 5 | stationary_fallback | 停车回退 |
 
@@ -1751,17 +1725,17 @@ candidate_valid_masks:  [B,6,6]
 
 #### 10.4.3 动作条件化候选生成、fallback 与 metadata
 
-Top-3 hard action-pair candidates（硬动作对候选）必须复用同一个 Phase 0.4 waypoint head：
+三个 candidate-decision trajectories（候选决策轨迹）必须复用同一个 Phase 0.4 decision adapter 与 waypoint head：
 
 ~~~text
-shared driving feature h
-+ selected longitudinal one-hot embedding
-+ selected lateral one-hot embedding
+temporal visual representation + ego representation
++ selected structured factorized decision
++ same decision adapter
 → same waypoint head
 → [B,6,2]
 ~~~
 
-候选生成不得重新训练另一个 trajectory model（轨迹模型），不得读取 GT action（真值动作）或 GT trajectory（真值轨迹）。每条 hard candidate（硬候选）保存动作对、联合概率、rank（排名）与 conditioning type（条件化类型）。该接口迁移 DriveMA（可验证元动作驾驶视觉-语言-动作模型）的高层动作到轨迹思想，并借鉴 multimodal anchor（多模态锚点）的离散候选概念，但不实现 diffusion model（扩散模型）或论文规模强化学习。
+候选生成不得重新训练另一个 trajectory model（轨迹模型），不得读取 GT action（真值动作）或 GT trajectory（真值轨迹）。每条 candidate-decision trajectory 保存结构化动作对、proposal rank（提议排名）、proposal version（提议版本）与 conditioning type（条件化类型）。该接口迁移 DriveMA（可验证元动作驾驶视觉-语言-动作模型）的高层动作到轨迹思想，并借鉴 multimodal anchor（多模态锚点）的离散候选概念，但不实现 diffusion model（扩散模型）或论文规模强化学习。
 
 确定性 fallback candidates（回退候选）只保留两条：
 
@@ -1777,9 +1751,8 @@ candidate_index
 candidate_type
 longitudinal_action
 lateral_action
-joint_action_probability
-pair_rank
-factorization_assumption_version
+proposal_rank
+candidate_proposal_version
 conditioning_type
 source_model_checkpoint
 source_waypoint_head_version
@@ -1789,14 +1762,14 @@ invalid_reason
 verifier_output
 ~~~
 
-raw_soft_conditioned 额外记录完整 `p_long`、完整 `p_lat`、完整 `p_pair`、top-1 action pair（最高概率动作对）和 raw trajectory source（原始轨迹来源）。Fallback 候选额外记录 fallback parameters（回退参数）、source raw trajectory（来源原始轨迹）、braking profile（制动曲线）与 fallback severity（回退程度）。所有候选保存 sample_token、split、model / config SHA、coordinate / time version 和 candidate provenance（候选来源追溯）。
+`primary_decision_conditioned` 额外记录 semantic branch 的 parsed structured decision、parser / generation version 和 raw trajectory source（原始轨迹来源）。Fallback 候选额外记录 fallback parameters（回退参数）、source raw trajectory（来源原始轨迹）、braking profile（制动曲线）与 fallback severity（回退程度）。所有候选保存 sample_token、split、model / config SHA、coordinate / time version 和 candidate provenance（候选来源追溯）。
 
 #### 10.4.4 每候选 verifier 与运动学检查
 
 六条候选必须分别运行 Phase 0.4 trajectory-to-action verifier（轨迹到动作验证器）：
 
-- hard action-pair candidate（硬动作对候选）：比较 conditioning action pair（条件化动作对）与 trajectory-implied action pair（轨迹隐含动作对）；
-- raw soft candidate（原始软动作候选）：比较模型 top-1 action pair 与轨迹隐含动作对；
+- candidate-decision trajectory（候选决策轨迹）：比较 conditioning action pair（条件化动作对）与 trajectory-implied action pair（轨迹隐含动作对）；
+- primary decision trajectory（主决策轨迹）：比较 semantic branch 的 primary structured decision 与轨迹隐含动作对；
 - controlled_braking_fallback：显式期望 longitudinal action（纵向动作）为 decelerate / stop；
 - stationary_fallback：显式期望 longitudinal action 为 stop。
 
@@ -1876,7 +1849,7 @@ Object backend（对象后端）与 raster backend（栅格后端）必须使用
 每个候选必须单独持久化：
 
 ~~~text
-J_action_confidence
+J_decision_proposal
 J_consistency
 J_risk
 J_progress
@@ -1886,20 +1859,20 @@ J_fallback
 
 语义为：
 
-- J_action_confidence：动作组合概率不足的代价；raw soft candidate 使用模型概率摘要，fallback 使用显式非模型来源标识。
+- J_decision_proposal：候选决策的版本化 proposal rank / validity 代价；fallback 使用显式非模型来源标识，不伪造分类概率。
 - J_consistency：conditioning / expected action pair（条件化 / 期望动作对）与 trajectory-implied action（轨迹隐含动作）不一致的代价。
 - J_risk：collision、near-miss、clearance（净空距离）、time to conflict / TTC 和 VRU 风险。
 - J_progress：终点前进不足、相对 raw trajectory 的进度损失与 unnecessary stop（不必要停车）。
 - J_comfort：速度、加速度、jerk 和曲率异常。
 - J_fallback：对受控制动和停车回退的有序惩罚，stationary 不得零代价。
 
-unnecessary_stop（不必要停车）定义为：selector（选择器）选中最终停车的 stationary_fallback，或选中导致停车的 controlled_braking_fallback，但同一样本的 raw_soft_conditioned 候选在 oracle object / raster geometry（真值对象 / 栅格几何）下没有超过冻结的 collision / near-miss（碰撞 / 近失）阈值。停车速度、持续时间、净空与冲突阈值只用 validation（验证集）冻结；oracle geometry 不可用时标为 unavailable（不可用），不能推断为 false。该定义只用于离线审计，不得在推理路径读取真值。
+unnecessary_stop（不必要停车）定义为：selector（选择器）选中最终停车的 stationary_fallback，或选中导致停车的 controlled_braking_fallback，但同一样本的 `primary_decision_conditioned` 候选在 oracle object / raster geometry（真值对象 / 栅格几何）下没有超过冻结的 collision / near-miss（碰撞 / 近失）阈值。停车速度、持续时间、净空与冲突阈值只用 validation（验证集）冻结；oracle geometry 不可用时标为 unavailable（不可用），不能推断为 false。该定义只用于离线审计，不得在推理路径读取真值。
 
 总成本固定为：
 
 ~~~text
 J_total
-= w_action      * J_action_confidence
+= w_proposal    * J_decision_proposal
 + w_consistency * J_consistency
 + w_risk        * J_risk
 + w_progress    * J_progress
@@ -1930,7 +1903,7 @@ current ego state
 
 核心只比较：
 
-1. `raw_soft_conditioned`：模型原始软动作条件化轨迹；
+1. `primary_decision_conditioned`：模型主 structured decision 条件化轨迹；
 2. `configured_oracle_reranker`：使用正式冻结的 `J_total`、权重和 selector（选择器）得到的真值离线重排序结果；
 3. `candidate_set_oracle_ceiling`：仅用于判断固定候选库是否包含更好轨迹的候选库真值上限。
 
@@ -1965,19 +1938,19 @@ FDE@1s / 2s / 3s
 
 #### 10.4.10 详细实施子步骤
 
-##### Phase 0.6a：candidate contract and top action-pair generation（候选协议与高概率动作对生成）
+##### Phase 0.6a：candidate-decision proposal contract（候选决策提议协议）
 
-- **输入 / 输出：** 输入 p_long [B,4]、p_lat [B,3]、类别顺序与模型版本；输出 12 个 `p_pair`、确定性 top-3 动作对，以及带 `p_long / p_lat / p_pair / pair_rank / factorization_assumption_version` 的候选 metadata（元数据）骨架。
-- **实现 / 复用：** 复用 Phase 0.4 动作 head（预测头）输出和版本化类别 schema（模式），按因子化联合分布假设实现乘积、排序、tie-break（平局处理）与概率有限值检查。
-- **禁止 / 失败：** 不读取 GT action / trajectory；概率 shape、归一化或有限值错误时 fail closed，不生成伪候选。
-- **测试 / artifact / 面试证据：** 测试乘积、排序、并列概率、批次确定性和假设版本往返读取；保存 pair table（动作对表）、top-3 receipt（回执）和来源版本，证明因子化动作组合、建模假设边界与确定性接口设计。
+- **输入 / 输出：** 输入 Phase 0.4 semantic branch 的真实 structured decision output、冻结的生成 / 解析配置与模型版本；输出 primary decision、三个有效且有序的 alternative decisions，以及带 proposal rank / version / provenance 的候选 metadata（元数据）骨架。
+- **实现 / 复用：** 先用真实 producer output 冻结生成、严格解析、去重、排序、tie-break（平局处理）和无效输出规则；具体 proposal 方法当前为 `planned`，不得在 Phase 0.3e-2 猜测。
+- **禁止 / 失败：** 不读取 GT action / trajectory，不依赖 optional classifier heads；结构化输出无效、重复或不足时 fail closed，不生成无来源候选。
+- **测试 / artifact / 面试证据：** 测试解析、去重、排序、并列处理、批次确定性和 proposal version 往返读取；保存 candidate-decision table（候选决策表）、proposal receipt（回执）和来源版本，证明候选提议接口可复算。
 
 ##### Phase 0.6b：action-conditioned candidate trajectories（动作条件化候选轨迹）
 
-- **输入 / 输出：** 输入 shared feature h、p_long / p_lat、top-3 one-hot embeddings（独热嵌入）和同一 waypoint head；输出 raw + 3 hard candidates（硬候选）以及两个 fallback，总张量 [B,6,6,2]。
-- **实现 / 复用：** 复用 Phase 0.4 soft / hard conditioning（软 / 硬条件化）和 waypoint head；fallback 使用版本化确定性生成器。
+- **输入 / 输出：** 输入 Phase 0.4 temporal visual / ego representations、primary + 3 structured candidate decisions、同一 decision adapter 与 waypoint head；输出 primary + 3 candidate-decision trajectories 以及两个 fallback，总张量 `[B,6,6,2]`。
+- **实现 / 复用：** 复用 Phase 0.4 decision conditioning 和 waypoint head；fallback 使用版本化确定性生成器。
 - **禁止 / 失败：** 不训练第二个轨迹模型，不读 GT action / trajectory；head 或 fallback 输出异常时只将对应候选标为 invalid（无效）。
-- **测试 / artifact / 面试证据：** 测试六候选顺序、shape、时间坐标、hard embedding 和 fallback 单调制动；保存 candidate bank、生成参数和 checkpoint provenance，证明同一多模态表征可生成动作可控轨迹。
+- **测试 / artifact / 面试证据：** 测试六候选顺序、shape、时间坐标、decision adapter 输入对齐和 fallback 单调制动；保存 candidate bank、生成参数和 checkpoint provenance，证明同一多模态表征可生成动作可控轨迹。
 
 ##### Phase 0.6c：candidate verification and kinematic validation（候选一致性验证与运动学检查）
 
@@ -2002,7 +1975,7 @@ FDE@1s / 2s / 3s
 
 ##### Phase 0.6f：minimal comparison, visualization and interface freeze（最小比较、可视化与接口冻结）
 
-- **输入 / 输出：** 输入 `raw_soft_conditioned`、`configured_oracle_reranker`、`candidate_set_oracle_ceiling` 和全部 sample-level artifacts（样本级产物）；输出最小指标表、代表性可视化、failure cases（失败案例）与 Phase 0.7 handoff（交接）。
+- **输入 / 输出：** 输入 `primary_decision_conditioned`、`configured_oracle_reranker`、`candidate_set_oracle_ceiling` 和全部 sample-level artifacts（样本级产物）；输出最小指标表、代表性可视化、failure cases（失败案例）与 Phase 0.7 handoff（交接）。
 - **实现 / 复用：** 只用 train / validation 完成三组比较，若增强成功再可选增加 predicted-geometry 组。
 - **禁止 / 失败：** 不访问已消费 test，不把 oracle 结果写成在线能力；若风险改善主要来自 stationary，则 Gate 失败。
 - **测试 / artifact / 面试证据：** 核对指标重算、serialization round-trip（序列化往返）、provenance 和 consumer intake；展示完整候选、分项和选择原因，证明端到端可审计重排序。
@@ -2014,8 +1987,8 @@ FDE@1s / 2s / 3s
 真实数据 smoke（冒烟验证）只用 train / validation，必须走通：
 
 ~~~text
-Phase 0.4 probabilities + h
-→ top-3 pairs
+Phase 0.4 structured decision + planning representations
+→ versioned candidate-decision proposal
 → six candidates
 → verifier + kinematic validation
 → Phase 0.5 Core object/raster geometry
@@ -2030,8 +2003,8 @@ Phase 0.4 probabilities + h
 
 Phase 0.6 Core 通过条件：
 
-- p_long × p_lat 的组合概率正确，top-3 动作对选择确定且可复现；
-- 同一个 Phase 0.4 waypoint head 能生成三条 hard action-pair candidates；
+- candidate-decision proposal contract 已由真实 structured output 冻结，三个替代动作对的生成、解析、去重、排序与失败语义确定且可复现；
+- 同一个 Phase 0.4 decision adapter 与 waypoint head 能生成三条 candidate-decision trajectories；
 - 候选库固定为 candidate_trajectories [B,6,6,2] 与 candidate_valid_masks [B,6,6]；
 - 六条候选都有完整 metadata，分别通过 verifier 或留下明确 invalid_reason；
 - 两条 fallback 通过基础运动学检查，且 stationary 有 progress / unnecessary-stop penalty；
@@ -2047,7 +2020,7 @@ Predicted occupancy scorer（预测占用评分器）不得成为 Core Gate。
 
 失败分支：
 
-- **动作概率或 hard conditioning 错误：** 停止候选生成，回到 Phase 0.4 输出 / embedding / head 合同。
+- **候选决策或 decision conditioning 错误：** 停止候选生成，回到 Phase 0.4 structured output / adapter / waypoint 合同。
 - **候选大面积无效：** 审计坐标、mask、反归一化、fallback 参数与运动学规则，不降低检查门槛。
 - **Object / raster 分歧：** 回到 Phase 0.5 的 transform、raster、margin 和时间合同，解释前不得通过 Gate。
 - **Always-stop 选择：** 判定 cost / candidate bank 失败，重新审核 progress、fallback 和 risk scale，不宣称安全提升。
@@ -2060,7 +2033,7 @@ Predicted occupancy scorer（预测占用评分器）不得成为 Core Gate。
 Phase 0.6 为 Phase 0.7 冻结：
 
 ~~~text
-raw_soft_conditioned trajectory + mask
+primary_decision_conditioned trajectory + mask
 candidate_trajectories [B,6,6,2]
 candidate_valid_masks [B,6,6]
 candidate metadata and verifier outputs
@@ -2080,9 +2053,9 @@ Phase 0.7 可以复用候选、轨迹、mask（掩码）、planning adapter（�
 
 ~~~text
 historical CAM_FRONT + ego state
-→ longitudinal / lateral probabilities
-→ top-3 action pairs
-→ raw + 3 action-conditioned + 2 fallback trajectories
+→ primary structured longitudinal / lateral decision
+→ versioned candidate-decision proposal
+→ primary + 3 candidate-decision + 2 fallback trajectories
 → per-candidate action consistency
 → GT-derived temporal occupancy
 → per-candidate risk / progress / comfort costs
@@ -2095,8 +2068,8 @@ historical CAM_FRONT + ego state
 
 面试能力通过以下证据证明：
 
-- **分层动作规划：** p_pair 表、top-3 deterministic test（确定性测试）和 hard-conditioned candidate artifact（硬条件候选产物）证明 factorized action probability（因子化动作概率）、动作对生成与动作条件化轨迹。
-- **多模态轨迹建模：** Qwen3-VL（通义千问第三代视觉语言模型）feature provenance（特征追溯）、soft / hard embedding 对照和同一 waypoint head 的六候选图证明共享多模态表征可控生成。
+- **分层动作规划：** structured decision artifact、candidate proposal deterministic test（确定性测试）和 decision-conditioned candidate artifact（决策条件化候选产物）证明高层动作生成、候选提议与动作条件化轨迹。
+- **多模态轨迹建模：** Qwen3-VL（通义千问第三代视觉语言模型）feature provenance（特征追溯）、decision adapter 对齐证据和同一 waypoint head 的六候选图证明共享多模态表征可控生成。
 - **几何安全评估：** ego-footprint tests（自车轮廓测试）、object / raster collision tables（对象 / 栅格碰撞表）、clearance / TTC 图和分歧可视化证明几何评估。
 - **系统设计：** candidate contract、verifier、scorer、selector、version / SHA 和 consumer intake receipt（消费者接入回执）证明模块协议与 provenance。
 - **安全与性能权衡：** raw / reranked collision、progress loss、comfort、unnecessary stop、fallback rate 与代表性失败案例共同证明，不能只展示碰撞下降。
@@ -2109,7 +2082,7 @@ historical CAM_FRONT + ego state
 
 - **阶段状态：** `planned`（计划中）。
 - **阶段目的：** 在连续日志锚点上运行 Phase 0.4 raw policy（原始策略），复用 Phase 0.6 candidate interface（候选接口），用相邻锚点重叠预测检查时序稳定性，并冻结 trajectory-native planning interface（轨迹原生规划接口）。
-- **前置条件：** Phase 0.4 checkpoint（检查点）、动作概率、`predicted_waypoints [B,6,2]`、mask（掩码）和 verifier（验证器）接口已冻结；Phase 0.6 的 `[B,6,6,2]` 候选、fallback（回退）、metadata（元数据）与逐锚点 oracle offline evidence（真值离线证据）已冻结。Predicted occupancy（预测占用表征）与 predicted-geometry selector（预测几何选择器）不是 Core 前置条件。
+- **前置条件：** Phase 0.4 checkpoint（检查点）、structured decision、decision adapter、`predicted_waypoints [B,6,2]`、mask（掩码）和 verifier（验证器）接口已冻结；Phase 0.6 的 `[B,6,6,2]` 候选、fallback（回退）、metadata（元数据）与逐锚点 oracle offline evidence（真值离线证据）已冻结。Predicted occupancy（预测占用表征）与 predicted-geometry selector（预测几何选择器）不是 Core 前置条件。
 - **核心边界：** 不实现 simulator rollout（仿真滚动）、reactive environment（响应式环境）、online driving evaluation（在线驾驶评估）、PID（比例—积分—微分控制器）、MPC（模型预测控制）、车辆动力学或交通参与者响应，不声称评估了模型动作的交互式因果后果。
 
 核心协议固定为：
@@ -2144,7 +2117,7 @@ optional inference-compatible predicted-geometry selector
 输出合同为：
 
 ~~~text
-per-anchor raw action probabilities
+per-anchor structured longitudinal / lateral decision
 per-anchor raw trajectory [6,2]
 per-anchor raw trajectory valid mask [6]
 per-anchor candidate bank [6,6,2]
@@ -2215,8 +2188,8 @@ Core 不实现 PID、MPC、steering / throttle / brake（转向角 / 油门 / �
 longitudinal action switch rate
 lateral action switch rate
 joint action switch rate
-probability distribution drift
-top-1 / top-3 action-pair churn
+structured decision invalid / churn rate
+candidate-decision churn
 raw candidate retention rate
 optional selected-candidate churn
 adapter fallback rate
@@ -2226,7 +2199,7 @@ optional selected fallback burst length
 invalid prediction burst length
 ~~~
 
-Probability distribution drift（概率分布漂移）必须分别基于 `p_long`、`p_lat` 和版本化距离定义计算；action-pair churn（动作对变动）使用同一 `factorization_assumption_version` 与稳定 tie-break（平局处理）。Raw candidate retention rate（原始候选保留率）描述相邻锚点的 raw / top-pair 身份是否保持，不表示轨迹几何完全一致。Adapter fallback（适配器回退）只统计无效 raw trajectory 或 planning-interface input 触发的冻结接口级回退；只有 optional inference-compatible selected policy（可选推理兼容选择策略）启用时，selected fallback（选择器回退）才统计 selector（选择器）选中 `controlled_braking_fallback` 或 `stationary_fallback` 的比例与连续长度。候选库中存在两类 fallback candidate（回退候选）不会自动计入任何回退率。两类 Burst（连续触发段）都按同一 scene 内连续锚点定义，跨 scene 必须重置。
+Structured decision churn（结构化决策变动）必须分别统计 longitudinal / lateral value 的变化，并绑定同一 parser、generation 与 candidate proposal version；Phase 0.4 主接口不要求 `p_long / p_lat` 概率漂移。Raw candidate retention rate（原始候选保留率）描述相邻锚点的 primary / candidate-decision 身份是否保持，不表示轨迹几何完全一致。Adapter fallback（适配器回退）只统计无效 raw trajectory 或 planning-interface input 触发的冻结接口级回退；只有 optional inference-compatible selected policy（可选推理兼容选择策略）启用时，selected fallback（选择器回退）才统计 selector（选择器）选中 `controlled_braking_fallback` 或 `stationary_fallback` 的比例与连续长度。候选库中存在两类 fallback candidate（回退候选）不会自动计入任何回退率。两类 Burst（连续触发段）都按同一 scene 内连续锚点定义，跨 scene 必须重置。
 
 正常交通变化可能导致合理动作切换，因此这些指标不能简单解释为越低越好。失败分析应结合图像、ego state（自车状态）、GT future trajectory（真值未来轨迹）和 evaluator-only geometry（仅评估器几何）进行少量人工核验；GT 信息只用于解释，不能回流到模型或推理选择器。重点识别没有明显环境变化却频繁切换、左右振荡、加减速振荡、重复 fallback（回退）和 invalid burst（无效连续段）。
 
@@ -2309,7 +2282,7 @@ E_latency
 - 轨迹跨锚点突然跳变；
 - planning adapter（规划适配器）连续失败或 latency spike（延迟尖峰）。
 
-每种模式必须有确定性检测规则、sample / scene-level evidence（样本 / 场景级证据）、稳定 failure label（失败标签）和代表性可视化。由于 Core 没有交互式 reward optimization（奖励优化），本节不得称 reward hacking（奖励投机）；发现退化时应审计输入变化、动作概率、候选、mask（掩码）、坐标变换、fallback 原因和 checkpoint（检查点），保留原始失败结果并明确是否阻塞 Gate（门槛）。
+每种模式必须有确定性检测规则、sample / scene-level evidence（样本 / 场景级证据）、稳定 failure label（失败标签）和代表性可视化。由于 Core 没有交互式 reward optimization（奖励优化），本节不得称 reward hacking（奖励投机）；发现退化时应审计输入变化、structured decision、候选、mask（掩码）、坐标变换、fallback 原因和 checkpoint（检查点），保留原始失败结果并明确是否阻塞 Gate（门槛）。
 
 #### 10.5.10 详细子阶段
 
@@ -2329,8 +2302,8 @@ E_latency
 
 ##### Phase 0.7c：raw policy sequential inference（原始策略序列推理）
 
-- **输入 / 输出：** 输入有序日志 observation（观测）、Phase 0.4 checkpoint（检查点）和同一 history policy；输出逐 anchor 的 `p_long / p_lat`、raw trajectory / mask、六候选、verifier（验证器）、invalid prediction（无效预测）、adapter fallback（适配器回退）和 latency（延迟）记录。
-- **复用 / 禁止：** 复用 Phase 0.4 正式 Stage B inference（阶段 B 推理）和 Phase 0.6 candidate generator（候选生成器）；禁止 GT action、GT future trajectory、GT geometry 或 oracle selected index（真值选择索引）进入推理。
+- **输入 / 输出：** 输入有序日志 observation（观测）、Phase 0.4 checkpoint（检查点）和同一 history policy；输出逐 anchor 的 parsed structured decision、raw trajectory / mask、六候选、verifier（验证器）、invalid prediction（无效预测）、adapter fallback（适配器回退）和 latency（延迟）记录。
+- **复用 / 禁止：** 复用 Phase 0.4 正式 predicted-decision-conditioned inference（预测决策条件化推理）和 Phase 0.6 candidate generator（候选生成器）；禁止 GT action、GT future trajectory、GT geometry 或 oracle selected index（真值选择索引）进入推理。
 - **失败 / 测试：** 单锚点失败不得被静默删除，应记录后继续同 scene 的下一可用日志锚点；测试 batch / single-sample equivalence（批次 / 单样本等价性）、determinism（确定性）和模型状态不跨 scene 污染。
 - **Artifact / 面试证据：** 保存逐锚点预测、候选和耗时表，证明多模态策略在连续记录上的可靠调用。
 
@@ -2548,9 +2521,9 @@ L_pref
   )
 ~~~
 
-第一版只训练 candidate preference head（候选偏好头）和必要的轻量 candidate feature projector（候选特征投影器），冻结 Qwen3-VL（通义千问第三代视觉语言模型）大部分参数、Phase 0.4 waypoint head（轨迹点头）、factorized action heads（因子化动作头）和 candidate generator（候选生成器）。只有偏好头在 validation 上稳定后，才允许 optional（可选）地解冻少量 LoRA（低秩适配）或以小学习率联合调整 action heads（动作头）；不得直接全参数微调，也不得让 `L_pref` 通过不受控梯度破坏冻结的 waypoint、动作空间和坐标协议。
+第一版只训练 candidate preference head（候选偏好头）和必要的轻量 candidate feature projector（候选特征投影器），冻结 Qwen3-VL（通义千问第三代视觉语言模型）大部分参数、Phase 0.4 semantic decision branch（语义决策分支）、decision adapter、waypoint head（轨迹点头）和 candidate generator（候选生成器）。只有偏好头在 validation 上稳定后，才允许 optional（可选）地解冻少量 LoRA（低秩适配）；不得直接全参数微调，也不得让 `L_pref` 通过不受控梯度破坏冻结的 structured action、waypoint 和坐标协议。
 
-当前模型输出是 factorized action heads（因子化动作头）和 continuous waypoint head（连续轨迹点头），不是具有清晰 sequence log-probability（序列对数概率）的离散语言 token policy（离散语言 token 策略）。因此第一版不直接使用标准 DPO 或 GRPO（组相对策略优化）：直接套用语言模型目标会使 action / trajectory likelihood（动作 / 轨迹似然）定义不清，而没有交互环境也不能据此声称在线强化学习。未来只有把动作或轨迹转成明确定义 log-probability（对数概率）的离散 token policy 后，才把 DPO 作为 Optional（可选）研究。
+Phase 0.4b 会让 semantic branch 生成离散 structured action tokens，但 continuous waypoint head（连续轨迹点头）与候选轨迹仍没有统一、已验证的 sequence log-probability（序列对数概率）定义。因此第一版不直接使用标准 DPO 或 GRPO（组相对策略优化）：直接套用语言模型目标不能定义完整 trajectory policy likelihood（轨迹策略似然），而没有交互环境也不能据此声称在线强化学习。DPO / GRPO 继续只作为后续 Optional / Stretch（可选 / 扩展），必须先单独冻结优化对象、概率与 reward contract（奖励协议）。
 
 #### 10.6.5 数据流程、训练步骤与 artifact
 
@@ -2558,7 +2531,7 @@ L_pref
 2. 仅在 train split 使用单一冻结 `preference_rule_version` 构造、过滤并版本化 preference pairs；validation 不参与偏好标签生成。
 3. 从候选轨迹和模型可用信息构造 candidate features（候选特征），运行 GT-isolation tests（真值隔离测试）。
 4. 训练偏好头与轻量 projector（投影器），保存 pairwise training curves（成对训练曲线）、trainable parameter report（可训练参数报告）和 checkpoint provenance（检查点来源）。
-5. 在 validation 上比较 raw、`top1_hard_action_pair` 与 learned preference selection（学习式偏好选择），同时把 oracle reranker 与 candidate ceiling（候选上限）保留为离线参考。
+5. 在 validation 上比较 `primary_decision_conditioned`、`candidate_decision_1` 与 learned preference selection（学习式偏好选择），同时把 oracle reranker 与 candidate ceiling（候选上限）保留为离线参考。
 6. 在 Phase 0.7 相同 logged sequential protocol（日志序列协议）上评估 learned selector（学习式选择器）的时间一致性、fallback（回退）与 invalid（无效）行为。
 
 Artifact（产物）至少包括 preference manifest / filter summary（偏好清单 / 过滤摘要）、pair sample records（成对样本记录）、feature contract（特征协议）、model / loss config（模型 / 损失配置）、checkpoint SHA-256、sample-level scores / selections（样本级分数 / 选择）、validation metrics（验证指标）、logged sequential metrics（日志序列指标）、failure cases（失败案例）和 negative-result receipt（负结果回执）。派生数据、权重和日志不进入 Git。
@@ -2567,15 +2540,15 @@ Artifact（产物）至少包括 preference manifest / filter summary（偏好�
 
 只比较：
 
-1. raw soft-conditioned trajectory（原始软动作条件化轨迹）；
-2. `top1_hard_action_pair` candidate（最高概率硬动作对候选）；
+1. `primary_decision_conditioned` trajectory（主决策条件化轨迹）；
+2. `candidate_decision_1` trajectory（第一候选决策轨迹）；
 3. learned preference selected candidate（学习式偏好选择候选）；
 4. configured oracle reranker（配置化真值重排序器，仅离线参考）；
 5. candidate-set oracle ceiling（候选库真值上限，仅诊断参考）。
 
-第 2 组直接使用 Phase 0.6 `index=1` 的 `top1_hard_action_pair`：它由最高 `p_pair` 对应的纵向 / 横向 one-hot embedding（独热嵌入）生成，不包含 `raw_soft_conditioned`、`controlled_braking_fallback` 或 `stationary_fallback`。该候选无效时按 invalid candidate（无效候选）计数，不得静默换成其他候选。第 4、5 组不是推理方法。至少报告：pairwise preference accuracy（成对偏好准确率）、learned 与 `top1_hard_action_pair` 的 selected-candidate agreement with oracle（与真值选择一致率）、collision / near-miss rate（碰撞 / 近失率）、minimum clearance（最小净空距离）、progress loss（进度损失）、unnecessary stop rate（不必要停车率）、comfort（舒适性）、fallback rate（回退率）、invalid candidate rate（无效候选率）和 logged sequential temporal consistency（日志序列时间一致性）。指标表和 Demo（演示）必须使用 `top1_hard_action_pair` 全名，并显式展示其无效计数，不使用含糊的 action-confidence（动作置信度）名称。同时报告 preference pair 数量、过滤的模糊 pair 数量、candidate type 分布、train / validation 分离、evaluator version，以及“推理是否使用 GT：否”。
+第 2 组直接使用 Phase 0.6 `index=1` 的 `candidate_decision_1`；它由冻结的 candidate-decision proposal protocol 生成，并通过同一 decision adapter 与 waypoint head 得到，不包含 primary 或两个 fallback。该候选无效时按 invalid candidate（无效候选）计数，不得静默换成其他候选。第 4、5 组不是推理方法。至少报告：pairwise preference accuracy（成对偏好准确率）、learned 与 `candidate_decision_1` 的 selected-candidate agreement with oracle（与真值选择一致率）、collision / near-miss rate（碰撞 / 近失率）、minimum clearance（最小净空距离）、progress loss（进度损失）、unnecessary stop rate（不必要停车率）、comfort（舒适性）、fallback rate（回退率）、invalid candidate rate（无效候选率）和 logged sequential temporal consistency（日志序列时间一致性）。指标表和 Demo（演示）必须使用 `candidate_decision_1` 全名，并显式展示其无效计数，不使用含糊的 action-confidence（动作置信度）名称。同时报告 preference pair 数量、过滤的模糊 pair 数量、candidate type 分布、train / validation 分离、evaluator version，以及“推理是否使用 GT：否”。
 
-自动测试至少覆盖：preference margin / filtering（偏好间隔 / 过滤）、train-only pair generation（仅训练集生成）、`configured_oracle_reranker` 标签来源、`candidate_set_oracle_ceiling` 标签生成拒绝、混用 oracle rule（真值规则）拒绝、`top1_hard_action_pair` 精确索引与无效时不替换、无效候选屏蔽、pair order reversal（偏好对顺序反转）、Bradley–Terry loss 数值、score shape `[B,6]`、checkpoint round-trip（检查点往返）、GT 字段拒绝、all-invalid fail closed（全部无效时失败关闭）、deterministic selection（确定性选择）和 consumed-test guard（已消费测试保护）。不要求大规模超参数搜索、多随机种子、显著性检验、在线 RL、大量 reward shaping（奖励塑形）或论文级 DPO / GRPO 对比。
+自动测试至少覆盖：preference margin / filtering（偏好间隔 / 过滤）、train-only pair generation（仅训练集生成）、`configured_oracle_reranker` 标签来源、`candidate_set_oracle_ceiling` 标签生成拒绝、混用 oracle rule（真值规则）拒绝、`candidate_decision_1` 精确索引与无效时不替换、无效候选屏蔽、pair order reversal（偏好对顺序反转）、Bradley–Terry loss 数值、score shape `[B,6]`、checkpoint round-trip（检查点往返）、GT 字段拒绝、all-invalid fail closed（全部无效时失败关闭）、deterministic selection（确定性选择）和 consumed-test guard（已消费测试保护）。不要求大规模超参数搜索、多随机种子、显著性检验、在线 RL、大量 reward shaping（奖励塑形）或论文级 DPO / GRPO 对比。
 
 #### 10.6.7 Conditional Gate（条件式门槛）与失败分支
 
@@ -2586,7 +2559,7 @@ Phase 0.8 通过条件：
 - preference head 推理不使用 GT，所有候选、分数和选择原因可审计；
 - pairwise accuracy（成对准确率）超过随机参考；
 - learned selector（学习式选择器）不主要依赖 stationary fallback（静止回退）；
-- 相对 raw / `top1_hard_action_pair` baseline（原始 / 最高概率硬动作对基线）的安全改善没有不可接受的 progress、comfort 或 temporal-consistency（进度、舒适性或时间一致性）退化；
+- 相对 `primary_decision_conditioned` / `candidate_decision_1` baseline（主决策 / 第一候选决策基线）的安全改善没有不可接受的 progress、comfort 或 temporal-consistency（进度、舒适性或时间一致性）退化；
 - 负结果与过滤样本均被保留。
 
 如果偏好头没有稳定增益，保留 Phase 0.6 oracle offline evidence（真值离线证据），把 Phase 0.8 标记为 `conditional_failed` 或 `blocked`，不阻塞 Final，不将 oracle selector（真值选择器）冒充 learned selector（学习式选择器），也不通过扩大模型或切换到 RL 掩盖失败。
@@ -2614,7 +2587,7 @@ Final 只汇总已经实现并验证的能力；仍为 planned / conditional / s
 
 **数据和合同验收**至少核对：manifest version（清单版本）、split mapping（切分映射）、coordinate / time contract（坐标 / 时间协议）、factorized action rule（因子化动作规则）、`[B,6,2]` waypoint contract（轨迹点协议）、BEV/OCC evaluator contract（鸟瞰图 / 占用表征评估器协议）、`[B,6,6,2]` candidate contract（候选协议）、temporal-agent tensor + sidecar metadata contract（时序对象张量加边车元数据协议）和 logged sequential protocol（日志序列协议）。验收必须从真实 artifact 读取字段、版本和 SHA，不以文档示例代替 producer output（生产者输出）。
 
-**模型验收**至少核对：Qwen3-VL revision（通义千问第三代视觉语言模型修订版）、processor revision（处理器修订版）、LoRA / trainable parameter report（低秩适配 / 可训练参数报告）、longitudinal / lateral action heads（纵向 / 横向动作头）、meta-action-conditioned waypoint head（元动作条件化轨迹点头）、checkpoint SHA-256、normalization statistics（归一化统计）和 inference config（推理配置）。正式推理必须复现 `p_long [B,4]`、`p_lat [B,3]`、预测类别 `[B] / [B]` 与 `predicted_waypoints [B,6,2]`。
+**模型验收**至少核对：Qwen3-VL revision（通义千问第三代视觉语言模型修订版）、processor revision（处理器修订版）、public planning feature interface、LoRA / trainable parameter report（低秩适配 / 可训练参数报告）、structured action prompt / parser / mask version、decision adapter、action-conditioned waypoint head（动作条件化轨迹点头）、checkpoint SHA-256、normalization statistics（归一化统计）和 inference config（推理配置）。正式推理必须复现一个合法的 structured longitudinal / lateral decision、对应 decision conditioning provenance 与 `predicted_waypoints [B,6,2]`；optional `[B,4] / [B,3]` diagnostic heads 不属于主验收合同。
 
 **评估验收**至少覆盖：Phase 0.3 legacy baseline、Phase 0.4 factorized action + trajectory、Phase 0.5 typed temporal geometry + occupancy（类型明确的时序几何加占用表征）、Phase 0.6 configured reranker + candidate ceiling（配置化重排序器加候选上限）、Phase 0.7 logged sequential stability（日志序列稳定性），以及实际完成时才加入的 optional Phase 0.8 preference learning（可选偏好学习）。每个结果必须能重算到相同样本数、metric version（指标版本）和 sample-level output。
 
@@ -2649,7 +2622,7 @@ fallback-triggering scene
 最终主 Demo 建议使用一个页面或连续界面，固定展示：
 
 - **A. Inputs（输入）：** historical CAM_FRONT（历史前视图像）、current ego state（当前自车状态）、`task_prompt`；
-- **B. Policy outputs（策略输出）：** `p_long`、`p_lat`、top action pairs（高概率动作对）与 raw trajectory（原始轨迹）；
+- **B. Policy outputs（策略输出）：** primary structured longitudinal / lateral decision、版本化 candidate decisions 与 raw trajectory（原始轨迹）；
 - **C. Candidate generation（候选生成）：** raw soft candidate（原始软候选）、top-1 / top-2 / top-3 hard candidates（前三硬动作候选）、controlled braking（受控制动）与 stationary fallback（静止回退）；
 - **D. Verification（验证）：** action-trajectory consistency（动作—轨迹一致性）、kinematic validity（运动学有效性）与 invalid reason（无效原因）；
 - **E. Offline evaluator（离线评估器）：** GT temporal-agent typed contract（真值时序对象类型合同）、GT temporal occupancy（真值时序占用表征）及逐候选 risk / progress / comfort（风险 / 进度 / 舒适性）；
@@ -2714,8 +2687,8 @@ Optional 项目只能在对应主线模块稳定后评估，不得挤占核心 G
 | interactive RL（交互式强化学习） | 完全响应式环境、baseline、rollback（回滚）和 reward / official-metric separation（奖励 / 官方指标分离）通过后 | 当前主线只有离线偏好学习与日志序列评估 |
 | GRPO（组相对策略优化） | 交互环境和可定义策略概率均满足，且 reward-hacking tests（奖励投机测试）通过后 | 当前连续轨迹接口没有足够依据直接使用组相对策略优化 |
 | DPO after trajectory tokenization（轨迹离散化后的直接偏好优化） | 动作或轨迹被转换为具有明确 log-probability（对数概率）的离散 token policy（离散 token 策略）后 | 当前连续 waypoint head（轨迹点头）不能直接套用标准语言模型 DPO |
-| joint action head（联合动作头） | 因子化联合分布假设出现可复现、不可忽略的纵横向相关性误差时 | 当前 `p_long × p_lat` 足以支持确定性候选提议，不阻塞主线 |
-| learned diverse trajectory generator（学习式多样轨迹生成器） | 固定 top-action-pair candidate bank（高概率动作对候选库）仍缺少有效多样性时 | Phase 0.6 核心已用同一 waypoint head 生成动作条件候选；diffusion（扩散）或独立生成模型成本更高 |
+| auxiliary classifier heads（辅助分类头） | structured token output 需要额外可复现的校准或诊断证据时 | 只能用于辅助诊断，不替代 Qwen structured semantic output，也不作为候选提议的默认依赖 |
+| learned diverse trajectory generator（学习式多样轨迹生成器） | 固定 candidate-decision bank（候选决策库）仍缺少有效多样性时 | Phase 0.6 核心计划复用同一 decision adapter 与 waypoint head 生成动作条件候选；diffusion（扩散）或独立生成模型成本更高 |
 | fine-grained maneuver taxonomy | map/route 数据稳定后 | 标注与协议成本高 |
 | predicted current occupancy（预测当前占用表征）与轻量融合 | Phase 0.5 Core 通过且 GPU、标定、依赖、许可证和 checkpoint 可用时 | 条件增强失败不阻塞 GT-derived geometry evaluator（真值派生几何评估器）或 Phase 0.6 Core |
 | temporal six-camera BEV（时序六相机鸟瞰图） | 轻量当前占用预测稳定后 | 核心时序几何来自 GT annotation；多相机时序模型成本更高 |

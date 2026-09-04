@@ -239,9 +239,18 @@ def _rewrite_config(tmp_path: Path, change) -> Path:
 
 
 class FakeTensor:
-    def __init__(self, shape=(1, 4), dtype="torch.int64") -> None:
+    def __init__(
+        self,
+        shape: tuple[int, ...] = (1, 4),
+        dtype: str = "torch.int64",
+        values: list[list[int]] | None = None,
+    ) -> None:
         self.shape = shape
         self.dtype = dtype
+        self.values = values
+
+    def tolist(self) -> list[list[int]] | None:
+        return self.values
 
 
 class FakeBatch(dict):
@@ -251,7 +260,7 @@ class FakeBatch(dict):
                 "input_ids": FakeTensor(),
                 "attention_mask": FakeTensor(),
                 "pixel_values": FakeTensor((8, 1536), "torch.float32"),
-                "image_grid_thw": FakeTensor((1, 3)),
+                "image_grid_thw": FakeTensor((1, 3), values=[[1, 2, 4]]),
             }
         )
         self.device = None

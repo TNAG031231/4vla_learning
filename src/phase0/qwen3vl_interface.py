@@ -1,27 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-
-from src.phase0.qwen3vl_dataset_adapter import VARIANTS
-
 
 PRODUCER_INTERFACE_VERSION = "phase0.3e2-qwen3vl-producer-interface-v0.1"
 FIXED_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 FIXED_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
-PROMPT_VERSION = "phase0.3c-zero-shot-v0.1"
-FIXED_TASK_PROMPT = (
-    "Based only on the provided current observation, predict the ego vehicle's\n"
-    "near-future coarse driving action.\n\n"
-    "Choose exactly one action from:\n\n"
-    "keep\n"
-    "accelerate\n"
-    "decelerate\n"
-    "stop\n"
-    "left_lateral\n"
-    "right_lateral\n\n"
-    "Output exactly the action name and nothing else."
-)
 PROCESSOR_REQUIRED_FIELDS = frozenset(
     ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
 )
@@ -32,6 +16,19 @@ PROCESSOR_DTYPES = {
     "image_grid_thw": "torch.int64",
 }
 PIXEL_VALUES_PATCH_WIDTH = 1536
+PLANNING_FEATURE_INTERFACE_VERSION = (
+    "phase0.3e2-qwen3vl-planning-feature-v0.1"
+)
+PLANNING_FEATURE_EXTRACTION_POLICY = (
+    "Qwen3VLForConditionalGeneration.get_image_features"
+)
+PLANNING_FEATURE_DIM = 2560
+PLANNING_FEATURE_DTYPE = "torch.bfloat16"
+VISION_SPATIAL_MERGE_SIZE = 2
+PLANNING_DYNAMIC_TOKEN_DIMENSION = "N_i"
+PLANNING_FRAME_ALIGNMENT = (
+    "image_embeds[i] corresponds to input image i and image_grid_thw[i]"
+)
 
 
 @dataclass(frozen=True)
@@ -44,30 +41,19 @@ class ProcessorInputMetadata:
     dtypes: Mapping[str, str]
 
 
-def build_multimodal_messages(
-    *,
-    variant: str,
-    image: object,
-    ego_state_text: str | None,
-) -> list[dict[str, object]]:
-    if variant not in VARIANTS:
-        raise ValueError("unsupported input variant")
-    prompt = FIXED_TASK_PROMPT
-    if variant == "image_ego_state":
-        if ego_state_text is None:
-            raise ValueError("image_ego_state input is missing adapter serialization")
-        prompt = f"{ego_state_text}\n\n{prompt}"
-    elif ego_state_text is not None:
-        raise ValueError("image_only input must not contain ego-state text")
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
+@dataclass(frozen=True)
+class PlanningFeatureMetadata:
+    feature_interface_version: str
+    model_id: str
+    model_revision: str
+    processor_revision: str
+    extraction_policy: str
+    per_image_shapes: tuple[tuple[int, int], ...]
+    per_image_token_counts: tuple[int, ...]
+    feature_dtype: str
+    dynamic_token_dimension: str
+    stable_feature_dimension: int
+    frame_alignment: str
 
 
 def _tensor_shape(value: object, field_name: str) -> tuple[int, ...]:
@@ -85,6 +71,37 @@ def _tensor_dtype(value: object, field_name: str) -> str:
     if dtype is None:
         raise ValueError(f"processor {field_name} has no dtype")
     return str(dtype)
+
+
+def _image_grid_rows(image_grid_thw: object) -> tuple[tuple[int, int, int], ...]:
+    shape = _tensor_shape(image_grid_thw, "image_grid_thw")
+    if len(shape) != 2 or shape[1] != 3:
+        raise ValueError("processor image_grid_thw must have shape [images, 3]")
+    tolist = getattr(image_grid_thw, "tolist", None)
+    if not callable(tolist):
+        raise ValueError("processor image_grid_thw must provide tensor values")
+    values = tolist()
+    if not isinstance(values, list):
+        raise ValueError("processor image_grid_thw values must be row-major")
+    rows = tuple(tuple(int(value) for value in row) for row in values)
+    if any(len(row) != 3 or any(value <= 0 for value in row) for row in rows):
+        raise ValueError("processor image_grid_thw values must be positive THW rows")
+    return rows
+
+
+def _visual_patch_counts(image_grid_thw: object) -> tuple[int, ...]:
+    return tuple(
+        temporal * height * width
+        for temporal, height, width in _image_grid_rows(image_grid_thw)
+    )
+
+
+def planning_visual_token_counts(image_grid_thw: object) -> tuple[int, ...]:
+    merge_area = VISION_SPATIAL_MERGE_SIZE**2
+    patch_counts = _visual_patch_counts(image_grid_thw)
+    if any(patch_count % merge_area for patch_count in patch_counts):
+        raise ValueError("image_grid_thw patch count must align to spatial merge")
+    return tuple(patch_count // merge_area for patch_count in patch_counts)
 
 
 def validate_processor_inputs(
@@ -124,6 +141,12 @@ def validate_processor_inputs(
         )
     if image_grid_thw_shape != (expected_image_count, 3):
         raise ValueError("processor image_grid_thw must have shape [images, 3]")
+    if pixel_values_shape[0] != sum(
+        _visual_patch_counts(inputs["image_grid_thw"])
+    ):
+        raise ValueError(
+            "processor pixel_values rows must match image_grid_thw patch count"
+        )
 
     dtypes = {
         field_name: _tensor_dtype(inputs[field_name], field_name)
@@ -147,4 +170,50 @@ def validate_processor_inputs(
             image_grid_thw_shape[1],
         ),
         dtypes=dtypes,
+    )
+
+
+def validate_planning_image_embeds(
+    image_embeds: object,
+    *,
+    image_grid_thw: object,
+) -> PlanningFeatureMetadata:
+    if not isinstance(image_embeds, Sequence):
+        raise ValueError("primary image_embeds must be a per-image sequence")
+    token_counts = planning_visual_token_counts(image_grid_thw)
+    if len(image_embeds) != len(token_counts):
+        raise ValueError("primary image_embeds must align one-to-one with images")
+
+    shapes = tuple(
+        _tensor_shape(image_embed, f"image_embeds[{index}]")
+        for index, image_embed in enumerate(image_embeds)
+    )
+    for shape, token_count in zip(shapes, token_counts, strict=True):
+        if shape != (token_count, PLANNING_FEATURE_DIM):
+            raise ValueError(
+                "primary image_embeds visual token count or feature dimension mismatch"
+            )
+    dtypes = tuple(
+        _tensor_dtype(image_embed, f"image_embeds[{index}]")
+        for index, image_embed in enumerate(image_embeds)
+    )
+    if any(dtype != PLANNING_FEATURE_DTYPE for dtype in dtypes):
+        raise ValueError(
+            f"primary image_embeds dtype must be {PLANNING_FEATURE_DTYPE}"
+        )
+    return PlanningFeatureMetadata(
+        feature_interface_version=PLANNING_FEATURE_INTERFACE_VERSION,
+        model_id=FIXED_MODEL_ID,
+        model_revision=FIXED_REVISION,
+        processor_revision=FIXED_REVISION,
+        extraction_policy=PLANNING_FEATURE_EXTRACTION_POLICY,
+        per_image_shapes=tuple(
+            (shape[0], shape[1])
+            for shape in shapes
+        ),
+        per_image_token_counts=token_counts,
+        feature_dtype=PLANNING_FEATURE_DTYPE,
+        dynamic_token_dimension=PLANNING_DYNAMIC_TOKEN_DIMENSION,
+        stable_feature_dimension=PLANNING_FEATURE_DIM,
+        frame_alignment=PLANNING_FRAME_ALIGNMENT,
     )

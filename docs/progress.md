@@ -3,8 +3,8 @@
 ## Current Phase
 
 - 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `active`。
-- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c、Phase 0.3d 与 Phase 0.3e-1 均为 `completed`；下一子阶段为 Phase 0.3e-2 interface freeze。
-- 当前状态已确认 Qwen3-VL full-validation zero-shot baseline 与 real LoRA smoke training chain 完成；不代表 full-validation LoRA performance、test performance 或最终 VLA model training 已完成。
+- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c、Phase 0.3d 与 Phase 0.3e-1 均为 `completed`；Phase 0.3e-2 real interface verification 已通过，当前等待 Draft PR #37 人工 review / merge。
+- 当前状态已确认 Qwen3-VL full-validation zero-shot baseline、real LoRA smoke training chain，以及 pinned processor / planning visual feature interface；不代表 full-validation LoRA performance、test performance、full-validation feature extraction 或最终 VLA model training 已完成。
 
 ## Confirmed Milestones
 
@@ -114,7 +114,18 @@ Exact tiny train subset 在训练前后（adapter save 后通过 fresh base/adap
 - Lateral collapse 是当前 zero-shot baseline 最主要的建模短板。Case 07 / 08 的 GT 为 `left_lateral`，Case 09 / 10 的 GT 为 `right_lateral`，两个 input variants 均预测为 `keep`；部分人工审核样本的当前图像包含道路转向、车道几何或路口结构线索，reviewer-only GT future trajectory 也支持对应 lateral action，但模型仍未识别。结合 full-validation prediction distribution，当前现象不能仅由 class imbalance 解释，更合理的工程判断是 baseline 对 lateral intent 的视觉感知与推理能力不足。
 - 12 个冻结 representative samples 已完成 input-faithful review 与 reviewer-only GT trajectory audit。代表样本中的 GT future trajectory 总体支持对应 meta-action，未发现足以说明系统性标签错误或标签污染的证据；该结论仅限本次小规模代表样本审核，不证明 full dataset 的每条标签均无误。当前主要问题更可能来自模型判别能力与输入信息边界，而不是 GT 标签体系失效。
 - Reviewer-only panel 明确标注 `REVIEWER-ONLY GT FUTURE INFORMATION` 与 `NOT AVAILABLE TO MODEL AT INFERENCE`。其中 input-faithful review 用于判断当前 `CAM_FRONT + ego-state` 是否足以支持动作判断；reviewer-only GT audit 只用于核验 GT action 是否受真实 future trajectory 支持，并区分视觉信息不足、模型推理失败与潜在标签问题。Future trajectory / BEV 从未加入 Qwen inference input，也不得被描述为模型推理时可获得的信息。
-- Phase 0.3 overall 继续保持 `active`；Phase 0.3e-2 interface freeze 为下一子阶段。只有完成 interface freeze 并满足 Phase 0.3 Gate 后，才能将 Phase 0.3 标记为 `completed`。
+- 该分析完成时 Phase 0.3 overall 继续保持 `active`，下一子阶段为 Phase 0.3e-2 interface freeze；当前状态已由下节的 real interface verification 结果更新。
+
+### Phase 0.3e-2 Qwen3-VL Real Interface Freeze
+
+- Real verification 状态为 `passed`；使用 `Qwen/Qwen3-VL-4B-Instruct` 与 model / processor revision `ebb281ec70b05090aa6165b016eac8ec08e71b17`，只访问少量 validation adapter record，test access counters 全部为 0。
+- 真实 processor 类型为 `Qwen3VLProcessor`，稳定 required keys 为 `input_ids`、`attention_mask`、`pixel_values` 与 `image_grid_thw`。本次真实样本观察为：`input_ids [1,1413] int64`、`attention_mask [1,1413] int64`、`pixel_values [5600,1536] float32`、`image_grid_thw [1,3] int64`，grid 为 `[[1,56,100]]`。
+- `1413`、`5600` 与下述 `1400` 均只属于该真实 validation CAM_FRONT sample observation，不是全局固定 shape。稳定 processor contract 为 required fields / dtypes、`pixel_values` patch width `1536`、grid 每行 `[T,H,W]`、pixel row count 等于各图像 `T×H×W` 之和，以及 sequence / visual patch axes 保持动态。
+- 真实模型结构为 `Qwen3VLForConditionalGeneration.model` 下的 `visual=Qwen3VLVisionModel` 与 `language_model=Qwen3VLTextModel`；规划分支固定使用 public `Qwen3VLForConditionalGeneration.get_image_features(pixel_values, image_grid_thw)`，不得直接绑定 `model.model.visual(...)` 或私有 ViT block API。
+- 对 grid `[[1,56,100]]` 且 `spatial_merge_size=2` 的真实样本，primary per-image `image_embeds` 为 `[1400,2560]`、dtype `bfloat16`。稳定 planning feature contract 是 per-image `[N_i,2560]`，其中 `N_i=T_i×H_i×W_i/2²` 动态，feature dimension `2560` 稳定，image / frame 顺序与 processor 输入及 `image_grid_thw` 行顺序一致。
+- Native DeepStack 在完整 Qwen3-VL semantic branch 内正常工作；本次观察到 3 个 levels，每个为 `[1400,2560] bfloat16`。这些 DeepStack tensors 不作为 Phase 0.4 temporal planner 的 mandatory public interface，不自行重实现，也不把该单样本 token count 写死。
+- Phase 0.3 legacy six-class prompt、strict parser 与 prediction artifact format 保持不变；Phase 0.4 planning feature interface 已与 legacy prompt / parser 解耦。Phase 0.4 的 structured factorized meta-action serialization、assistant masking、strict parser 与 decision adapter hidden-state shape 仍为 `planned`，必须在对应实现子任务中用真实输出冻结。
+- 本轮未运行 full-validation feature extraction、LoRA training 或 Phase 0.4 training；未访问、恢复或重跑已消费 project test。
 
 ## Active Source Files
 
@@ -201,7 +212,7 @@ source_audit_record
 ## Next Gate
 
 - 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
-- Phase 0.3 overall 保持 `active`；Phase 0.3e-1 failure analysis 已完成，下一子阶段为 Phase 0.3e-2 interface freeze。
-- 只有完成 Phase 0.3e-2 interface freeze 并满足 Phase 0.3 Gate 后，才能将 Phase 0.3 标记为 `completed`。
+- Phase 0.3 overall 保持 `active`，直到 Draft PR #37 完成人工 review / merge；Phase 0.3e-2 real interface verification 已通过，不再存在 real processor / visual-feature verification pending item。
+- PR #37 merge 后执行 Learning & Capability Closeout，再按修正后的 Phase 0.4a 数据合同开始下一独立阶段；不得提前开始 Phase 0.4 training。
 - Phase 0.3 可继续使用 train/validation 进行开发与模型选择，但不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
 - 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
