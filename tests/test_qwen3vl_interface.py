@@ -65,14 +65,21 @@ def _motion() -> dict[str, object]:
 
 
 def _processor_output(
-    *, sequence_length: int, image_grid_thw: torch.Tensor
+    *,
+    sequence_length: int,
+    image_grid_thw: torch.Tensor,
+    batch_size: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    batch_size = image_grid_thw.shape[0]
+    processor_batch_size = (
+        image_grid_thw.shape[0] if batch_size is None else batch_size
+    )
     visual_patches = int(image_grid_thw.prod(dim=1).sum().item())
     return {
-        "input_ids": torch.ones((batch_size, sequence_length), dtype=torch.long),
+        "input_ids": torch.ones(
+            (processor_batch_size, sequence_length), dtype=torch.long
+        ),
         "attention_mask": torch.ones(
-            (batch_size, sequence_length), dtype=torch.long
+            (processor_batch_size, sequence_length), dtype=torch.long
         ),
         "pixel_values": torch.ones(
             (visual_patches, PIXEL_VALUES_PATCH_WIDTH), dtype=torch.float32
@@ -198,6 +205,29 @@ def test_processor_contract_keeps_sequence_and_visual_axes_dynamic(
         "input_ids",
         "pixel_values",
     )
+
+
+def test_processor_contract_keeps_batch_and_image_axes_independent() -> None:
+    grid = torch.tensor(
+        [[1, 2, 2], [1, 4, 2]],
+        dtype=torch.long,
+    )
+    inputs = _processor_output(
+        batch_size=1,
+        sequence_length=12,
+        image_grid_thw=grid,
+    )
+
+    metadata = validate_processor_inputs(
+        inputs,
+        expected_batch_size=1,
+        expected_image_count=2,
+    )
+
+    assert metadata.input_ids_shape == (1, 12)
+    assert metadata.attention_mask_shape == (1, 12)
+    assert metadata.pixel_values_shape == (12, PIXEL_VALUES_PATCH_WIDTH)
+    assert metadata.image_grid_thw_shape == (2, 3)
 
 
 def test_processor_contract_rejects_missing_or_incompatible_fields() -> None:

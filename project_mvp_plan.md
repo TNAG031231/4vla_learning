@@ -139,7 +139,7 @@ right_lateral
 
 ### 2.2 Factorized meta-action（因子化元动作）
 
-最终高层动作空间 `planned`（计划中）为两个可组合的 action head（动作预测头）：
+最终高层动作接口 `planned`（计划中）为 Qwen3-VL semantic decision branch 生成的 one-step structured longitudinal / lateral factorized meta-action（单步结构化纵向 / 横向因子化元动作），其中包含两个可组合字段：
 
 ```text
 longitudinal_action:
@@ -268,7 +268,7 @@ Preference learning（偏好学习）只在候选生成、verifier（验证器�
 | 能力 | 通过什么代码或结果证明 | 当前边界 |
 |---|---|---|
 | 数据工程能力 | 以现有 nuScenes（自动驾驶数据集）解析脚本、`CAM_FRONT` / future trajectory（未来轨迹）/ nearby agents（邻近交通参与者）对齐结果、坐标可视化、scene-level split（场景级切分）、manifest versioning（清单版本管理）及 validator（验证器）结果证明。 | 数据闭环、冻结标签和 manifest（清单）基础已有真实证据；不得把派生数据提交 Git（版本控制系统）。 |
-| 多模态模型能力 | 后续以 Qwen3-VL（通义千问第三代视觉语言模型）数据适配、LoRA（低秩适配）训练记录、multimodal feature fusion（多模态特征融合）张量合同、custom action head（自定义动作预测头）测试及 sample-level prediction（样本级预测）证明。 | 均为 `planned`（计划中）；模型卡或论文结果不能替代本项目运行证据。 |
+| 多模态模型能力 | 后续以 Qwen3-VL（通义千问第三代视觉语言模型）数据适配、action-centric LoRA / SFT（动作中心低秩适配 / 监督微调）训练记录、structured longitudinal / lateral output（结构化纵向 / 横向输出）测试、multimodal feature fusion（多模态特征融合）张量合同及 sample-level prediction（样本级预测）证明。 | 均为 `planned`（计划中）；模型卡或论文结果不能替代本项目运行证据。 |
 | 自动驾驶规划能力 | 后续以 factorized action space（因子化动作空间）分类指标、`[B, 6, 2]` waypoint prediction（轨迹点预测）、ADE（平均位移误差）/ FDE（最终位移误差）、action-conditioned planning（动作条件化规划）可视化和 action-trajectory consistency（动作—轨迹一致性）结果证明。 | 连续轨迹模型为 `planned`（计划中）；当前六类输出只是 legacy coarse action schema（旧版粗粒度动作模式）。 |
 | BEV（鸟瞰图）/ occupancy（占用表征）能力 | 后续以 GT boxes（真值三维框）到 temporal occupancy rasterization（时序占用栅格化）的对象/栅格对照、ego footprint collision checking（自车轮廓碰撞检查）、TTC（碰撞时间）、VRU（弱势道路使用者）距离和条件化 drivable-area evaluation（可行驶区域评估）证明。 | Evaluator（评估器）为 `planned`（计划中）且只做离线几何评估；可行驶区域指标依赖可靠 map contract（地图协议）。 |
 | 系统分析能力 | 以 inference / target / evaluator（推理 / 目标 / 评估器）隔离测试、information leakage prevention（信息泄漏防护）、trajectory-to-action verifier（轨迹到动作验证器）、failure case analysis（失败案例分析）、sample-level provenance（样本级来源追溯）和 safety-performance trade-off（安全性与行驶性能权衡）报告证明。 | 保留少量代表性人工核验与可复现输出，不扩展为论文式大规模统计或复杂消融。 |
@@ -605,7 +605,7 @@ Validation macro-F1 / accuracy 为 `0.615681 / 0.623817`；同协议 Majority Ba
 
 - **阶段状态：** `active`。
 - **阶段目的：** 打通 frozen manifest（冻结清单）→ image/text processor（图像 / 文本处理器）→ Qwen3-VL（通义千问第三代视觉语言模型）→ legacy action parser（旧版动作解析器）→ sample-level prediction（样本级预测）的完整链路。
-- **为什么需要：** 在引入时序、factorized action head（因子化动作预测头）和 waypoint head（轨迹点头）前，先隔离数据加载、模型依赖、`task_prompt` 序列化、generation（生成）和六类输出解析问题，避免把接入错误误判为规划模型错误。
+- **为什么需要：** 在引入时序、Qwen3-VL structured semantic decision（结构化语义决策）、decision adapter（决策适配器）和 waypoint planner（轨迹点规划器）前，先隔离数据加载、模型依赖、`task_prompt` 序列化、generation（生成）和六类输出解析问题，避免把接入错误误判为规划模型错误。
 - **前置条件：** Phase 0.1b trainval manifest 与六类 schema 已冻结；Phase 0.2d 的 consumed-test 边界保持不变；开发只允许 train/validation。
 
 本阶段验证：
@@ -1156,6 +1156,17 @@ trajectory_valid_mask:      [B, 6]
 
 Phase 0.4b 使用 LoRA / parameter-efficient tuning（参数高效微调）训练完整 Qwen3-VL semantic branch 输出结构化纵向 / 横向动作，并保留 native DeepStack。Assistant supervision 只覆盖真实结构化动作 token；serialization、mask 与 parser 必须先通过真实 tokenizer / processor regression，再允许优化。
 
+Action-token supervision（动作 token 监督）必须保持两个方向独立：
+
+| `longitudinal_action_valid` | `lateral_action_valid` | Phase 0.4b supervision |
+|---|---|---|
+| `true` | `false` | 只监督 longitudinal structured token span |
+| `false` | `true` | 只监督 lateral structured token span |
+| `true` | `true` | 监督完整 longitudinal / lateral pair |
+| `false` | `false` | 不计算 action-token supervision |
+
+该表只冻结 supervision semantics（监督语义），不冻结具体 token index、serialization、field delimiter（字段分隔符）或 masking implementation（掩码实现）。这些实现细节必须在 Phase 0.4b 使用真实 Qwen3-VL tokenizer / processor 输出验证后冻结，本阶段不得手写猜测 token boundary（token 边界）。
+
 Phase 0.4c 冻结或按已批准范围复用 semantic branch，使用 primary per-frame `image_embeds`、temporal fusion、ego encoder 与 predicted decision conditioning 训练 waypoint planner。正式实现时在 SmoothL1 / Huber（平滑 L1 / Huber）等价配置中选择并版本化一个方案；`L_trajectory` 只在 `trajectory_valid_mask` 为真处计算。`factorized_action_joint_valid` 决定完整动作对能否作为 action-conditioning 监督或诊断依据，但正式 inference 只能消费模型预测 decision，禁止注入 GT action。
 
 第一版不引入复杂 scheduled sampling（计划采样）、GRPO（组相对策略优化）、不可微 safety loss（安全损失）或复杂 consistency loss（一致性损失）。Action-trajectory consistency（动作—轨迹一致性）首先作为规则化评测指标和 failure signal（失败信号），不进入梯度路径。Verifier（验证器）遵循以下语义：
@@ -1195,7 +1206,7 @@ left / straight / right
 ##### Phase 0.4b：action-centric VLM SFT（动作中心视觉语言模型监督微调）
 
 1. 为 Qwen3-VL semantic decision branch 冻结独立 fixed task prompt 与 one-step structured factorized meta-action serialization。
-2. 使用真实 tokenizer / processor 验证 assistant-only supervision boundary、strict parser、invalid output 与多 token target，再运行 LoRA / parameter-efficient SFT。
+2. 按独立方向有效性合同构造 action-token supervision，并使用真实 tokenizer / processor 验证 assistant-only supervision boundary、strict parser、invalid output 与多 token target，再运行 LoRA / parameter-efficient SFT。
 3. 保留 Qwen3-VL native DeepStack，不把三个 DeepStack levels 拆成 planner 公共输入。
 4. 检查少量 train sample overfit、checkpoint save / load、trainable parameter report 与 validation action metrics；不访问 test。
 
@@ -2622,8 +2633,8 @@ fallback-triggering scene
 最终主 Demo 建议使用一个页面或连续界面，固定展示：
 
 - **A. Inputs（输入）：** historical CAM_FRONT（历史前视图像）、current ego state（当前自车状态）、`task_prompt`；
-- **B. Policy outputs（策略输出）：** primary structured longitudinal / lateral decision、版本化 candidate decisions 与 raw trajectory（原始轨迹）；
-- **C. Candidate generation（候选生成）：** raw soft candidate（原始软候选）、top-1 / top-2 / top-3 hard candidates（前三硬动作候选）、controlled braking（受控制动）与 stationary fallback（静止回退）；
+- **B. Phase 0.4 Policy outputs（阶段 0.4 策略输出）：** primary structured decision（主结构化决策）与 predicted trajectory（预测轨迹）；
+- **C. Phase 0.6 Candidate generation（阶段 0.6 候选生成）：** `primary_decision_conditioned`、`candidate_decision_1`、`candidate_decision_2`、`candidate_decision_3`、`controlled_braking_fallback` 与 `stationary_fallback`；
 - **D. Verification（验证）：** action-trajectory consistency（动作—轨迹一致性）、kinematic validity（运动学有效性）与 invalid reason（无效原因）；
 - **E. Offline evaluator（离线评估器）：** GT temporal-agent typed contract（真值时序对象类型合同）、GT temporal occupancy（真值时序占用表征）及逐候选 risk / progress / comfort（风险 / 进度 / 舒适性）；
 - **F. Selection（选择）：** configured oracle reranker（配置化真值重排序器）、candidate-set oracle ceiling（候选库真值上限）及各自选择原因；
