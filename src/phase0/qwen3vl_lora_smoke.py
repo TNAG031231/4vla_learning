@@ -23,6 +23,7 @@ from src.phase0.qwen3vl_dataset_adapter import (
     sha256_file,
     validate_git_provenance,
 )
+from src.phase0.qwen3vl_interface import validate_processor_inputs
 from src.phase0.qwen3vl_zero_shot import (
     AdapterSample,
     FIXED_GENERATION_KWARGS,
@@ -621,9 +622,11 @@ class Qwen3VLSupervisedCollator:
             return_dict=True,
             return_tensors="pt",
         )
-        required = {"input_ids", "attention_mask", "pixel_values", "image_grid_thw"}
-        if not isinstance(batch, Mapping) or not required.issubset(batch):
-            raise ValueError("processor did not return required multimodal fields")
+        validate_processor_inputs(
+            batch,
+            expected_batch_size=len(samples),
+            expected_image_count=len(samples),
+        )
         input_rows = batch["input_ids"]
         mask_rows = batch["attention_mask"]
         if input_rows.shape != mask_rows.shape or input_rows.shape[0] != len(samples):

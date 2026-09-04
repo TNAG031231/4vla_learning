@@ -147,7 +147,7 @@ class FakeProcessor:
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "pixel_values": torch.ones((len(rows) * 2, 3)),
+            "pixel_values": torch.ones((len(rows) * 2, 1536)),
             "image_grid_thw": torch.ones((len(rows), 3), dtype=torch.long),
             "mm_token_type_ids": attention_mask.clone(),
         }

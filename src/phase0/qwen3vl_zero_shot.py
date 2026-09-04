@@ -28,37 +28,51 @@ from src.phase0.qwen3vl_dataset_adapter import (
     sha256_file,
     validate_git_provenance,
 )
+from src.phase0.qwen3vl_interface import (
+    FIXED_MODEL_ID,
+    FIXED_REVISION,
+    FIXED_TASK_PROMPT,
+    PROMPT_VERSION,
+    VARIANTS,
+    build_multimodal_messages,
+    validate_processor_inputs,
+)
 from src.phase0.qwen3vl_smoke import parse_action_output, resolve_image_path
 
 
 ARTIFACT_VERSION = "zero_shot_smoke_v0_1"
 ARTIFACT_SCHEMA_VERSION = "phase0_3c1_zero_shot_artifact_v0.1"
-PROMPT_VERSION = "phase0.3c-zero-shot-v0.1"
 PARSER_VERSION = "phase0.3a2-strict-legacy-action-v0.1"
 GENERATION_CONFIG_VERSION = "phase0.3a2-deterministic-generation-v0.1"
-FIXED_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
-FIXED_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 ALLOWED_SPLIT = "validation"
-VARIANTS = ("image_only", "image_ego_state")
 FIXED_GENERATION_KWARGS = {
     "do_sample": False,
     "num_beams": 1,
     "max_new_tokens": 16,
 }
-FIXED_TASK_PROMPT = """Based only on the provided current observation, predict the ego vehicle's
-near-future coarse driving action.
-
-Choose exactly one action from:
-
-keep
-accelerate
-decelerate
-stop
-left_lateral
-right_lateral
-
-Output exactly the action name and nothing else."""
 OUTPUT_FILENAMES = ("predictions.jsonl", "metrics.json", "run_receipt.json")
+LEGACY_PREDICTION_FIELDS = frozenset(
+    (
+        "sample_token",
+        "scene_token",
+        "split",
+        "input_variant",
+        "target_action",
+        "raw_output",
+        "parsed_action",
+        "parser_success",
+        "invalid_reason",
+        "is_correct",
+        "model_id",
+        "model_revision",
+        "processor_revision",
+        "prompt_version",
+        "parser_version",
+        "generation_config_version",
+        "adapter_schema_version",
+        "adapter_record_sha256",
+    )
+)
 
 
 class CudaRuntime(Protocol):
@@ -653,22 +667,13 @@ def build_inference_messages(
     image: object,
     config: ZeroShotConfig,
 ) -> list[dict[str, object]]:
-    prompt = config.task_prompt
-    if sample.variant == "image_ego_state":
-        if sample.ego_state_text is None:
-            raise ValueError("image_ego_state sample is missing adapter serialization")
-        prompt = f"{sample.ego_state_text}\n\n{prompt}"
-    elif sample.ego_state_text is not None:
-        raise ValueError("image_only sample must not contain ego-state text")
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
+    if config.task_prompt != FIXED_TASK_PROMPT:
+        raise ValueError("task prompt does not match producer interface")
+    return build_multimodal_messages(
+        variant=sample.variant,
+        image=image,
+        ego_state_text=sample.ego_state_text,
+    )
 
 
 def build_metrics(
@@ -902,27 +907,7 @@ def _receipt_matches_run(
 def _validate_prediction_record(
     record: Mapping[str, object], sample: AdapterSample, config: ZeroShotConfig
 ) -> None:
-    required_fields = {
-        "sample_token",
-        "scene_token",
-        "split",
-        "input_variant",
-        "target_action",
-        "raw_output",
-        "parsed_action",
-        "parser_success",
-        "invalid_reason",
-        "is_correct",
-        "model_id",
-        "model_revision",
-        "processor_revision",
-        "prompt_version",
-        "parser_version",
-        "generation_config_version",
-        "adapter_schema_version",
-        "adapter_record_sha256",
-    }
-    if set(record) != required_fields:
+    if set(record) != LEGACY_PREDICTION_FIELDS:
         raise ValueError("prediction fields mismatch")
     expected = {
         "sample_token": sample.sample_token,
@@ -1160,6 +1145,11 @@ def run_zero_shot(
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
+        )
+        validate_processor_inputs(
+            inputs,
+            expected_batch_size=1,
+            expected_image_count=1,
         )
         input_token_count = _input_token_count(inputs)
         inputs = inputs.to(config.device)
