@@ -765,19 +765,33 @@ image + ego state
 
 ##### Phase 0.3e：failure analysis 与接口冻结
 
-- **状态：** `planned / next`。Phase 0.3 overall 继续保持 `active`，完成本子阶段并满足 Phase 0.3 Gate 后才能更新 overall 状态。
+- **状态：** `active`。Phase 0.3e-1 failure analysis 已完成，Phase 0.3e-2 interface freeze 为下一子阶段；Phase 0.3 overall 继续保持 `active`，只有完成 interface freeze 并满足 Phase 0.3 Gate 后才能更新为 `completed`。
 
-至少分析：
+###### Phase 0.3e-1：Qwen3-VL baseline failure analysis
+
+- **状态：** `completed`。基于冻结的 Phase 0.3c full-validation artifacts，对 `image_only` 与 `image_ego_state` 各 3,594 条 validation predictions 完成 failure analysis；provenance、SHA、split 与 sample alignment 均已核验，未重跑 inference，未访问 test。
+- 两组 baseline 的 parser success rate 均为 `1.0`、invalid output rate 均为 `0.0`，因此 output format 与 parser 不是当前主要 failure source。
+- 单帧 `CAM_FRONT` 难以稳定区分 `keep / accelerate / decelerate`；ego-state 对纵向动作提供了有效补充信息，但代表样本中同时存在 wrong → correct 与 correct → wrong，说明模型确实利用 ego-state，也存在将 speed / acceleration / yaw rate 直接映射到 coarse action 的 shortcut 风险。
+- `left_lateral / right_lateral` collapse 是当前 zero-shot baseline 最主要的 failure mode。代表样本中两类 lateral GT 均持续被两个 variants 预测为 `keep`；reviewer-only GT future trajectory 支持对应标签，部分当前图像也具有道路转向、车道几何或路口结构线索，因此该问题不能仅由 class imbalance 解释，主要反映模型对 lateral intent 的视觉感知与推理不足。
+- 12 个冻结 representative samples 已完成 input-faithful review 与 reviewer-only GT trajectory audit。GT future trajectory 总体支持对应 meta-action，未发现足以说明系统性标签错误或标签污染的证据；该结论只适用于本次小规模代表样本审核，不等于 full dataset label correctness 已被穷尽证明。
+- Reviewer-only panels 明确标注 `REVIEWER-ONLY GT FUTURE INFORMATION` 与 `NOT AVAILABLE TO MODEL AT INFERENCE`。Future trajectory / BEV 仅用于人工诊断与标签一致性核验，从未进入 Qwen inference input；input-faithful review 与 reviewer-only GT audit 的信息边界不得混淆。
+
+Phase 0.3e-1 已分析：
 
 ```text
 visual ambiguity
-class imbalance
-output-format errors
-model ignores ego state
-keep / decelerate confusion
-left / right lateral confusion
+class imbalance and prediction collapse
+output-format errors, ruled out as the primary source
+ego-state use and shortcut risk
+keep / accelerate / decelerate confusion
+left / right lateral collapse
 insufficient image evidence
+representative-label consistency
 ```
+
+###### Phase 0.3e-2：interface freeze
+
+- **状态：** `planned / next`。本子阶段只冻结下列 producer contracts，并完成 Phase 0.3 Gate 核验；不得把 Phase 0.3e-1 的 reviewer-only future information 纳入 inference interface。
 
 最终冻结的主要 producer contract（生产者协议）为：
 
