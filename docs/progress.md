@@ -3,7 +3,7 @@
 ## Current Phase
 
 - 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `active`。
-- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c 与 Phase 0.3d 均为 `completed`；下一子阶段为 Phase 0.3e failure analysis 与接口冻结。
+- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c、Phase 0.3d 与 Phase 0.3e-1 均为 `completed`；下一子阶段为 Phase 0.3e-2 interface freeze。
 - 当前状态已确认 Qwen3-VL full-validation zero-shot baseline 与 real LoRA smoke training chain 完成；不代表 full-validation LoRA performance、test performance 或最终 VLA model training 已完成。
 
 ## Confirmed Milestones
@@ -105,6 +105,17 @@ Exact tiny train subset 在训练前后（adapter save 后通过 fresh base/adap
 - Isolation：`test_files_opened=0`、`test_records_read=0`、`test_images_opened=0`、`test_labels_read=0`、`test_evaluation_performed=false`。
 - 该证据证明 real Qwen3-VL LoRA training chain、真实 loss/backward/optimizer path、adapter checkpoint save/reload 均可运行，且训练后 model behavior 在 exact tiny train subset 上发生变化；不得据此声称 full-validation LoRA performance 已完成、LoRA 已超过 rule baseline、LoRA 泛化能力已证明、test performance 已获得或 final VLA model 已训练完成。
 
+### Phase 0.3e-1 Qwen3-VL Baseline Failure Analysis
+
+- 状态为 `completed`。分析只复用冻结的 Phase 0.3c full-validation artifacts，覆盖 `image_only` 与 `image_ego_state` 各 3,594 条 validation predictions；prediction、metrics 与 receipt 的 provenance、SHA、split 和 sample alignment 均已核验，未重跑 inference，未访问 test。
+- 两组 full-validation baseline 的 parser success rate 均为 `1.0`、invalid output rate 均为 `0.0`，因此 output format、parser 与 action schema 解析不是当前主要 failure source；后续重点应放在语义分类、视觉信息利用、ego-state 融合与 lateral intent 建模。
+- 纵向动作存在明显的单帧视觉歧义：单帧 `CAM_FRONT` 能提供道路结构、障碍物和前车距离等静态线索，但通常不能直接表达当前速度变化趋势，难以稳定区分 `keep / accelerate / decelerate`。这与 Phase 0.3c 中 ego-state 主要改善 `accelerate / decelerate / stop` 的统计 observation 一致，说明 current/past ego-state 为纵向判断提供了有价值的补充信息，但不构成因果证明。
+- Ego-state 确实影响了模型输出：代表样本中 Case 01 / 02 / 04 / 05 由 image-only 错误变为 image + ego-state 正确；Case 06 / 11 / 12 则由 image-only 正确变为加入 ego-state 后错误。该双向变化表明 ego-state 同时具有有效补充信息与 shortcut 风险：模型可能过度依赖 speed、acceleration、yaw rate 到 coarse action 的直接映射，而未充分结合视觉场景。
+- Lateral collapse 是当前 zero-shot baseline 最主要的建模短板。Case 07 / 08 的 GT 为 `left_lateral`，Case 09 / 10 的 GT 为 `right_lateral`，两个 input variants 均预测为 `keep`；部分人工审核样本的当前图像包含道路转向、车道几何或路口结构线索，reviewer-only GT future trajectory 也支持对应 lateral action，但模型仍未识别。结合 full-validation prediction distribution，当前现象不能仅由 class imbalance 解释，更合理的工程判断是 baseline 对 lateral intent 的视觉感知与推理能力不足。
+- 12 个冻结 representative samples 已完成 input-faithful review 与 reviewer-only GT trajectory audit。代表样本中的 GT future trajectory 总体支持对应 meta-action，未发现足以说明系统性标签错误或标签污染的证据；该结论仅限本次小规模代表样本审核，不证明 full dataset 的每条标签均无误。当前主要问题更可能来自模型判别能力与输入信息边界，而不是 GT 标签体系失效。
+- Reviewer-only panel 明确标注 `REVIEWER-ONLY GT FUTURE INFORMATION` 与 `NOT AVAILABLE TO MODEL AT INFERENCE`。其中 input-faithful review 用于判断当前 `CAM_FRONT + ego-state` 是否足以支持动作判断；reviewer-only GT audit 只用于核验 GT action 是否受真实 future trajectory 支持，并区分视觉信息不足、模型推理失败与潜在标签问题。Future trajectory / BEV 从未加入 Qwen inference input，也不得被描述为模型推理时可获得的信息。
+- Phase 0.3 overall 继续保持 `active`；Phase 0.3e-2 interface freeze 为下一子阶段。只有完成 interface freeze 并满足 Phase 0.3 Gate 后，才能将 Phase 0.3 标记为 `completed`。
+
 ## Active Source Files
 
 - `src/actions/schema.py`：定义唯一的 6 类 action schema。
@@ -190,6 +201,7 @@ source_audit_record
 ## Next Gate
 
 - 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
-- Phase 0.3 overall 保持 `active`；Phase 0.3d 已完成，下一子阶段为现有路线定义的 Phase 0.3e failure analysis 与接口冻结。
+- Phase 0.3 overall 保持 `active`；Phase 0.3e-1 failure analysis 已完成，下一子阶段为 Phase 0.3e-2 interface freeze。
+- 只有完成 Phase 0.3e-2 interface freeze 并满足 Phase 0.3 Gate 后，才能将 Phase 0.3 标记为 `completed`。
 - Phase 0.3 可继续使用 train/validation 进行开发与模型选择，但不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
 - 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
