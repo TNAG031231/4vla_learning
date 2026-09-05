@@ -2,8 +2,8 @@
 
 ## Current Phase
 
-- 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `active`。
-- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c、Phase 0.3d 与 Phase 0.3e-1 均为 `completed`；Phase 0.3e-2 real interface verification 已通过，当前等待 Draft PR #37 人工 review / merge。
+- 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `completed`。
+- Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c、Phase 0.3d、Phase 0.3e-1 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
 - 当前状态已确认 Qwen3-VL full-validation zero-shot baseline、real LoRA smoke training chain，以及 pinned processor / planning visual feature interface；不代表 full-validation LoRA performance、test performance、full-validation feature extraction 或最终 VLA model training 已完成。
 
 ## Confirmed Milestones
@@ -118,7 +118,7 @@ Exact tiny train subset 在训练前后（adapter save 后通过 fresh base/adap
 
 ### Phase 0.3e-2 Qwen3-VL Real Interface Freeze
 
-- Real verification 状态为 `passed`；使用 `Qwen/Qwen3-VL-4B-Instruct` 与 model / processor revision `ebb281ec70b05090aa6165b016eac8ec08e71b17`，只访问少量 validation adapter record，test access counters 全部为 0。
+- 状态为 `completed`：real verification `passed`，PR #37 已 merged，Learning & Capability Closeout 已完成；使用 `Qwen/Qwen3-VL-4B-Instruct` 与 model / processor revision `ebb281ec70b05090aa6165b016eac8ec08e71b17`，只访问少量 validation adapter record，test access counters 全部为 0。
 - 真实 processor 类型为 `Qwen3VLProcessor`，稳定 required keys 为 `input_ids`、`attention_mask`、`pixel_values` 与 `image_grid_thw`。本次真实样本观察为：`input_ids [1,1413] int64`、`attention_mask [1,1413] int64`、`pixel_values [5600,1536] float32`、`image_grid_thw [1,3] int64`，grid 为 `[[1,56,100]]`。
 - `1413`、`5600` 与下述 `1400` 均只属于该真实 validation CAM_FRONT sample observation，不是全局固定 shape。稳定 processor contract 为 required fields / dtypes、`pixel_values` patch width `1536`、grid 每行 `[T,H,W]`、pixel row count 等于各图像 `T×H×W` 之和，以及 sequence / visual patch axes 保持动态。
 - 真实模型结构为 `Qwen3VLForConditionalGeneration.model` 下的 `visual=Qwen3VLVisionModel` 与 `language_model=Qwen3VLTextModel`；规划分支固定使用 public `Qwen3VLForConditionalGeneration.get_image_features(pixel_values, image_grid_thw)`，不得直接绑定 `model.model.visual(...)` 或私有 ViT block API。
@@ -212,7 +212,7 @@ source_audit_record
 ## Next Gate
 
 - 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
-- Phase 0.3 overall 保持 `active`，直到 Draft PR #37 完成人工 review / merge；Phase 0.3e-2 real interface verification 已通过，不再存在 real processor / visual-feature verification pending item。
-- PR #37 merge 后执行 Learning & Capability Closeout，再按修正后的 Phase 0.4a 数据合同开始下一独立阶段；不得提前开始 Phase 0.4 training。
-- Phase 0.3 可继续使用 train/validation 进行开发与模型选择，但不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
+- Phase 0.3 overall 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
+- 下一实际执行子阶段为 `Phase 0.4a — factorized target + temporal dataset contract`；Phase 0.4 overall 仍为 `planned`，尚未开始实现或训练。
+- Phase 0.4 仅可使用 train/validation 进行开发与模型选择，不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
 - 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。

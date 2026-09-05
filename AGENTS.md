@@ -113,12 +113,13 @@ right_lateral
 2. **Phase 0.1:** audited seed-subset manifest、固定 seed 的 scene-level split、六类统一评测协议、invalid prediction 指标处理、完整 manifest contract validator 与 Majority Baseline；已完成并合并。
 3. **Phase 0.1b:** 从 nuScenes mini 扩展至 trainval，生成正式 dataset manifest v1，重统计类别分布并抽检边界样本；正式 LoRA、action adapter 与 DPO 前必须完成。
 4. **Phase 0.2:** inference-time current/past ego-motion rule baseline。
-5. **Phase 0.3:** Qwen3-VL zero-shot / few-shot baseline。
-6. **Phase 0.4:** coarse meta-action LoRA / action adapter。
-7. **Phase 0.5a:** GT-derived geometric safety scorer、candidate action rollout、scorer synthetic tests 与 scorer audit。
-8. **Phase 0.5b:** 固定 candidate set 的 offline safety reranker；仅在 Phase 0.5a scorer gate 通过后进入。
-9. **Phase 0.6:** preference pair audit 与可选 coarse-action DPO；仅在 reranker 已证明风险改善且不过度增加 stop 后构造 pairs，DPO 不优于 reranker 时保留 reranker 作为 MVP 结果。
-10. **后续扩展:** short temporal input、map / route / lane topology、hierarchical fine-grained maneuver、continuous waypoint head、optional BEV / occupancy auxiliary 与闭环或 quasi-closed-loop evaluation。
+5. **Phase 0.3:** Qwen3-VL 数据接口与 legacy coarse action baseline。
+6. **Phase 0.4:** factorized meta-action、structured semantic decision、action-conditioned waypoint 与 trajectory-to-action verifier；下一实际执行子阶段为 Phase 0.4a factorized target + temporal dataset contract。
+7. **Phase 0.5:** BEV/OCC geometry 与 offline spatial evaluation。
+8. **Phase 0.6:** factorized-action-conditioned candidate trajectories 与 safety reranking。
+9. **Phase 0.7:** logged sequential evaluation 与 planning interface。
+10. **Phase 0.8:** conditional preference learning；只有前序 gate 满足时才执行。
+11. **后续扩展:** map / route / lane topology、fine-grained maneuver、predicted BEV / occupancy、外部交互平台与 RL / GRPO。
 
 前一阶段验收条件未满足时，不得推进下一阶段。失败时优先修复数据、标签、scorer 或评测协议，不得通过增加训练规模掩盖问题。
 
@@ -164,8 +165,8 @@ manifest_schema_version
 - `uncertain` 样本不能强行算作正确标签，必须单独记录并排除出高置信度训练/偏好数据。
 - Phase -1 / Week 2 必须完成至少 100 个样本的人工抽检记录。
 - Phase -1 抽检必须覆盖 6 类 action、有/无 VRU、VRU presence 和 action boundary cases。
-- Phase 0.5a scorer 必须报告 collision / near-miss、VRU distance violation、infeasibility、unnecessary stop、harsh action / jerk，并通过 synthetic tests 与 scorer audit；未通过不得进入 Phase 0.5b。
-- Phase 0.5b reranker 必须在固定 candidate set 上比较 rerank 前后 macro-F1、VRU / near-collision、unnecessary stop 与 scorer failure cases；未证明风险改善且不过度增加 stop，不得构造 DPO pairs。
+- Phase 0.5 geometry evaluator 必须报告 collision / near-miss、VRU distance violation、infeasibility、unnecessary stop、harsh action / jerk，并通过 synthetic tests 与 evaluator audit；未通过不得进入 Phase 0.6 safety reranking。
+- Phase 0.6 reranker 必须在固定 candidate set 上比较 rerank 前后 macro-F1、VRU / near-collision、unnecessary stop 与 scorer failure cases；未证明风险改善且不过度增加 stop，不得进入 conditional preference learning。
 - 原始数据、处理后数据和生成媒体默认不纳入 Git；只提交 schema、脚本、配置、允许公开的小型测试 fixture 和质检报告。
 
 ## 6. Evaluation Rules
@@ -198,16 +199,9 @@ Reranker 的结论必须基于相同 candidate set。若 violation 下降主要�
 
 ### Preference learning
 
-DPO 必须包含以下对照：
+Phase 0.8 为 conditional preference learning，仅在 Phase 0.6 candidate / oracle evaluator 与 Phase 0.7 logged sequential protocol 通过对应 gate 后启动。若 learned selector 没有稳定优于非学习基线，保留 Phase 0.6 oracle offline evidence，并记录负结果，不得通过扩大模型或切换到 RL 掩盖失败。
 
-- L0；
-- L0 + safety reranker；
-- DPO without safety terms；
-- DPO with full safety terms。
-
-如果 DPO 不优于 reranker，保留 reranker 作为最终 MVP 方案，不继续堆叠训练。负结果必须保留并分析，不得选择性删除失败样本。
-
-coarse-action DPO 只是第一版 MVP 的可选终点。输出 head 或 target 变化后，必须记录哪些 checkpoint、标签和 preference pairs 可以复用；fine maneuver 或 continuous waypoint 扩展需要重新构造相关 preference pairs，旧分类 head 不保证可直接复用。
+DPO / GRPO 仅在 trajectory tokenization、policy likelihood 与优化目标另行冻结后作为 Optional / Stretch；不得把它们写成当前 MVP 的必经终点。
 
 ## 7. Documentation Rules
 
