@@ -472,7 +472,7 @@ contract / regression tests
 | Phase 0.2b | rule candidate search | `completed` | validation candidate selection |
 | Phase 0.2c | failure analysis 与 rule freeze | `frozen` | `phase0.2-ego-motion-rule-v0.1` |
 | Phase 0.2d | sealed one-shot evaluation | `consumed_failed` | 无正式 test metrics；原 test 永久消费 |
-| Phase 0.3 | Qwen3-VL 数据接口与 legacy coarse action baseline（旧版粗粒度动作基线） | `active` | 可复用视觉/多模态特征接口与六类历史兼容基线 |
+| Phase 0.3 | Qwen3-VL 数据接口与 legacy coarse action baseline（旧版粗粒度动作基线） | `completed` | 可复用视觉/多模态特征接口与六类历史兼容基线 |
 | Phase 0.4 | factorized meta-action（因子化元动作）+ action-conditioned waypoint（动作条件化轨迹点）+ verification（验证） | `planned` | Qwen3-VL 结构化语义决策、decision adapter、`[B,6,2]` 轨迹规划与一致性验证器 |
 | Phase 0.5 | BEV/OCC（鸟瞰图 / 占用表征）几何表示与离线空间评估，以及条件式轻量预测分支 | `planned` | Core：类型明确的时序对象张量与元数据、temporal occupancy 与对象—栅格一致性；Enhancement：可选当前占用预测 |
 | Phase 0.6 | factorized-action-conditioned candidates（因子化动作条件化候选）+ GT-derived safety reranking（真值派生安全重排序） | `planned` | `[B,6,6,2]` 固定候选库、双几何后端、configured oracle reranker（配置化真值重排序器）与独立 candidate-set ceiling（候选库上限） |
@@ -603,7 +603,7 @@ Validation macro-F1 / accuracy 为 `0.615681 / 0.623817`；同协议 Majority Ba
 
 #### 10.1.1 阶段状态、目的与边界
 
-- **阶段状态：** `active`。
+- **阶段状态：** `completed`。PR #37 已 merged，Learning & Capability Closeout 已完成。
 - **阶段目的：** 打通 frozen manifest（冻结清单）→ image/text processor（图像 / 文本处理器）→ Qwen3-VL（通义千问第三代视觉语言模型）→ legacy action parser（旧版动作解析器）→ sample-level prediction（样本级预测）的完整链路。
 - **为什么需要：** 在引入时序、Qwen3-VL structured semantic decision（结构化语义决策）、decision adapter（决策适配器）和 waypoint planner（轨迹点规划器）前，先隔离数据加载、模型依赖、`task_prompt` 序列化、generation（生成）和六类输出解析问题，避免把接入错误误判为规划模型错误。
 - **前置条件：** Phase 0.1b trainval manifest 与六类 schema 已冻结；Phase 0.2d 的 consumed-test 边界保持不变；开发只允许 train/validation。
@@ -741,7 +741,7 @@ ACTION: keep
 
 ##### Phase 0.3c：zero-shot baseline
 
-- **状态：** `completed`。已在相同 3,594 条 validation samples 上完成 image-only 与 image + ego-state 两组正式 baseline；Phase 0.3 overall 仍为 `active`。
+- **状态：** `completed`。已在相同 3,594 条 validation samples 上完成 image-only 与 image + ego-state 两组正式 baseline；该子阶段完成时 Phase 0.3 overall 仍为 `active`，当前已完成全部 Phase 0.3 Gate 并更新为 `completed`。
 
 只运行有限、预定义的 prompt templates，至少比较：
 
@@ -771,7 +771,7 @@ image + ego state
 
 ##### Phase 0.3e：failure analysis 与接口冻结
 
-- **状态：** `active`。Phase 0.3e-1 failure analysis 已完成；Phase 0.3e-2 real interface verification 已通过，当前等待 Draft PR #37 人工 review / merge。Phase 0.3 overall 继续保持 `active`，只有完成该 review / merge 并满足 Phase 0.3 Gate 后才能更新为 `completed`。
+- **状态：** `completed`。Phase 0.3e-1 failure analysis 与 Phase 0.3e-2 real interface verification 均已完成；PR #37 已 merged，Learning & Capability Closeout 已完成，Phase 0.3 overall 已更新为 `completed`。
 
 ###### Phase 0.3e-1：Qwen3-VL baseline failure analysis
 
@@ -797,7 +797,7 @@ representative-label consistency
 
 ###### Phase 0.3e-2：interface freeze
 
-- **状态：** real interface verification `passed`，等待 Draft PR #37 人工 review / merge。本子阶段只冻结下列 producer contracts，并完成 Phase 0.3 Gate 核验；不得把 Phase 0.3e-1 的 reviewer-only future information 纳入 inference interface。
+- **状态：** `completed`。Real interface verification `passed`，PR #37 已 merged，Learning & Capability Closeout 已完成。本子阶段只冻结下列 producer contracts，并完成 Phase 0.3 Gate 核验；不得把 Phase 0.3e-1 的 reviewer-only future information 纳入 inference interface。
 
 最终冻结的主要 producer contract（生产者协议）为：
 
@@ -879,6 +879,8 @@ Phase 0.3 通过条件：
 Zero-shot 不要求超过 frozen ego-motion rule；较弱结果不阻塞 Phase 0.4，但必须保留并分析。若 processor shape、图像路径、parser 或 label masking 未通过，停止模型扩展并先修复相应 contract。若硬件不支持目标配置，先缩小 batch、分辨率或可训练范围并重新做 resource preflight，不静默改用未经记录的模型。
 
 本阶段没有不可逆 test 操作。任何脚本都必须默认拒绝原 project test；Phase 0.2d 的 claim、preflight 和 consumed artifact 不得读取、恢复或修改。
+
+Phase 0.3 Gate 已满足。下一实际执行子阶段为 `Phase 0.4a — factorized target + temporal dataset contract`；Phase 0.4 overall 仍为 `planned`，尚未开始实现。
 
 #### 10.1.10 阶段学习目标与证据
 
