@@ -1,0 +1,13 @@
+source_projection_version: phase0.4a1-source-projection-v0.1
+source_projection_schema_version: phase0_4_source_projection_v0.1
+source_contract_config: configs/phase0_3_development_projection.yaml
+trainval_config: configs/trainval_manifest.yaml
+output_relative_dir: phase_0_4/source_projection_v0_1
+
+trajectory:
+  raw_point_count: 7
+  horizon_sec: 3.0
+  sample_interval_sec: 0.5
+  time_tolerance_sec: 0.075
+  # Matches the existing current-origin test's pytest.approx(0.0) tolerance.
+  anchor_absolute_tolerance: 1.0e-12
