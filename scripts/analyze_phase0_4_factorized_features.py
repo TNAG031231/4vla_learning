@@ -54,7 +54,9 @@ def summarize(features: list[dict[str, float]]) -> dict[str, object]:
     }
 
 
-def analyze_sources(derived_root: Path, splits: list[str]) -> dict[str, object]:
+def read_audited_sources(
+    derived_root: Path, splits: list[str],
+) -> dict[str, list[dict[str, object]]]:
     if not splits or any(split not in ("train", "validation") for split in splits):
         raise ValueError("analyzer only permits train and validation")
     config = load_config(
@@ -68,11 +70,9 @@ def analyze_sources(derived_root: Path, splits: list[str]) -> dict[str, object]:
             raise ValueError(f"{split} source SHA-256 differs from audited artifact")
         payloads[split] = payload
 
-    results = {}
+    records_by_split = {}
     for split, payload in payloads.items():
-        features = []
-        groups: dict[str, list[dict[str, float]]] = defaultdict(list)
-        audit_count = 0
+        records = []
         for line in payload.splitlines():
             record = json.loads(line)
             if (
@@ -81,6 +81,18 @@ def analyze_sources(derived_root: Path, splits: list[str]) -> dict[str, object]:
                 or record["source_projection_schema_version"] != SOURCE_SCHEMA
             ):
                 raise ValueError("source split or projection version mismatch")
+            records.append(record)
+        records_by_split[split] = records
+    return records_by_split
+
+
+def analyze_sources(derived_root: Path, splits: list[str]) -> dict[str, object]:
+    results = {}
+    for split, records in read_audited_sources(derived_root, splits).items():
+        features = []
+        groups: dict[str, list[dict[str, float]]] = defaultdict(list)
+        audit_count = 0
+        for record in records:
             points = [
                 TrajectoryPoint(**point) for point in record["future_ego_trajectory"]
             ]

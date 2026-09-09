@@ -1,0 +1,8 @@
+status: provisional
+parameters:
+  stop_distance_center_m: 0.5
+  speed_change_center_mps: 1.0
+  minimum_forward_displacement_m: 1.0
+  lateral_displacement_center_m: 1.0
+  heading_support_rad: 0.10
+  boundary_margin: 0.2
