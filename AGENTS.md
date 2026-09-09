@@ -1,18 +1,17 @@
 # AGENTS.md
 
-本文件约束 Codex 和其他 agentic coding worker 在本仓库中的工作方式。若任务要求与本文件冲突，先停止并向用户说明，不得静默绕过。
+本文件约束 Codex 和其他 agentic coding worker 在本仓库中的工作方式。按适用的指令优先级处理冲突，并说明采用的规则。用户已明确授权的常规工作持续执行；只有授权范围或关键需求仍不明确时，询问该事项，并继续完成独立且已授权的工作。明确批准要求按对应条款执行。
 
 ## General Rules
 
 ### Documentation Discipline
 
-- Do not create new temporary documentation files for routine tasks. This includes files or directories named like plan, design, spec, debug, report, tmp, scratch, notes, experiments, or similar variants.
-- Temporary execution plans must stay in the chat response only. They must not be written into repository files.
+- Keep execution plans in the chat. Put temporary files required by tools in an ignored `scratch/` directory or the system temporary directory, and handle them under the cleanup rules.
 - If long-term stable project conventions need to be recorded, only update existing relevant sections in:
   - AGENTS.md
   - README.md
   - docs/progress.md
-- Do not create new documentation files unless the user explicitly requests it.
+- Create documentation explicitly requested by the user at the requested location. Obtain approval before adding long-term documentation outside the authorized task scope.
 - docs/progress.md, if present, should only record confirmed facts, such as completed milestones, dataset paths, input/output field contracts, CLI conventions, known risks, and open questions.
 - docs/progress.md must not contain long reasoning traces, temporary plans, debugging logs, one-off task notes, or speculative implementation ideas.
 - At the end of each task, report:
@@ -22,7 +21,7 @@
   - whether any new documentation file was created.
 - If no documentation was modified, explicitly state: “No documentation files were modified.”
 - If a task does not require documentation changes, do not modify any `.md` files.
-- If creating a new documentation file seems necessary, stop and ask the user for confirmation before doing so.
+- Pending approval for an additional document blocks only that document; continue independent authorized work.
 
 ### Contract-First Irreversible Workflows
 
@@ -35,15 +34,18 @@
 
 ### Minimal Change and Anti-Overengineering
 
+- **限制自行新增机制：** 禁止自行加入哈希/SHA、smoke test 和防御性编程。新增此类内容须有用户明确要求；现有已批准 contract 和 gate 中的相关机制保持有效，并在获授权的验证范围内使用。必要的数据隔离、GT/future leakage 和外部输入合同校验按现有规则执行。单元测试与回归测试按当前验收要求执行。
+- **根因修复：** 每次修复先依据可复现现象或明确代码证据定位根因，再在错误产生的位置，用正确逻辑直接替换错误逻辑，并验证受影响行为。修复保持在当前任务范围内；证据不足时继续定位，避免叠加特判、fallback、重复校验和异常吞噬来掩盖问题。
+- **肯定式表达：** 直接描述实际行为、适用条件、已完成内容和能力边界，使用肯定性的句式；避免“否定的否定”和多层否定。明确禁令及批准要求保留清楚、直接的措辞。
 - 修改前必须明确当前任务的 success criteria、failure criteria 与 verification method；达到验收标准后停止，不得以“更加严谨”或“理论上更安全”为由继续追加无关加固。测试数量、校验字段数量和 abstraction 数量本身不代表更高质量。
 - 默认只实现解决当前明确问题所需的最小改动；不得因“以后可能会用到”提前增加功能、helper、class、抽象层、配置项或 fallback，也不得顺手重构与任务无关的代码。
 - 只清理由本轮修改直接产生的问题。历史遗留问题若不阻塞当前任务，应记录为 optional cleanup 或 future hardening；一次性或简单流程优先直接实现，不为形式上的架构完整性增加 wrapper 或 abstraction。
 - 已由仓库 contract、producer、framework 或现有测试保证的内部状态默认按其合同使用。完成必需的外部 artifact intake 后，不得为理论上不应出现的内部状态层层重复 SHA、schema、metadata 或 provenance 校验，也不得穷举防护人为篡改内部 artifact。
-- 只有存在真实历史失败、明确外部输入边界、不可逆操作风险或当前任务可复现的问题时，才增加对应 validation、fallback 或 recovery path。严格校验应集中在用户输入、CLI 参数、外部 API / 网络、文件系统输入、外部 artifact intake、train / validation / test 边界、model inference input contract、GT / future information leakage 与不可逆正式执行。
+- validation、fallback 或 recovery path 须有真实历史失败、明确外部输入边界、不可逆操作风险或当前任务可复现的问题作为依据；新增机制同时遵循本节的用户授权要求。严格校验集中在用户输入、CLI 参数、外部 API / 网络、文件系统输入、外部 artifact intake、train / validation / test 边界、model inference input contract、GT / future information leakage 与不可逆正式执行。
 - 真实错误必须 fail fast 并暴露根因。禁止使用 broad `except Exception`、silent fallback、nil / empty fallback、模糊默认值、改变实验条件的自动重试、fuzzy mapping 或静默纠正 invalid output 让程序“看起来继续工作”；违反正式 contract 的输入必须 hard fail，不得猜测意图或自动修复。
-- **Blocking：** 任何可能影响实验结果正确性、train / validation / test isolation、test / target / future / GT leakage、输入输出 contract、label / schema、metrics、sample alignment、数据或模型真实执行链路、不可逆正式执行真实风险或后续阶段实际兼容性的问题，都必须修复后才能继续。典型情况包括读取 test 数据、future trajectory 进入模型输入、baseline sample set 不一致、invalid prediction 使 F1 虚高、label / schema 不匹配、真实 producer / consumer contract mismatch 或模型实际无法运行。
+- **Blocking：** 当前验收路径中已复现的问题、可定位的合同冲突，以及有具体数据流证据的隔离或泄漏风险，须在受影响的执行前解决。典型情况包括读取 test 数据、future trajectory 进入模型输入、baseline sample set 不一致、invalid prediction 使 F1 虚高、label / schema 不匹配、真实 producer / consumer contract mismatch 或模型实际无法运行。未来阶段的假设性问题记录为待验证事项；对于隔离和不可逆执行所必需但尚未确认的前置条件，暂停对应执行并完成核验。独立且已授权的工作继续进行。
 - **Non-blocking：** 仅涉及极端人为篡改、理论上不可能的内部状态、重复 provenance 字段的穷举校验、不改变实验结果的 receipt 防篡改增强、一次性流程的额外 abstraction、为“完整”增加 helper / wrapper / class，或没有真实 failure evidence 的 fallback / recovery，默认不阻塞当前 Phase；可以记录，但不得无限延后模型实验和主线推进。
-- 本节不得用于削弱 Contract-First Irreversible Workflows、Data Rules、Evaluation Rules、test isolation、future / GT leakage guard，以及 Git、secret 和 dataset protection。Minimal code 不等于少做必要校验，trust internal contracts 不等于信任外部输入，avoid defensive coding 不等于吞掉异常，fast iteration 不等于降低实验可信度；发生冲突时，数据泄漏、实验正确性和不可逆风险规则优先。
+- Contract-First Irreversible Workflows、Data Rules、Evaluation Rules、test isolation、future / GT leakage guard，以及 Git、secret 和 dataset protection 保持有效。最小实现完成必要的边界校验，按已验证的内部合同使用数据，并直接暴露真实错误；发生冲突时，数据泄漏、实验正确性和不可逆风险规则优先。
 - 多个实现方案都合理时，优先选择能直接提升模型能力、自动驾驶 / VLA 技术含量、系统完整性、实验可解释性和面试展示价值的方案；纯内部防御且不改变模型结果、实验可信度或后续系统能力的工作降低优先级，但不得以 demo 为由牺牲 correctness。
 
 ## Environment Rules
@@ -55,7 +57,7 @@
   conda run -n codex4vla_env pytest ...
 
 - 不得使用 base Python 作为项目验证环境。
-- 如果 `conda run -n codex4vla_env ...` 失败，必须停止并报告环境问题，不得改用 base Python 伪造通过结果。
+- `conda run -n codex4vla_env ...` 失败后先定位原因：代码或测试失败在当前任务范围内继续修复；环境无法启动或依赖缺失时，暂停依赖该环境的验证，报告原因并继续可独立完成的工作。所有项目验证保持在 `codex4vla_env` 中执行。
 - 如果需要新增依赖，先说明依赖用途和安装位置；不得静默安装到 base 环境。
 - README 中的命令若未显式写 conda，仅表示命令形式；实际验证必须在 `codex4vla_env` 下执行。
   
@@ -239,20 +241,21 @@ docs: report experiments and limitations
 - Commit 前运行 `git status` 并检查 staged diff。
 - 不得提交数据集、权重、secrets、本地路径或无关文件。
 - 修改后总结 changed / why / how to verify。
-- 除非用户明确要求，不得自动 commit 或 push。
+- commit、push、创建 PR 分别依据用户明确授权执行；授权在其指定的任务范围内持续有效。尚未授权发布时，先完成本地实现、验证和可审阅 diff。Git 命令示例仅说明执行方式。
 - 永远不得使用 `git push --force`。
 
 ## GitHub PR Collaboration Workflow
 
-1. Codex 接到任务后，必须先从最新 `main` 开始并确认工作区状态：
+1. 首先检查工作区状态、当前分支和任务对应的 PR。只读审阅保留当前 checkout；已有 PR 的修复沿用原分支；新实现任务从更新后的 `main` 创建独立分支。遇到用户未提交改动时保留其内容，只暂停会与其冲突的操作。新实现任务的命令顺序为：
 
    ```bash
+   git status --short
+   git branch --show-current
    git checkout main
    git pull --ff-only origin main
-   git status --short
    ```
 
-2. 每个任务使用独立分支，命名格式为 `task_<phase-or-id>_<short-name>`，例如 `task_p1_5_manual_review`；不得直接在 `main` 上修改。
+2. 新实现任务使用独立分支；用户指定名称时沿用该名称，否则使用 `codex/<phase-or-id>-<short-name>`，例如 `codex/phase-1-8-instruction-autonomy`。同一 PR 的修复沿用原分支；只读任务保留当前分支。不得直接在 `main` 上修改。
 3. 修改前必须读取 `AGENTS.md`、`README.md`、`project_mvp_plan.md`、存在时的 `docs/progress.md`，以及与任务直接相关的源文件和测试文件。
 4. 提交前禁止使用 `git add .` 或 `git add -A`。必须显式指定文件路径，例如：
 
@@ -269,11 +272,11 @@ docs: report experiments and limitations
    ```
 
    同时运行当前改动所需的测试命令。Commit message 沿用本文件既有风格，例如 `feat(data): add manual review export`、`test(data): cover label verification cases` 或 `docs: update confirmed progress`。
-6. 允许使用 `git push -u origin <branch-name>` 推送当前任务分支。永远不得使用 `git push --force`。
-7. GitHub CLI 可用且已登录时，可以创建 PR：
+6. 获得当前任务的 push 授权后，使用 `git push -u origin <branch-name>` 推送。永远不得使用 `git push --force`。
+7. 获得当前任务的 PR 创建授权且 GitHub CLI 可用并已登录时，创建 Draft PR：
 
    ```bash
-   gh pr create --base main --head <branch-name> --title "<title>" --body-file <body-file>
+   gh pr create --draft --base main --head <branch-name> --title "<title>" --body-file <body-file>
    ```
 
    若 `gh` 不可用或未登录，不得反复尝试或伪造成功；必须输出 branch name、commit hash、建议 PR title、建议 PR body 和手动创建 PR 的说明。
@@ -283,7 +286,7 @@ docs: report experiments and limitations
 
 ## PR Learning & Capability Closeout
 
-从本规则生效后，每一个正式 PR merge 后、开始下一个独立任务或 Phase 前，必须在刚刚 merge 的 GitHub PR Conversation 页面发布一条顶层 comment，标题固定为：
+从本规则生效后，每一个正式 PR merge 后、开始下一个独立实现任务或 Phase 执行前，必须在刚刚 merge 的 GitHub PR Conversation 页面发布一条顶层 comment，标题固定为：
 
 ```markdown
 ## Learning & Capability Closeout
@@ -305,7 +308,7 @@ Learning & Capability Closeout comment
 next task / next Phase
 ```
 
-不得跳过 Closeout 直接进入下一项独立工作。核心 Phase、model、data 或 evaluation PR 的完整协作流程为：
+Closeout gate 约束下一项实现和 Phase 执行；证据收集、只读审阅及 Closeout 准备可以继续。发布失败时交付完整 Markdown，正式推进仍等待 Closeout 完成。发布评论须有明确授权，已有授权在其指定范围内持续有效。Closeout 使用个人技能目录中的 `pr-learning-capability-closeout` 修订版，历史记忆副本仅作参考。核心 Phase、model、data 或 evaluation PR 的完整协作流程为：
 
 ```text
 Codex implementation
@@ -330,6 +333,8 @@ next task
 ### Closeout Evidence and Structure
 
 Closeout 必须以该 PR 的 actual diff、merged code、tests、实际执行过的 runtime / experiment results、artifact 和已确认事实为依据。禁止把 planned 工作写成 completed、把 synthetic test 写成 real model evidence、把未执行的 GPU / training / evaluation 写成已掌握能力，或为了丰富简历而虚构能力；不得使用“熟悉了 LoRA”“学会了训练模型”等无法由该 PR 证明的空泛表述。
+
+证据不足的能力主张应删除或标注待验证，并完成有证据支持的内容。PR merge 状态须先核实；无法核实时暂停正式发布，继续收集证据。
 
 重要 PR 默认使用以下结构：
 
@@ -411,8 +416,8 @@ sample_token
 10. 每次任务结束时，必须给出简短的 repository hygiene summary，包括新增了哪些正式文件、删除了哪些临时文件、还有哪些未跟踪文件，以及是否需要用户确认保留或删除。
 11. 不要为每次任务自动创建 `docs/specs/YYYY-MM-DD-*.md` 这类任务记录文件。
 12. 除非用户明确要求，不要创建新的 specs 文档。
-13. 如果任务过程中需要临时记录计划、草稿或 debug 说明，只能放在 `scratch/` 目录。
-14. `scratch/` 必须被 `.gitignore` 忽略，任务结束前必须清理其中已经不需要的内容。
+13. 执行计划保留在聊天中；工具执行确需的临时草稿或 debug 文件放在已忽略的 `scratch/` 或系统临时目录。
+14. `scratch/` 必须被 `.gitignore` 忽略。任务结束前审查本轮创建的临时文件，输出 dry-run 清单后逐文件清理已确认不再需要的内容；用户已有文件和用途不明的文件保留。
 15. 仓库中的正式长期文档只允许放在：
     - `README.md`
     - `project_mvp_plan.md`
