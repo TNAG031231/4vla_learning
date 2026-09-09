@@ -9,6 +9,7 @@ import tempfile
 
 import yaml
 
+from data import build_trainval_manifest as trainval_source
 from src.phase0 import development_projection as development
 from src.phase0.manifest import (
     COORDINATE_METADATA,
@@ -219,6 +220,16 @@ def build_source_projection(
         raise ValueError("source projection must be outside the repository")
     if output.exists():
         raise FileExistsError("source projection already exists; refusing to overwrite")
+    trainval = trainval_source.load_config(config.trainval_config)
+    historical_audits = trainval_source.load_audit_index(
+        repository_root / trainval.base_audit_path,
+        repository_root / trainval.supplement_audit_path,
+    )
+    audit_index = {
+        token: row for token, row in historical_audits.items()
+        if row.scene_token in selection.allowed_scene_tokens
+        and row.scene_token not in selection.forbidden_test_scene_tokens
+    }
     counters = development.IsolationCounters()
     reader = development.GuardedNuScenesReader(
         reader_factory(), selection.allowed_scene_tokens,
@@ -235,7 +246,7 @@ def build_source_projection(
             split_seed=source.expected_split_seed,
             split_strategy_version=source.expected_split_strategy_version,
             split_mapping_sha256=mapping_sha,
-            audit_index={},
+            audit_index=audit_index,
             dataroot=nuscenes_root,
             rules=producer_inputs.rules,
             horizon_sec=producer_inputs.horizon_sec,

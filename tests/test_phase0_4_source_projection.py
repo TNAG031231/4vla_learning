@@ -17,10 +17,15 @@ from src.phase0 import phase0_4_source_projection as projection
 from src.phase0.manifest import json_record
 from src.phase0.qwen_preflight import sha256_file
 from test_phase0_3_development_projection import _mapping_payload, _write_inputs
-from test_trainval_manifest import build_scene, evaluate, rules
+from test_trainval_manifest import audit_row_for_record, build_scene, evaluate, rules
 
 
 CONFIG = ROOT / "configs/phase0_4_source_projection.yaml"
+
+
+@pytest.fixture(autouse=True)
+def synthetic_audit_loader(monkeypatch):
+    monkeypatch.setattr(producer, "load_audit_index", lambda *paths: {})
 
 
 @pytest.fixture
@@ -168,7 +173,6 @@ def setup_pipeline(tmp_path, config):
         calls.append(kwargs)
         tokens = kwargs["scene_tokens"]
         assert not set(tokens) & {f"scene-{i:03d}" for i in range(700, 850)}
-        assert kwargs["audit_index"] == {}
         # Run the actual frozen producer on the populated scene in each split.
         return producer.build_records(**{**kwargs, "scene_tokens": (tokens[0],)})
 
@@ -189,11 +193,10 @@ def test_producer_to_projection_pipeline_and_byte_only_integrity(
     import src.phase0.protocol as protocol
 
     def forbidden(*args, **kwargs):
-        pytest.fail("combined manifest semantic parsing or audit access is forbidden")
+        pytest.fail("combined manifest semantic parsing is forbidden")
 
     monkeypatch.setattr(protocol, "iter_manifest_rows", forbidden)
     monkeypatch.setattr(protocol, "validate_manifest", forbidden)
-    monkeypatch.setattr(producer, "load_audit_index", forbidden)
     monkeypatch.setattr(producer, "build_full_scene_splits", forbidden)
     receipt = projection.build_source_projection(**kwargs)
     assert len(calls) == 2
@@ -207,6 +210,7 @@ def test_producer_to_projection_pipeline_and_byte_only_integrity(
         record = json.loads(path.read_text())
         assert len(record["future_ego_trajectory"]) == 7
         assert record["split"] == split
+        assert record["source_audit_record"] is None
         assert receipt["outputs"][split]["sha256"] == sha256_file(path)
         assert receipt["outputs"][split]["record_count"] == 1
     assert not (output / "test.jsonl").exists()
@@ -300,3 +304,61 @@ def test_output_is_deterministic_for_same_producer_inputs(tmp_path, config):
         kwargs, _, _ = setup_pipeline(tmp_path / name, config)
         receipts.append(projection.build_source_projection(**kwargs))
     assert receipts[0] == receipts[1]
+
+
+def test_historical_audit_provenance_survives_allowed_scene_filter(
+    tmp_path, config, monkeypatch,
+):
+    kwargs, reader, calls = setup_pipeline(tmp_path, config)
+    scene_splits = {"scene-000": "train", "scene-560": "validation"}
+    producer_kwargs = dict(
+        nuscenes=reader, scene_tokens=tuple(scene_splits),
+        scene_splits=scene_splits,
+        official_splits={token: "train" for token in scene_splits},
+        split_seed=20260710,
+        split_strategy_version=config.source_contract.expected_split_strategy_version,
+        split_mapping_sha256=_mapping_payload()["scene_split_mapping_sha256"],
+        dataroot=kwargs["nuscenes_root"], rules=rules(),
+        horizon_sec=3.0, sample_interval_sec=0.5,
+        time_tolerance_sec=0.075, agent_radius_m=50.0,
+    )
+    baseline = producer.build_records(**producer_kwargs, audit_index={})
+    audits = {
+        record.sample_token: audit_row_for_record(record)
+        for record in baseline.records
+    }
+    expected = producer.build_records(**producer_kwargs, audit_index=audits)
+    forbidden = replace(
+        next(iter(audits.values())), sample_token="forbidden-audit",
+        scene_token="scene-700",
+    )
+    selection_completed = False
+    select_scenes = development.select_development_scenes
+
+    def tracked_selection(*args):
+        nonlocal selection_completed
+        result = select_scenes(*args)
+        selection_completed = True
+        return result
+
+    def historical_loader(base_path, supplement_path):
+        assert selection_completed
+        trainval = producer.load_config(config.trainval_config)
+        assert base_path == ROOT / trainval.base_audit_path
+        assert supplement_path == ROOT / trainval.supplement_audit_path
+        return {**audits, forbidden.sample_token: forbidden}
+
+    monkeypatch.setattr(development, "select_development_scenes", tracked_selection)
+    monkeypatch.setattr(producer, "load_audit_index", historical_loader)
+    receipt = projection.build_source_projection(**kwargs)
+    output = kwargs["derived_root"] / config.output_relative_dir
+    for record in expected.records:
+        actual = json.loads((output / f"{record.split}.jsonl").read_text())
+        assert actual["source_audit_record"] is not None
+        assert actual["source_audit_record"] == json_record(record.source_audit_record)
+        assert "forbidden-audit" not in json.dumps(actual)
+    assert selection_completed
+    for call in calls:
+        assert call["audit_index"] == audits
+        assert "forbidden-audit" not in call["audit_index"]
+    assert receipt["combined_manifest_records_parsed"] == 0
