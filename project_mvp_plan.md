@@ -37,7 +37,7 @@
 
 除非实验正确性确实需要，不得用多 seed、statistical significance、exhaustive ablation、大规模 hyperparameter search、论文级 benchmark、复杂 artifact framework，或与求职能力无关的 defensive engineering 拖慢主线。以下问题仍是 blocking：data leakage、test misuse、错误 label、错误 metric、模型未真正运行、训练未真正更新目标参数、checkpoint 无法使用、错误的数据 / 模型 interface，以及任何会导致结论错误的 implementation bug。工程与面试优先不削弱数据隔离、实验正确性、真实执行和可复现性要求。
 
-每个正式 PR merge 后、进入下一独立任务或 Phase 前，必须按 `AGENTS.md` 的 **PR Learning & Capability Closeout** workflow，在该 merged PR 的 GitHub Conversation 中记录真实完成的 What / How / Why、Capability、Interview Explanation、Follow-up Questions 与 Current Boundary。GitHub PR comment 是每次具体 Closeout 的唯一主要存放位置；本文只维护路线、Phase 设计、执行原则和制度，`docs/progress.md` 只维护已确认状态、指标、artifact、gate 与实验事实，不重复收纳逐 PR 的完整学习总结。
+每个正式 PR merge 后、进入下一独立实现任务或 Phase 执行前，必须按 `AGENTS.md` 的 **PR Learning & Capability Closeout** workflow，在该 merged PR 的 GitHub Conversation 中记录真实完成的 What / How / Why、Capability、Interview Explanation、Follow-up Questions 与 Current Boundary。证据收集、只读审阅及 Closeout 准备可以继续；发布失败时交付完整 Markdown，正式推进仍等待 Closeout 完成。GitHub PR comment 是每次具体 Closeout 的唯一主要存放位置；本文只维护路线、Phase 设计、执行原则和制度，`docs/progress.md` 只维护已确认状态、指标、artifact、gate 与实验事实，不重复收纳逐 PR 的完整学习总结。
 
 ## 1. 信息边界与总体数据流
 
