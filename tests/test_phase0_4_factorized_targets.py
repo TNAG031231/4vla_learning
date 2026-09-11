@@ -200,3 +200,153 @@ def test_linear_percentiles():
     assert result["distance"] == dict(zip(
         analyzer.PERCENTILE_NAMES, analyzer.PERCENTILES,
     ))
+
+
+from scripts import derive_phase0_4_factorized_targets as derivation
+from src.phase0.phase0_4_factorized_targets import (
+    FACTORIZED_ACTION_RULE_VERSION, derive_feature_targets,
+    derive_trajectory_targets,
+)
+
+
+def targets(points):
+    return derive_trajectory_targets(
+        points, sample_interval_sec=0.5, time_tolerance_sec=0.075,
+        anchor_absolute_tolerance=1e-12,
+    )
+
+
+@pytest.mark.parametrize("xs,action", [
+    ([0] * 7, "stop"),
+    ([0, 1, 3, 6, 10, 15, 21], "accelerate"),
+    ([0, 6, 11, 15, 18, 20, 21], "decelerate"),
+    (range(7), "keep"),
+])
+def test_longitudinal_targets(xs, action):
+    result = targets(trajectory(xs))
+    assert result["longitudinal_action"] == action
+    assert result["longitudinal_action_valid"] is True
+    assert result["factorized_action_joint_valid"] is True
+    assert result["factorized_action_rule_version"] == FACTORIZED_ACTION_RULE_VERSION
+
+
+@pytest.mark.parametrize("final,action", [
+    (1.0, "left"), (-1.0, "right"), (0.999, "straight"),
+    (-0.999, "straight"), (0, "straight"),
+])
+def test_lateral_boundary_without_heading_condition(final, action):
+    result = targets(trajectory(range(7), [i * final / 6 for i in range(7)]))
+    assert result["lateral_action"] == action
+    assert result["lateral_action_valid"] is True
+
+
+@pytest.mark.parametrize("delta,action", [
+    (1.0, "accelerate"), (-1.0, "decelerate"),
+    (0.999, "keep"), (-0.999, "keep"),
+])
+def test_speed_boundary_has_no_uncertainty_band(delta, action):
+    features = extract_motion_features(trajectory(range(7)))
+    features["delta_speed_proxy_mps"] = delta
+    result = derive_feature_targets(features)
+    assert result["longitudinal_action"] == action
+    assert result["longitudinal_action_valid"] is True
+
+
+def test_stop_thresholds_and_priority():
+    features = extract_motion_features(trajectory(range(7)))
+    features.update(path_length_m=0.6, end_speed_proxy_mps=0.6, delta_speed_proxy_mps=1)
+    assert derive_feature_targets(features)["longitudinal_action"] == "stop"
+    features["end_speed_proxy_mps"] = 0.601
+    assert derive_feature_targets(features)["longitudinal_action"] == "accelerate"
+
+
+@pytest.mark.parametrize("field,valid_direction,invalid_direction", [
+    ("final_lateral_displacement_m", "longitudinal", "lateral"),
+    ("delta_speed_proxy_mps", "lateral", "longitudinal"),
+])
+def test_direction_validity_preserves_other_supervision(field, valid_direction, invalid_direction):
+    features = extract_motion_features(trajectory(range(7)))
+    del features[field]
+    result = derive_feature_targets(features)
+    assert result[f"{valid_direction}_action_valid"] is True
+    assert result[f"{valid_direction}_action"] is not None
+    assert result[f"{invalid_direction}_action_valid"] is False
+    assert result[f"{invalid_direction}_action"] is None
+    assert field in result[f"{invalid_direction}_action_reason"]
+    assert result["factorized_action_joint_valid"] is False
+
+
+@pytest.mark.parametrize("change,reason", [
+    (lambda points: [], "missing_or_incomplete_trajectory"),
+    (lambda points: [*points[:-1], replace(points[-1], x_m=math.nan)], "nonfinite_trajectory"),
+    (lambda points: [*points[:-1], replace(points[-1], y_m=math.inf)], "nonfinite_trajectory"),
+    (lambda points: [*points[:-1], replace(points[-1], t_sec=4)], "invalid_trajectory_time"),
+])
+def test_invalid_trajectory_reason(change, reason):
+    result = targets(change(trajectory(range(7))))
+    for direction in ("longitudinal", "lateral"):
+        assert result[f"{direction}_action_valid"] is False
+        assert result[f"{direction}_action_reason"] == reason
+    assert result["factorized_action_joint_valid"] is False
+
+
+def test_derived_record_preserves_provenance_and_ignores_legacy(source_artifacts):
+    root, relative = source_artifacts
+    config = projection.load_config(ROOT / "configs/phase0_4_source_projection.yaml", ROOT)
+    record = json.loads((root / relative / "train.jsonl").read_bytes())
+    before = derivation.derive_record(record, "train", config)
+    record["source_legacy_meta_action"] = "changed"
+    after = derivation.derive_record(record, "train", config)
+    assert {key: value for key, value in before.items() if key != "source_legacy_meta_action"} == {
+        key: value for key, value in after.items() if key != "source_legacy_meta_action"
+    }
+    for key in ("label_rule_version", "source_audit_record", "future_ego_trajectory"):
+        assert before[key] == record[key]
+    assert before["source_future_trajectory_version"] == projection.SOURCE_VERSION
+
+
+def test_derivation_rejects_test_before_file_access(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "read_bytes", lambda *args: pytest.fail("file accessed"))
+    with pytest.raises(ValueError, match="only permits"):
+        derivation.derive_sources(tmp_path, ["train", "test"])
+
+
+def test_producer_to_derivation_outputs(source_artifacts, monkeypatch):
+    from dataclasses import asdict
+
+    root, relative = source_artifacts
+    config = projection.load_config(ROOT / "configs/phase0_4_source_projection.yaml", ROOT)
+    source_bytes = {}
+    for split in ("train", "validation"):
+        path = root / relative / f"{split}.jsonl"
+        record = json.loads(path.read_bytes())
+        records = []
+        for index, (xs, final) in enumerate([
+            ([0] * 7, 0), (list(range(7)), 0),
+            ([0, 1, 3, 6, 10, 15, 21], 2),
+            ([0, 6, 11, 15, 18, 20, 21], -2),
+        ]):
+            points = trajectory(xs, [i * final / 6 for i in range(7)])
+            records.append({
+                **record, "sample_token": f"{split}-{index}",
+                "future_ego_trajectory": [asdict(point) for point in points],
+            })
+        payload = "".join(json.dumps(row) + "\n" for row in records).encode()
+        path.write_bytes(payload)
+        source_bytes[path] = payload
+        monkeypatch.setitem(analyzer.AUDITED_SOURCE_SHA256, split, hashlib.sha256(payload).hexdigest())
+    monkeypatch.setattr(derivation, "load_config", lambda *args: replace(
+        config, source_contract=replace(config.source_contract, expected_sample_counts={"train": 4, "validation": 4}),
+    ))
+    summary = derivation.derive_sources(root, ["train", "validation"])
+    for split in ("train", "validation"):
+        assert summary["splits"][split]["sample_count"] == 4
+        assert summary["splits"][split]["factorized_action_joint_valid"]["ratio"] == 1
+    for path, payload in source_bytes.items():
+        assert path.read_bytes() == payload
+    output = root / derivation.OUTPUT_RELATIVE_DIR
+    assert (output / "review.html").is_file()
+    assert "REVIEWER-ONLY GT FUTURE" in (output / "review.html").read_text()
+    assert summary["access_evidence"]["test_sample_records_read"] == 0
+    with pytest.raises(FileExistsError):
+        derivation.derive_sources(root, ["train", "validation"])

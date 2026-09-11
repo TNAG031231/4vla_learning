@@ -5,6 +5,7 @@
 - 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `completed`。
 - Phase 0.3a-1、Phase 0.3a-2、Phase 0.3b、Phase 0.3c、Phase 0.3d、Phase 0.3e-1 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
 - 当前状态已确认 Qwen3-VL full-validation zero-shot baseline、real LoRA smoke training chain，以及 pinned processor / planning visual feature interface；不代表 full-validation LoRA performance、test performance、full-validation feature extraction 或最终 VLA model training 已完成。
+- Phase 0.4a-3 factorized target derivation 为 `completed`，v0.1 rule 为 `frozen`；真实 AutoDL derivation 与 28 条 representative / boundary 人工审核已通过。Temporal history、waypoint dataset 与 Phase 0.4b training 尚未开始。
 
 ## Confirmed Milestones
 
@@ -209,12 +210,36 @@ source_audit_record
 - Phase 0.2d 状态为 `consumed_failed`；后续必须新增独立的 validation-artifact schema adapter 和真实 artifact-shape regression test。该修复仅适用于未来协议，不得用于重跑当前 test。
 - validation artifact adapter 与 producer-shape regression 已完成，但仅适用于未来协议，不授权重跑已消费 test。
 
+## Phase 0.4a-3 Factorized Target Derivation v0.1
+
+- 状态：`completed` / rule `frozen`；以下真实 AutoDL 结果及人工审核结论由用户确认。
+- `factorized_action_rule_version=phase0.4-factorized-action-v0.1`。Targets 从 frozen future trajectory → deterministic motion features 独立派生；`source_legacy_meta_action` 仅作 provenance，旧标签与 frozen source 保持不变。
+- Longitudinal 优先级：`path_length_m <= 0.6` 且 `end_speed_proxy_mps <= 0.6` 时为 `stop`；否则 `delta_speed_proxy_mps >= +1.0` 为 `accelerate`，`<= -1.0` 为 `decelerate`，其余为 `keep`。
+- Lateral 沿用 current ego frame（x forward、y left，单位 m）：`final_lateral_displacement_m >= +1.0` 为 `left`，`<= -1.0` 为 `right`，其余为 `straight`；heading 不作为硬性条件。两方向采用 inclusive thresholds，不设 uncertainty band。
+
+| direction / action | train（14,253）count / ratio | validation（3,594）count / ratio |
+|---|---:|---:|
+| longitudinal / stop | 2,430 / 17.049% | 613 / 17.056% |
+| longitudinal / decelerate | 2,852 / 20.010% | 686 / 19.087% |
+| longitudinal / keep | 6,376 / 44.734% | 1,616 / 44.964% |
+| longitudinal / accelerate | 2,595 / 18.207% | 679 / 18.893% |
+| longitudinal / invalid | 0 / 0% | 0 / 0% |
+| lateral / left | 1,350 / 9.472% | 341 / 9.488% |
+| lateral / straight | 11,247 / 78.910% | 2,836 / 78.909% |
+| lateral / right | 1,656 / 11.619% | 417 / 11.603% |
+| lateral / invalid | 0 / 0% | 0 / 0% |
+
+- `factorized_action_joint_valid = longitudinal_action_valid AND lateral_action_valid`；train 为 `14253/14253`，validation 为 `3594/3594`，均为 `1.0`（100%）。各方向保留独立 validity / reason，联合有效性不覆盖单方向监督。
+- `review_record_count=28`，representative human review 为 `passed`：未发现 longitudinal direction、left/right coordinate semantics、stop rule 或 factorized combination 的系统性错误；±1.0 m lateral 与 ±1.0 m/s speed-change 附近样本符合 v0.1 inclusive threshold contract。
+- Test access：`test_sample_records_read=0`、`test_images_opened=0`、`test_labels_read=0`。
+- 当前能力边界：factorized targets 及本轮真实派生与人工审核已完成；temporal history、waypoint dataset、Phase 0.4b training 尚未开始。
+
 ## Next Gate
 
 - 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
 - Phase 0.3 overall 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
 - Phase 0.4a-1 real-data gate 已通过（用户确认的 AutoDL artifact audit）：train 14,253 records / 560 scenes，validation 3,594 records / 140 scenes；unique sample_token 17,847，scene overlap 0，malformed trajectories 0，7-point raw trajectory contract PASS。
 - Source artifact SHA-256：train `8c1ad5cc2ad4fa01d7730b1458a7415061ed40b0198495ddb36fbb035d738352`；validation `68ab5a06440447f31bbfcb8fa4678bf248b5ab3f718d978cba25d8b568e77246`。
-- 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4 后续 factorized target、temporal dataset 与模型训练仍未完成。
+- 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4a-3 factorized targets 已完成并冻结，后续 temporal history、waypoint dataset 与 Phase 0.4b training 尚未开始。
 - Phase 0.4 仅可使用 train/validation 进行开发与模型选择，不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
 - 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
