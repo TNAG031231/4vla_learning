@@ -39,3 +39,104 @@ def extract_motion_features(
         "final_heading_delta_rad": headings[-1],
         "max_abs_heading_delta_rad": max(abs(value) for value in headings),
     }
+
+
+FACTORIZED_ACTION_RULE_VERSION = "phase0.4-factorized-action-v0.1"
+LONGITUDINAL_ACTIONS = ("stop", "decelerate", "keep", "accelerate")
+LATERAL_ACTIONS = ("left", "straight", "right")
+STOP_PATH_LENGTH_M = 0.6
+STOP_END_SPEED_MPS = 0.6
+SPEED_CHANGE_MPS = 1.0
+LATERAL_DISPLACEMENT_M = 1.0
+
+
+def derive_feature_targets(features: dict[str, float]) -> dict[str, object]:
+    """Classify each direction using only its required motion features."""
+    required = {
+        "longitudinal": (
+            "path_length_m", "end_speed_proxy_mps", "delta_speed_proxy_mps",
+        ),
+        "lateral": ("final_lateral_displacement_m",),
+    }
+    result: dict[str, object] = {
+        "factorized_action_rule_version": FACTORIZED_ACTION_RULE_VERSION,
+    }
+    for direction, names in required.items():
+        invalid = next((
+            name for name in names
+            if name not in features or not math.isfinite(features[name])
+        ), None)
+        result[f"{direction}_action"] = None
+        result[f"{direction}_action_valid"] = invalid is None
+        result[f"{direction}_action_reason"] = (
+            f"missing_or_nonfinite_feature:{invalid}" if invalid else "valid"
+        )
+    if result["longitudinal_action_valid"]:
+        if (
+            features["path_length_m"] <= STOP_PATH_LENGTH_M
+            and features["end_speed_proxy_mps"] <= STOP_END_SPEED_MPS
+        ):
+            action = "stop"
+        elif features["delta_speed_proxy_mps"] >= SPEED_CHANGE_MPS:
+            action = "accelerate"
+        elif features["delta_speed_proxy_mps"] <= -SPEED_CHANGE_MPS:
+            action = "decelerate"
+        else:
+            action = "keep"
+        result["longitudinal_action"] = action
+        result["longitudinal_action_reason"] = f"v0.1:{action}"
+    if result["lateral_action_valid"]:
+        displacement = features["final_lateral_displacement_m"]
+        action = (
+            "left" if displacement >= LATERAL_DISPLACEMENT_M
+            else "right" if displacement <= -LATERAL_DISPLACEMENT_M
+            else "straight"
+        )
+        result["lateral_action"] = action
+        result["lateral_action_reason"] = f"v0.1:{action}"
+    result["factorized_action_joint_valid"] = (
+        result["longitudinal_action_valid"] and result["lateral_action_valid"]
+    )
+    return result
+
+
+def derive_trajectory_targets(
+    trajectory: Sequence[TrajectoryPoint],
+    *,
+    sample_interval_sec: float,
+    time_tolerance_sec: float,
+    anchor_absolute_tolerance: float,
+) -> dict[str, object]:
+    """Check the frozen timing/geometry boundary before feature extraction."""
+    reason = None
+    if len(trajectory) != 7:
+        reason = "missing_or_incomplete_trajectory"
+    elif any(
+        not math.isfinite(value)
+        for point in trajectory
+        for value in (point.t_sec, point.x_m, point.y_m, point.heading_delta_rad)
+    ):
+        reason = "nonfinite_trajectory"
+    elif trajectory[0].t_sec != 0 or any(
+        second.t_sec <= first.t_sec
+        for first, second in zip(trajectory, trajectory[1:])
+    ) or any(
+        abs(point.t_sec - index * sample_interval_sec) > time_tolerance_sec
+        for index, point in enumerate(trajectory)
+    ):
+        reason = "invalid_trajectory_time"
+    elif any(
+        abs(value) > anchor_absolute_tolerance
+        for value in (
+            trajectory[0].x_m, trajectory[0].y_m,
+            trajectory[0].heading_delta_rad,
+        )
+    ):
+        reason = "invalid_current_anchor"
+    if reason:
+        result = derive_feature_targets({})
+        for direction in ("longitudinal", "lateral"):
+            result[f"{direction}_action_reason"] = reason
+        return {**result, "motion_features": None}
+    features = extract_motion_features(trajectory)
+    return {**derive_feature_targets(features), "motion_features": features}
