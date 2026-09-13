@@ -1,0 +1,6 @@
+temporal_dataset_schema_version: phase0.4-temporal-waypoint-v0.1
+history_length: 3
+history_policy: null_padding
+history_order: oldest_to_current
+availability_lengths: [1, 2, 3, 4]
+output_relative_dir: phase_0_4/temporal_waypoint_v0_1
