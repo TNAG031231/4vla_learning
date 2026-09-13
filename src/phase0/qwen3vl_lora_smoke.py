@@ -8,7 +8,7 @@ from importlib import metadata
 import json
 import math
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import yaml
 
@@ -58,6 +58,35 @@ class Optimizer(Protocol):
 
     def step(self) -> None:
         ...
+
+
+class LoraSettings(Protocol):
+    @property
+    def lora_r(self) -> int: ...
+    @property
+    def lora_alpha(self) -> int: ...
+    @property
+    def lora_dropout(self) -> float: ...
+    @property
+    def lora_bias(self) -> str: ...
+    @property
+    def lora_task_type(self) -> str: ...
+    @property
+    def lora_target_modules(self) -> tuple[str, ...]: ...
+
+
+class TrainingSchedule(Protocol):
+    @property
+    def max_steps(self) -> int: ...
+    @property
+    def gradient_accumulation_steps(self) -> int: ...
+
+
+SampleT = TypeVar("SampleT", contravariant=True)
+
+
+class SupervisedCollator(Protocol[SampleT]):
+    def __call__(self, samples: Sequence[SampleT], *, expected_split: str) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -692,7 +721,7 @@ class Qwen3VLSupervisedCollator:
         return result
 
 
-def lora_config_kwargs(config: LoraSmokeConfig) -> dict[str, object]:
+def lora_config_kwargs(config: LoraSettings) -> dict[str, object]:
     return {
         "r": config.lora_r,
         "lora_alpha": config.lora_alpha,
@@ -706,7 +735,7 @@ def lora_config_kwargs(config: LoraSmokeConfig) -> dict[str, object]:
 def inject_lora(
     model: object,
     *,
-    config: LoraSmokeConfig,
+    config: LoraSettings,
     dependencies: RuntimeDependencies,
 ) -> object:
     for parameter in model.parameters():
@@ -808,10 +837,10 @@ def _move_batch(batch: Mapping[str, object], device: str) -> dict[str, object]:
 def run_training_steps(
     *,
     model: object,
-    samples: Sequence[AdapterSample],
-    collator: Qwen3VLSupervisedCollator,
+    samples: Sequence[SampleT],
+    collator: SupervisedCollator[SampleT],
     optimizer: Optimizer,
-    config: LoraSmokeConfig,
+    config: TrainingSchedule,
     device: str,
 ) -> list[float]:
     model.train()
