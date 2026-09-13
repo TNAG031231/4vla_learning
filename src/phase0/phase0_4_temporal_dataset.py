@@ -59,8 +59,15 @@ def collect_history(reader: NuScenesReader, record: dict, length: int) -> list[d
     result = frames[:length]
     for frame in result:
         frame["motion"] = current_ego_motion(reader, frame["token"])
-    if result[0]["motion"] != record["current_ego_motion"]:
-        raise ValueError("anchor motion differs from frozen producer")
+    for key, expected in record["current_ego_motion"].items():
+        actual = result[0]["motion"][key]
+        matches = (
+            math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+            if isinstance(actual, float) and isinstance(expected, float)
+            else actual == expected
+        )
+        if not matches:
+            raise ValueError("anchor motion differs from frozen producer")
     return list(reversed(result))
 
 

@@ -198,3 +198,21 @@ def test_serialized_schema_validation(case, field, value, message):
     result[field] = value
     with pytest.raises(ValueError, match=message):
         validate_record(result)
+
+
+def test_anchor_motion_accepts_observed_cross_platform_roundoff(case, monkeypatch):
+    from src.phase0 import phase0_4_temporal_dataset as temporal
+
+    reader, records = case
+    records[3]["current_ego_motion"]["yaw_rate_radps"] = 0.022630699712793412
+    producer = temporal.current_ego_motion
+
+    def local_motion(reader, token):
+        motion = producer(reader, token)
+        if token == records[3]["sample_token"]:
+            motion["yaw_rate_radps"] = 0.022630699712795632
+        return motion
+
+    monkeypatch.setattr(temporal, "current_ego_motion", local_motion)
+    history = collect_history(reader, records[3], 3)
+    assert history[-1]["motion"]["yaw_rate_radps"] == 0.022630699712795632
