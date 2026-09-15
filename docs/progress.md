@@ -245,12 +245,30 @@ source_audit_record
 - 生成 summary 的 `combined_manifest_records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 `0`。
 - Artifact 位于 `$VLA_DERIVED_ROOT/phase_0_4/temporal_waypoint_v0_1/`：train/validation JSONL、`dataset_summary.json`、`review_records.jsonl` 与 `review.html`；12 条审核样本覆盖两个 split 的 full/padded 和 left/straight/right，明确标为 reviewer-only GT future information。用户已确认 representative human review 为 `PASS`：历史顺序、scene-start padding/mask、ego-motion availability 和 waypoint 坐标方向符合合同，未发现阻塞数据错误。Phase 0.4a-4 为 `completed`，Phase 0.4a overall gate 为 `PASS`；Phase 0.4b training 为 `NOT STARTED`。生成时 artifact 中的 pending 状态保留为历史记录，本次审核结论以本节及 PR #44 Closeout 为准。
 
+## Phase 0.4b-A Structured Factorized Action LoRA Smoke
+
+- 状态：real AutoDL GPU smoke `completed` / `PASS`；用户本人真实执行并确认，artifact `status=smoke_passed`，`execution_git_commit=fe0ae161be6fedf15e80f1f532ece52ab6bb2afd`。
+- 模型为 `Qwen/Qwen3-VL-4B-Instruct`，model / processor revision 均为 `ebb281ec70b05090aa6165b016eac8ec08e71b17`。Canonical serialization 为 `longitudinal=<value>; lateral=<value>`；prompt / serialization / parser 版本分别为 `phase0.4b-factorized-action-prompt-v0.1`、`phase0.4b-factorized-action-serialization-v0.1`、`phase0.4b-factorized-action-parser-v0.1`，已通过真实 tokenizer/processor 与真实 LoRA smoke 验证；四种独立 validity masking 由 synthetic contract cases 验证。
+- 训练使用同一 exact tiny train subset 12 条样本，optimizer steps `60`、gradient accumulation `4`；LoRA rank `8`、alpha `16`、dropout `0.05`，target modules 为 `q_proj/k_proj/v_proj/o_proj`，trainable parameters `5,898,240`。同一子集 eval-mode supervised-token mean loss 从 `0.9590820153263739` 降至 fresh adapter reload 后的 `9.701040496429802e-05`；这两个数不是训练首末 step loss。
+
+| exact tiny train subset | before training | after fresh adapter reload |
+|---|---:|---:|
+| longitudinal accuracy | 0.25 | 1.0 |
+| lateral accuracy | 0.5833333333333334 | 1.0 |
+| joint accuracy | 0.16666666666666666 | 1.0 |
+| parser success rate | 1.0 | 1.0 |
+| invalid output rate | 0.0 | 0.0 |
+
+- LoRA B：144 个 tensors，nonzero tensor count `0 → 144`，训练后 nonzero elements `2,506,752`、norm `2.094771557660345`，`lora_parameters_updated=true`。Adapter checkpoint 已保存，fresh base + adapter reload / structured generation 成功，`reload_status=success`、`full_model_saved=false`。
+- Artifact 位于 `$VLA_DERIVED_ROOT/phase_0_4/structured_action_lora_smoke_v0_1/`，包含 `smoke_result.json` 与 `adapter_checkpoint/`，不进入 Git。`test_records_read`、`combined_manifest_records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 全部为 `0`；`test_evaluation_performed=false`、`validation_evaluation_performed=false`。
+- 能力边界：已证明 structured action SFT、真实 optimizer 更新、tiny-subset overfit 与 adapter save/fresh reload 链路可运行；tiny overfit 不是 generalization evidence。Phase 0.4b validation/full training 与 Phase 0.4b-B 尚未开始，waypoint planner、BEV/OCC 与后续阶段尚未执行。
+
 ## Next Gate
 
 - 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
 - Phase 0.3 overall 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
 - Phase 0.4a-1 real-data gate 已通过（用户确认的 AutoDL artifact audit）：train 14,253 records / 560 scenes，validation 3,594 records / 140 scenes；unique sample_token 17,847，scene overlap 0，malformed trajectories 0，7-point raw trajectory contract PASS。
 - Source artifact SHA-256：train `8c1ad5cc2ad4fa01d7730b1458a7415061ed40b0198495ddb36fbb035d738352`；validation `68ab5a06440447f31bbfcb8fa4678bf248b5ab3f718d978cba25d8b568e77246`。
-- 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4a-3 factorized targets 已完成并冻结，Phase 0.4a-4 为 `completed`，真实生成、验证及人工审核均已通过；Phase 0.4a overall gate 为 `PASS`，Phase 0.4b training 为 `NOT STARTED`。
+- 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4a-3 factorized targets 已完成并冻结，Phase 0.4a-4 为 `completed`，真实生成、验证及人工审核均已通过；Phase 0.4a overall gate 为 `PASS`。Phase 0.4b-A real GPU smoke 为 `completed` / `PASS`；Phase 0.4b validation/full training 与 Phase 0.4b-B 尚未开始。
 - Phase 0.4 仅可使用 train/validation 进行开发与模型选择，不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
 - 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
