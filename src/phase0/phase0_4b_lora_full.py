@@ -8,6 +8,7 @@ from itertools import zip_longest
 import math
 from pathlib import Path
 import random
+from time import perf_counter
 
 import yaml
 
@@ -50,6 +51,7 @@ class FullConfig:
     lora_task_type: str
     lora_target_modules: tuple[str, ...]
     local_files_only: bool
+    log_every_steps: int
     checkpoint_fractions: tuple[float, ...]
     failure_examples_per_category: int
     lateral_collapse_straight_fraction: float
@@ -82,6 +84,8 @@ def load_config(path: Path) -> FullConfig:
         raise ValueError("seed must be integer and failure example count positive")
     if not 0 < config.lateral_collapse_straight_fraction <= 1:
         raise ValueError("collapse reporting fraction must be in (0,1]")
+    if type(config.log_every_steps) is not int or not 20 <= config.log_every_steps <= 50:
+        raise ValueError("log_every_steps must be an integer between 20 and 50")
     return config
 
 
@@ -106,14 +110,26 @@ def learning_rate_at_step(step: int, total: int, config: FullConfig) -> float:
     return config.learning_rate * (1 + math.cos(math.pi * progress)) / 2
 
 
+def synchronize_device(device: str) -> None:
+    if device.startswith("cuda"):
+        import torch
+
+        torch.cuda.synchronize(device)
+
+
 def train_one_epoch(*, model: object, samples: list[SFTSample], collator: StructuredCollator,
                     optimizer: object, config: FullConfig, device: str,
                     on_step: Callable[[dict], None]) -> list[dict]:
     total = math.ceil(len(samples) / config.gradient_accumulation_steps)
     history = []
     consumed = 0
+    micro_batches = 0
+    optimizer_steps = 0
     model.train()
     optimizer.zero_grad()
+    synchronize_device(device)
+    training_started = perf_counter()
+    callback_seconds = 0.0
     for step, group in enumerate(epoch_groups(samples, config.gradient_accumulation_steps, config.seed), 1):
         lr = learning_rate_at_step(step, total, config)
         for parameters in optimizer.param_groups:
@@ -131,25 +147,53 @@ def train_one_epoch(*, model: object, samples: list[SFTSample], collator: Struct
         # An all-invalid group has no loss and must not trigger AdamW weight decay.
         if supervised:
             optimizer.step()
+            optimizer_steps += 1
         optimizer.zero_grad()
+        synchronize_device(device)
         consumed += len(group)
+        micro_batches += len(supervised)
+        elapsed = perf_counter() - training_started - callback_seconds
         entry = {"step": step, "sample_count": len(group), "consumed_sample_count": consumed,
                  "supervised_sample_count": len(supervised), "optimizer_step_performed": bool(supervised),
-                 "loss": loss_sum / len(supervised) if supervised else None, "learning_rate": lr}
+                 "loss": loss_sum / len(supervised) if supervised else None, "learning_rate": lr,
+                 "training_elapsed_seconds": elapsed, "micro_batches_completed": micro_batches,
+                 "optimizer_steps_completed": optimizer_steps,
+                 "mean_seconds_per_train_sample": elapsed / consumed,
+                 "train_samples_per_second": consumed / elapsed if elapsed else None,
+                 "estimated_remaining_training_seconds": elapsed / consumed * (len(samples) - consumed)}
         history.append(entry)
+        if step % config.log_every_steps == 0 or step == total:
+            print(json.dumps({"event": "training_progress", **entry}), flush=True)
+        callback_started = perf_counter()
         on_step(entry)
+        callback_seconds += perf_counter() - callback_started
         model.train()
     return history
 
 
 def evaluate_validation(model: object, samples: list[SFTSample], collator: StructuredCollator,
-                        config: FullConfig, device: str, runtime: object) -> list[dict]:
+                        config: FullConfig, device: str, runtime: object, *,
+                        evaluation_name: str = "validation") -> tuple[list[dict], dict]:
     if not samples or any(s.split != "validation" for s in samples):
         raise ValueError("evaluation requires nonempty validation samples only")
     model.eval()
+    synchronize_device(device)
+    started = perf_counter()
+    predictions = []
     with runtime.inference_context():
-        return [predict_sample(model, s, collator, config.generation_kwargs, device,
-                               expected_split="validation") for s in samples]
+        for count, sample in enumerate(samples, 1):
+            predictions.append(predict_sample(model, sample, collator, config.generation_kwargs,
+                                              device, expected_split="validation"))
+            if count % config.log_every_steps == 0 or count == len(samples):
+                synchronize_device(device)
+                elapsed = perf_counter() - started
+                timing = {"evaluation_name": evaluation_name, "validation_samples_completed": count,
+                          "validation_total_seconds": elapsed,
+                          "mean_seconds_per_validation_sample": elapsed / count,
+                          "validation_samples_per_second": count / elapsed if elapsed else None,
+                          "estimated_remaining_validation_seconds": elapsed / count * (len(samples) - count)}
+                print(json.dumps({"event": "validation_progress", **timing}), flush=True)
+    return predictions, timing
 
 
 def prepare_data(repository: Path, derived_root: Path, config: FullConfig
@@ -184,6 +228,7 @@ def write_json(path: Path, value: object) -> None:
 
 def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
              config: FullConfig, git_provenance: object) -> dict:
+    run_started = perf_counter()
     git = validate_git_provenance(git_provenance)
     output = resolve_derived_path(derived_root, config.output_relative_dir)
     if output.is_relative_to(repository.resolve()):
@@ -202,10 +247,15 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
         raise ValueError("formal Phase 0.4b-B requires BF16 support")
     processor = runtime.processor_loader(FIXED_MODEL_ID, FIXED_REVISION, config.local_files_only)
     collator = StructuredCollator(processor, runtime.image_loader, dataset_root)
+    load_started = perf_counter()
     base = runtime.model_loader(FIXED_MODEL_ID, FIXED_REVISION, dtype,
                                 config.attention_implementation, config.local_files_only)
     base.to(device)
     model = inject_lora(base, config=config, dependencies=runtime)
+    synchronize_device(device)
+    model_load_seconds = perf_counter() - load_started
+    print(json.dumps({"event": "model_loaded", "stage": "training",
+                      "model_load_seconds": model_load_seconds}), flush=True)
     parameter_report = trainable_parameter_report(model, config.lora_target_modules)
     if parameter_report["trainable_parameter_count"] == 0:
         raise ValueError("no trainable LoRA parameters")
@@ -224,6 +274,8 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
         "serialization_version": SERIALIZATION_VERSION, "parser_version": PARSER_VERSION,
         "execution_git_commit": git.commit, "lora_config": lora_config_kwargs(config),
         "trainable_parameters": parameter_report, "full_model_saved": False,
+        "model_load_seconds": model_load_seconds,
+        "timing_scope": "training excludes checkpoint/evaluation callbacks; validation includes preprocessing and generation; total ends before summary write",
         "total_optimizer_steps": total, "checkpoint_steps": milestones,
         "checkpoint_selection_protocol": "mean_direction_macro_f1_then_joint_accuracy_then_parser_success_then_earliest",
         "generation_use_cache": False,
@@ -246,7 +298,10 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
             if entry["step"] in milestones:
                 checkpoint = output / f"adapter_step_{entry['step']:04d}"
                 model.save_pretrained(checkpoint)
-                predictions = evaluate_validation(model, validation, collator, config, device, runtime)
+                predictions, timing = evaluate_validation(
+                    model, validation, collator, config, device, runtime,
+                    evaluation_name=f"checkpoint_{entry['step']}",
+                )
                 metric = factorized_metrics(predictions)
                 prediction_path = output / f"validation_step_{entry['step']:04d}.json"
                 write_json(prediction_path, predictions)
@@ -254,6 +309,7 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
                             "metrics": metric, "selection_score": checkpoint_score(metric),
                             "validation_predictions_path": str(prediction_path),
                             "validation_sample_count": len(predictions),
+                            **timing,
                             "lora_B": lora_b_report(model), "full_model_saved": False}
                 checkpoints.append(metadata)
                 write_json(output / "milestone_checkpoints.json", checkpoints)
@@ -271,17 +327,25 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
     del on_step, optimizer, model, base
     gc.collect()
     torch.cuda.empty_cache()
+    load_started = perf_counter()
     fresh_base = runtime.model_loader(FIXED_MODEL_ID, FIXED_REVISION, dtype,
                                       config.attention_implementation, config.local_files_only)
     reloaded = runtime.adapter_loader(fresh_base, Path(selected["adapter_path"]))
     reloaded.to(device)
     reloaded.config.use_cache = False
+    synchronize_device(device)
+    fresh_model_load_seconds = perf_counter() - load_started
+    print(json.dumps({"event": "model_loaded", "stage": "fresh_reload",
+                      "model_load_seconds": fresh_model_load_seconds}), flush=True)
     restored = lora_b_report(reloaded)
     expected = selected["lora_B"]
     if (any(restored[key] != expected[key] for key in ("tensor_count", "nonzero_tensor_count", "nonzero_element_count"))
             or not math.isclose(restored["norm"], expected["norm"], rel_tol=1e-5, abs_tol=1e-8)):
         raise ValueError("selected adapter reload weight report mismatch")
-    predictions = evaluate_validation(reloaded, validation, collator, config, device, runtime)
+    predictions, final_timing = evaluate_validation(
+        reloaded, validation, collator, config, device, runtime, evaluation_name="fresh_reload",
+    )
+    write_json(output / "final_validation_timing.json", final_timing)
     metric = factorized_metrics(predictions)
     selection_predictions = json.loads(Path(selected["validation_predictions_path"]).read_text())
     differences = [
@@ -314,8 +378,18 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
         "reload_validation_consistent": comparison["matched"],
         "formal_validation_model": "fresh_pinned_base_plus_selected_saved_adapter",
         "validation_records_consumed": len(predictions), "validation_metrics": metric,
+        "training_total_seconds": history[-1]["training_elapsed_seconds"],
+        "mean_seconds_per_train_sample": history[-1]["mean_seconds_per_train_sample"],
+        "micro_batches_completed": history[-1]["micro_batches_completed"],
+        "fresh_model_load_seconds": fresh_model_load_seconds,
+        "checkpoint_validation_timings": [{key: c[key] for key in (
+            "step", "validation_total_seconds", "mean_seconds_per_validation_sample",
+            "validation_samples_completed", "validation_samples_per_second",
+        )} for c in checkpoints],
+        "final_validation_timing": final_timing,
         "generalization": generalization_summary(metric, baselines, config.lateral_collapse_straight_fraction),
         "validation_evaluation_performed": True,
+        "total_run_seconds": perf_counter() - run_started,
     }
     write_json(output / "training_summary.json", result)
     return result

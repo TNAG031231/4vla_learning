@@ -40,14 +40,19 @@ def test_epoch_visits_each_record_once_with_incomplete_group(samples):
     assert tokens == [s.sample_token for group in full.epoch_groups(list(reversed(train)), 4, 17) for s in group]
 
 
-def test_tail_gradient_uses_actual_group_size_and_no_cycling(samples, config):
+def test_tail_gradient_uses_actual_group_size_and_no_cycling(samples, config, monkeypatch, capsys):
     train = [replace(samples[0], sample_token=str(i)) for i in range(1, 6)]
     config = replace(config, learning_rate=0.1)
     visited = []
+    clock = [0.0]
+    monkeypatch.setattr(full, "perf_counter", lambda: clock[0])
+    def checkpoint_callback(entry):
+        clock[0] += 100.0
     class Collator:
         def __call__(self, group, expected_split):
             assert expected_split == "train"
             visited.extend(s.sample_token for s in group)
+            clock[0] += 2.0
             return {"target": torch.tensor(float(group[0].sample_token))}
     class Model(torch.nn.Module):
         def __init__(self):
@@ -58,7 +63,7 @@ def test_tail_gradient_uses_actual_group_size_and_no_cycling(samples, config):
     model = Model()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     history = full.train_one_epoch(model=model, samples=train, collator=Collator(), optimizer=optimizer,
-                                  config=config, device="cpu", on_step=lambda entry: None)
+                                  config=config, device="cpu", on_step=checkpoint_callback)
     expected = 0.0
     for step, group in enumerate(full.epoch_groups(train, 4, config.seed), 1):
         mean_target = sum(float(s.sample_token) for s in group) / len(group)
@@ -67,6 +72,14 @@ def test_tail_gradient_uses_actual_group_size_and_no_cycling(samples, config):
     assert len(set(visited)) == len(visited) == 5
     assert history[-1]["sample_count"] == 1
     assert history[-1]["consumed_sample_count"] == 5
+    assert history[-1]["training_elapsed_seconds"] == 10.0
+    assert history[-1]["mean_seconds_per_train_sample"] == 2.0
+    assert history[-1]["micro_batches_completed"] == 5
+    assert history[-1]["optimizer_steps_completed"] == 2
+    assert history[0]["estimated_remaining_training_seconds"] == 2.0
+    assert history[-1]["estimated_remaining_training_seconds"] == 0.0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["step"] == 2
 
 
 def test_both_invalid_consumed_without_loss_or_optimizer_decay(samples, config):
@@ -253,9 +266,18 @@ def test_synthetic_cpu_full_flow_releases_training_model_and_reloads_selected_ad
     assert calls.count("milestone_eval") == 16 and calls.count("fresh_eval") == 4
     assert result["selected_checkpoint"]["step"] == 1
     assert result["reload_validation_consistent"]
+    assert result["training_total_seconds"] > 0
+    assert result["mean_seconds_per_train_sample"] == result["training_total_seconds"] / len(train)
+    assert result["micro_batches_completed"] == len(train)
+    assert result["model_load_seconds"] > 0 and result["fresh_model_load_seconds"] > 0
+    assert result["total_run_seconds"] > result["training_total_seconds"]
+    assert len(result["checkpoint_validation_timings"]) == 4
+    assert result["final_validation_timing"]["validation_samples_completed"] == len(validation)
     checkpoints = json.loads((tmp_path / config.output_relative_dir / "milestone_checkpoints.json").read_text())
     for checkpoint in checkpoints:
         assert checkpoint["validation_sample_count"] == len(validation)
+        assert checkpoint["validation_total_seconds"] > 0
+        assert checkpoint["mean_seconds_per_validation_sample"] == checkpoint["validation_total_seconds"] / len(validation)
         rows = json.loads(Path(checkpoint["validation_predictions_path"]).read_text())
         assert [r["sample_token"] for r in rows] == [s.sample_token for s in validation]
         assert checkpoint["metrics"]["longitudinal_count"] == len(validation)
@@ -292,3 +314,43 @@ def test_cli_dry_run_uses_intake_without_runtime(config, samples, tmp_path, monk
     monkeypatch.setattr(cli, "run_full", lambda **kwargs: pytest.fail("training launched"))
     assert cli.main(["--dry-run", "--derived-root", str(tmp_path)]) == 0
     assert json.loads(capsys.readouterr().out)["gpu_training_executed"] is False
+
+
+def test_validation_timing_reports_throughput_eta_and_bounded_logs(samples, config, monkeypatch, capsys):
+    validation = [replace(samples[0], split="validation", sample_token=f"val-{i}") for i in range(60)]
+    clock = [0.0]
+    monkeypatch.setattr(full, "perf_counter", lambda: clock[0])
+    def prediction(model, sample, *args, expected_split):
+        assert expected_split == "validation"
+        clock[0] += 2.0
+        return {"sample_token": sample.sample_token}
+    monkeypatch.setattr(full, "predict_sample", prediction)
+    predictions, timing = full.evaluate_validation(
+        torch.nn.Linear(1, 1), validation, None, config, "cpu",
+        SimpleNamespace(inference_context=nullcontext), evaluation_name="checkpoint_891",
+    )
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row["validation_samples_completed"] for row in logs] == [25, 50, 60]
+    assert [row["estimated_remaining_validation_seconds"] for row in logs] == [70.0, 20.0, 0.0]
+    assert timing["validation_total_seconds"] == 120.0
+    assert timing["mean_seconds_per_validation_sample"] == 2.0
+    assert timing["validation_samples_per_second"] == 0.5
+    assert len(predictions) == 60
+
+
+def test_training_progress_logs_every_25_steps_plus_final(samples, config, monkeypatch, capsys):
+    train = [replace(samples[0], sample_token=str(i), target=ActionTarget(None, None, False, False))
+             for i in range(201)]
+    clock = [0.0]
+    def time_now():
+        clock[0] += 1.0
+        return clock[0]
+    monkeypatch.setattr(full, "perf_counter", time_now)
+    model = torch.nn.Linear(1, 1)
+    full.train_one_epoch(model=model, samples=train, collator=None,
+                         optimizer=torch.optim.AdamW(model.parameters()), config=config,
+                         device="cpu", on_step=lambda entry: None)
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row["step"] for row in logs] == [25, 50, 51]
+    assert logs[-1]["micro_batches_completed"] == logs[-1]["optimizer_steps_completed"] == 0
+    assert logs[-1]["consumed_sample_count"] == 201
