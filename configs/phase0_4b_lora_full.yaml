@@ -1,0 +1,28 @@
+protocol_version: phase0.4b-full-action-sft-v0.1
+seed: 20260812
+shuffle_version: sorted-token-python-random-v0.1
+num_train_epochs: 1
+micro_batch_size: 1
+gradient_accumulation_steps: 4
+optimizer: AdamW
+learning_rate: 0.0001
+warmup_ratio: 0.03
+lr_scheduler: cosine
+precision: bfloat16
+gradient_checkpointing: true
+attention_implementation: sdpa
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_bias: none
+lora_task_type: CAUSAL_LM
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+local_files_only: true
+checkpoint_fractions: [0.25, 0.5, 0.75, 1.0]
+failure_examples_per_category: 3
+lateral_collapse_straight_fraction: 0.95
+generation_kwargs:
+  do_sample: false
+  num_beams: 1
+  max_new_tokens: 24
+output_relative_dir: phase_0_4/structured_action_lora_full_v0_1

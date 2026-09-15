@@ -66,30 +66,52 @@ def load_config(path: Path) -> SmokeConfig:
 def load_samples(repository: Path, derived_root: Path, *, split: str = "train") -> list[SFTSample]:
     if split != "train":
         raise ValueError("Phase 0.4b-A only permits train")
+    return load_temporal_samples(repository, derived_root, split=split)
+
+
+def load_temporal_samples(repository: Path, derived_root: Path, *, split: str) -> list[SFTSample]:
+    if split not in ("train", "validation"):
+        raise ValueError("temporal intake only permits train and validation")
     source = load_source_config(repository / "configs/phase0_4_source_projection.yaml", repository)
     mapping = read_scene_mapping(derived_root / source.source_contract.scene_mapping_relative_path)
     selection = development.select_development_scenes(mapping, source.source_contract)
     temporal = yaml.safe_load((repository / "configs/phase0_4_temporal_dataset.yaml").read_text())
-    path = resolve_derived_path(derived_root, temporal["output_relative_dir"]) / "train.jsonl"
+    path = resolve_derived_path(derived_root, temporal["output_relative_dir"]) / f"{split}.jsonl"
     ego_config = load_ego_config(repository / "configs/phase0_3_dataset_adapter.yaml")
     samples, seen = [], set()
     with path.open() as stream:
         for line in stream:
             row = json.loads(line)
-            if row["split"] != "train" or row["scene_token"] not in selection.scene_tokens_by_split["train"]:
-                raise ValueError("temporal record outside frozen train scenes")
+            if row["split"] != split or row["scene_token"] not in selection.scene_tokens_by_split[split]:
+                raise ValueError("temporal record outside frozen split scenes")
             if row["split_mapping_sha256"] != mapping["scene_split_mapping_sha256"]:
                 raise ValueError("temporal record split mapping mismatch")
             if row["history_length"] != temporal["history_length"]:
                 raise ValueError("temporal history length mismatch")
-            sample = adapt_record(row, ego_config)
+            sample = adapt_record(row, ego_config, expected_split=split)
             if sample.sample_token in seen:
-                raise ValueError("duplicate temporal train sample")
+                raise ValueError("duplicate temporal sample")
             seen.add(sample.sample_token)
             samples.append(sample)
-    if len(samples) != source.source_contract.expected_sample_counts["train"]:
-        raise ValueError("temporal train count differs from frozen producer")
+    if len(samples) != source.source_contract.expected_sample_counts[split]:
+        raise ValueError("temporal count differs from frozen producer")
     return samples
+
+
+def predict_sample(model: object, sample: SFTSample, collator: StructuredCollator,
+                   generation_kwargs: dict, device: str, *, expected_split: str) -> dict:
+    inputs = collator.processor.apply_chat_template(
+        collator.messages(sample, expected_split=expected_split), tokenize=True,
+        add_generation_prompt=True, return_dict=True, return_tensors="pt",
+    )
+    output = model.generate(**_move_batch(inputs, device), **generation_kwargs)
+    raw = collator.processor.batch_decode(
+        output[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0]
+    return {"sample_token": sample.sample_token, "scene_token": sample.scene_token,
+            "split": sample.split, "target": asdict(sample.target),
+            "raw_output": raw, "parsed_action": parse_action(raw)}
 
 
 def select_tiny(samples: list[SFTSample], size: int, seed: int) -> list[SFTSample]:
@@ -137,18 +159,8 @@ def evaluate(model: object, samples: list[SFTSample], collator: StructuredCollat
                 raise ValueError("evaluation loss must be finite")
             total_loss += loss * count
             token_count += count
-            inputs = collator.processor.apply_chat_template(
-                collator.messages(sample), tokenize=True, add_generation_prompt=True,
-                return_dict=True, return_tensors="pt",
-            )
-            output = model.generate(**_move_batch(inputs, device), **config.generation_kwargs)
-            raw = collator.processor.batch_decode(
-                output[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[0]
-            predictions.append({"sample_token": sample.sample_token, "split": sample.split,
-                                "target": asdict(sample.target), "raw_output": raw,
-                                "parsed_action": parse_action(raw)})
+            predictions.append(predict_sample(model, sample, collator, config.generation_kwargs,
+                                              device, expected_split="train"))
     return total_loss / token_count, predictions
 
 

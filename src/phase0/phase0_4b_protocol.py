@@ -77,9 +77,9 @@ class SFTSample:
     target: ActionTarget
 
 
-def adapt_record(record: dict, ego_config: AdapterConfig) -> SFTSample:
-    if record["split"] != "train":
-        raise ValueError("Phase 0.4b-A only permits train")
+def adapt_record(record: dict, ego_config: AdapterConfig, *, expected_split: str = "train") -> SFTSample:
+    if expected_split not in ("train", "validation") or record["split"] != expected_split:
+        raise ValueError("default intake only permits train; explicit validation intake requires matching split")
     validate_record(record)
     paths, texts = [], []
     for path, time, motion, valid in zip(
@@ -180,9 +180,9 @@ class StructuredCollator:
         self.image_loader = image_loader
         self.dataset_root = dataset_root
 
-    def messages(self, sample: SFTSample) -> list[dict]:
-        if sample.split != "train":
-            raise ValueError("Phase 0.4b-A only permits train")
+    def messages(self, sample: SFTSample, *, expected_split: str = "train") -> list[dict]:
+        if expected_split not in ("train", "validation") or sample.split != expected_split:
+            raise ValueError("inference sample must match the permitted train/validation split")
         images = [self.image_loader(resolve_image_path(self.dataset_root, path))
                   for path in sample.observation.image_paths]
         return inference_messages(sample.observation, images)
