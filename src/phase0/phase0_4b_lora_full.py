@@ -177,6 +177,7 @@ def evaluate_validation(model: object, samples: list[SFTSample], collator: Struc
     if not samples or any(s.split != "validation" for s in samples):
         raise ValueError("evaluation requires nonempty validation samples only")
     model.eval()
+    model.config.use_cache = True
     synchronize_device(device)
     started = perf_counter()
     predictions = []
@@ -278,7 +279,8 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
         "timing_scope": "training excludes checkpoint/evaluation callbacks; validation includes preprocessing and generation; total ends before summary write",
         "total_optimizer_steps": total, "checkpoint_steps": milestones,
         "checkpoint_selection_protocol": "mean_direction_macro_f1_then_joint_accuracy_then_parser_success_then_earliest",
-        "generation_use_cache": False,
+        "training_use_cache": False,
+        "validation_generation_use_cache": True,
         "warmup_steps": math.ceil(total * config.warmup_ratio),
         "scheduler_version": "linear-warmup-then-cosine-one-based-v0.1",
         "scheduler_definition": "warmup: lr*step/warmup; cosine: lr*(1+cos(pi*(step-warmup-1)/(total-warmup)))/2",
@@ -302,6 +304,7 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
                     model, validation, collator, config, device, runtime,
                     evaluation_name=f"checkpoint_{entry['step']}",
                 )
+                model.config.use_cache = False
                 metric = factorized_metrics(predictions)
                 prediction_path = output / f"validation_step_{entry['step']:04d}.json"
                 write_json(prediction_path, predictions)
@@ -332,7 +335,6 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
                                       config.attention_implementation, config.local_files_only)
     reloaded = runtime.adapter_loader(fresh_base, Path(selected["adapter_path"]))
     reloaded.to(device)
-    reloaded.config.use_cache = False
     synchronize_device(device)
     fresh_model_load_seconds = perf_counter() - load_started
     print(json.dumps({"event": "model_loaded", "stage": "fresh_reload",

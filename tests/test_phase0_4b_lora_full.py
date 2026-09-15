@@ -192,8 +192,10 @@ def test_synthetic_cpu_full_flow_releases_training_model_and_reloads_selected_ad
             super().__init__()
             self.base_weight = torch.nn.Parameter(torch.zeros(1))
             self.config = SimpleNamespace(use_cache=True)
+            self.checkpointing_enabled = False
         def forward(self, **batch):
             assert self.training and (batch["labels"] != -100).any()
+            assert self.checkpointing_enabled and self.config.use_cache is False
             calls.append("train")
             if failure == "nonfinite":
                 return SimpleNamespace(loss=self.lora_B.sum() * float("nan"))
@@ -202,6 +204,9 @@ def test_synthetic_cpu_full_flow_releases_training_model_and_reloads_selected_ad
             return SimpleNamespace(loss=(self.lora_B - 1).square().mean())
         def generate(self, **batch):
             assert not self.training and "labels" not in batch
+            assert self.config.use_cache is True
+            assert torch.is_inference_mode_enabled()
+            assert {key: batch[key] for key in config.generation_kwargs} == config.generation_kwargs
             calls.append("fresh_eval" if len(refs) == 2 else "milestone_eval")
             text = "longitudinal=keep; lateral=straight"
             if failure == "prediction_mismatch" and len(refs) == 2:
@@ -211,7 +216,7 @@ def test_synthetic_cpu_full_flow_releases_training_model_and_reloads_selected_ad
             ids = processor.tokenizer.encode(text, add_special_tokens=False)
             return torch.cat((batch["input_ids"], torch.tensor([ids])), dim=1)
         def gradient_checkpointing_enable(self):
-            pass
+            self.checkpointing_enabled = True
         def enable_input_require_grads(self):
             pass
         def save_pretrained(self, path):
@@ -239,7 +244,7 @@ def test_synthetic_cpu_full_flow_releases_training_model_and_reloads_selected_ad
         lora_injector=inject, adapter_loader=reload,
         optimizer_factory=lambda params, lr: torch.optim.AdamW(params, lr=lr),
         image_loader=lambda path: Image.new("RGB", (64, 64)), dtype_selector=lambda _: torch.bfloat16,
-        device_selector=lambda _: "cpu", inference_context=nullcontext, package_version=lambda _: "synthetic",
+        device_selector=lambda _: "cpu", inference_context=torch.inference_mode, package_version=lambda _: "synthetic",
     )
     monkeypatch.setattr(full, "default_runtime_dependencies", lambda: runtime)
     provenance = GitProvenance("a" * 40, "synthetic", False, True)
@@ -266,6 +271,9 @@ def test_synthetic_cpu_full_flow_releases_training_model_and_reloads_selected_ad
     assert calls.count("milestone_eval") == 16 and calls.count("fresh_eval") == 4
     assert result["selected_checkpoint"]["step"] == 1
     assert result["reload_validation_consistent"]
+    assert result["training_use_cache"] is False
+    assert result["validation_generation_use_cache"] is True
+    assert "generation_use_cache" not in result
     assert result["training_total_seconds"] > 0
     assert result["mean_seconds_per_train_sample"] == result["training_total_seconds"] / len(train)
     assert result["micro_batches_completed"] == len(train)
@@ -289,6 +297,10 @@ def test_synthetic_cpu_full_flow_releases_training_model_and_reloads_selected_ad
     assert all(result[key] == 0 for key in ("test_records_read", "test_scene_traversal_attempts",
         "test_sample_records_read", "test_images_opened", "test_labels_read"))
     output = tmp_path / config.output_relative_dir
+    resolved = json.loads((output / "resolved_config.json").read_text())
+    assert resolved["training_use_cache"] is False
+    assert resolved["validation_generation_use_cache"] is True
+    assert "generation_use_cache" not in resolved
     history = [json.loads(line) for line in (output / "training_history.jsonl").read_text().splitlines()]
     assert history[-1]["sample_count"] == 1
     assert len(list(output.glob("adapter_step_*"))) == 4
@@ -325,8 +337,10 @@ def test_validation_timing_reports_throughput_eta_and_bounded_logs(samples, conf
         clock[0] += 2.0
         return {"sample_token": sample.sample_token}
     monkeypatch.setattr(full, "predict_sample", prediction)
+    model = torch.nn.Linear(1, 1)
+    model.config = SimpleNamespace(use_cache=False)
     predictions, timing = full.evaluate_validation(
-        torch.nn.Linear(1, 1), validation, None, config, "cpu",
+        model, validation, None, config, "cpu",
         SimpleNamespace(inference_context=nullcontext), evaluation_name="checkpoint_891",
     )
     logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
