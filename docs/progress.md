@@ -286,10 +286,11 @@ source_audit_record
 
 ## Next Gate
 
-- 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
+- Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
+- 当前 test 不进入 Phase 0.4b / 0.4c / 0.4d 的模型选择或开发反馈；test 保留给最终冻结 VLA pipeline 的一次正式 evaluation。
+- 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。
+- 历史 Phase 0.2d 曾有一次 failed rule-baseline test execution attempt，但没有产生正式 test metrics，也没有影响当前模型训练或 checkpoint selection。
 - Phase 0.3 overall 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
 - Phase 0.4a-1 real-data gate 已通过（用户确认的 AutoDL artifact audit）：train 14,253 records / 560 scenes，validation 3,594 records / 140 scenes；unique sample_token 17,847，scene overlap 0，malformed trajectories 0，7-point raw trajectory contract PASS。
 - Source artifact SHA-256：train `8c1ad5cc2ad4fa01d7730b1458a7415061ed40b0198495ddb36fbb035d738352`；validation `68ab5a06440447f31bbfcb8fa4678bf248b5ab3f718d978cba25d8b568e77246`。
 - 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4a-3 factorized targets 已完成并冻结，Phase 0.4a-4 为 `completed`，真实生成、验证及人工审核均已通过；Phase 0.4a overall gate 为 `PASS`。Phase 0.4b-A real GPU smoke 为 `completed` / `PASS`；Phase 0.4b validation/full training 与 Phase 0.4b-B 尚未开始。
-- Phase 0.4 仅可使用 train/validation 进行开发与模型选择，不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
-- 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
