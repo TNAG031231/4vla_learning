@@ -263,12 +263,34 @@ source_audit_record
 - Artifact 位于 `$VLA_DERIVED_ROOT/phase_0_4/structured_action_lora_smoke_v0_1/`，包含 `smoke_result.json` 与 `adapter_checkpoint/`，不进入 Git。`test_records_read`、`combined_manifest_records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 全部为 `0`；`test_evaluation_performed=false`、`validation_evaluation_performed=false`。
 - 能力边界：已证明 structured action SFT、真实 optimizer 更新、tiny-subset overfit 与 adapter save/fresh reload 链路可运行；tiny overfit 不是 generalization evidence。Phase 0.4b validation/full training 与 Phase 0.4b-B 尚未开始，waypoint planner、BEV/OCC 与后续阶段尚未执行。
 
+## Phase 0.4b-B Full-train Structured Factorized Action LoRA SFT
+
+- 状态：`completed` / `PASS`。2026-09-16 核验用户真实 AutoDL 正式运行 artifact；execution Git commit 为 `02f11a27201c35207f5bdd3066217efc5c08c621`。本节记录 Phase 0.4b 最新确认状态；前文的未开始描述为此前阶段记录。
+- 正式训练完整消费 train `14,253` samples / `560` scenes，exactly `1 epoch`、`3,564` optimizer steps；validation 为 `3,594` samples / `140` scenes。逐条 train token/order 与 frozen temporal dataset 一致，末组 `1` sample，loss history 全部有限；纵向、横向及 joint evaluation 的 effective count 均为 `3,594`。
+- 复用 frozen prompt / serialization / parser 和独立方向 assistant-only supervision；Qwen/Qwen3-VL-4B-Instruct 的 model / processor revision 均为 `ebb281ec70b05090aa6165b016eac8ec08e71b17`。AdamW、LR `1e-4`、warmup ratio `0.03`（107 steps）、cosine、micro batch `1`、gradient accumulation `4`、BF16、SDPA、gradient checkpointing；LoRA `r=8 / alpha=16 / dropout=0.05`，target 为 `q_proj/k_proj/v_proj/o_proj`，trainable parameters `5,898,240`。训练 `use_cache=false`，validation generation `use_cache=true`。
+- 四个 adapter-only milestones `891 / 1782 / 2673 / 3564` 均在完整 validation 上评估；双方向 macro-F1 均值分别为 `0.6968190871 / 0.7180992148 / 0.7452882749 / 0.7508122662`。按该均值、joint accuracy、parser success rate、较早 step 的冻结顺序选中 **step 3564**。
+
+| Fresh-reload validation metric | Model | Train-derived majority | Delta |
+|---|---:|---:|---:|
+| longitudinal macro-F1 | 0.6840366014 | 0.1550863724 | +0.5289502290 |
+| lateral macro-F1 | 0.8175879310 | 0.2940383618 | +0.5235495691 |
+| joint accuracy | 0.6474680022 | 0.3366722315 | +0.3107957707 |
+
+- Longitudinal accuracy `0.6994991653`，lateral accuracy `0.9081803005`；per-class F1：stop `0.9108129440`、decelerate `0.5707434053`、keep `0.7308584687`、accelerate `0.5237315876`；left `0.7227414330`、straight `0.9451462191`、right `0.7848761408`。Parser success `1.0`，invalid output rate `0.0`。
+- Majority 仅从 train 统计：纵向 `keep`、横向 `straight`、joint pair `keep + straight`；两个 baseline 的核心指标一致。Lateral prediction counts 为 left/straight/right `301/2943/350`，`zero_f1_lateral_classes=[]`、`lateral_collapse_evidence=false`；模型三项核心指标均高于 majority。
+- LoRA B 的 144 个 tensors 从全零变为全部非零，nonzero elements `2,506,752`、norm `3.9201799118`，`lora_parameters_updated=true`。释放训练模型后 fresh pinned base + selected adapter reload 成功；重载权重统计一致，选优与 fresh reload 均为 `3,594` 条，`sample_differences=[]`、`metrics_match=true`、`matched=true`，原始输出、目标及指标重算均匹配。
+- Runtime：训练 `26,132.13 s`（`7.2589 h`，排除 checkpoint/validation callbacks），平均 `1.83345 s/train sample`；四次 milestone validation 分别 `0.9384 / 0.9316 / 0.9487 / 0.9523 h`，fresh final validation `0.9268 h`；total run `43,059.06 s`（`11.9609 h`，截止 summary 写入前）。
+- 主要瓶颈仍为 longitudinal：decelerate→keep `297` 条、accelerate→keep `270` 条；lateral 错误主要为 left/right 与 straight 混淆，left→right / right→left 仅 `6/7` 条。Failure taxonomy：fully correct `2327`、longitudinal wrong only `937`、lateral wrong only `187`、both wrong `143`、invalid structured output `0`。
+- `test_records_read`、`combined_manifest_records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 全部为 `0`；`test_evaluation_performed=false`。Artifact 位于 `$VLA_DERIVED_ROOT/phase_0_4/structured_action_lora_full_v0_1/`，配置、history、四次 validation、最终 predictions/metrics、baseline、reload consistency 与 adapter metadata 均已核验，`full_model_saved=false`；产物未提交 Git。
+- 当前能力边界：已获得 full-train structured-action SFT 与 scene-separated validation generalization 的真实 GPU 证据；本轮仅核验和记录，未重新训练，Phase 0.4c 尚未进入。
+
 ## Next Gate
 
-- 当前 test 不得再次使用，也不得重新切分或重命名为新的 holdout。
+- Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
+- 当前 test 不进入 Phase 0.4b / 0.4c / 0.4d 的模型选择或开发反馈；test 保留给最终冻结 VLA pipeline 的一次正式 evaluation。
+- 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。
+- 历史 Phase 0.2d 曾有一次 failed rule-baseline test execution attempt，但没有产生正式 test metrics，也没有影响当前模型训练或 checkpoint selection。
 - Phase 0.3 overall 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
 - Phase 0.4a-1 real-data gate 已通过（用户确认的 AutoDL artifact audit）：train 14,253 records / 560 scenes，validation 3,594 records / 140 scenes；unique sample_token 17,847，scene overlap 0，malformed trajectories 0，7-point raw trajectory contract PASS。
 - Source artifact SHA-256：train `8c1ad5cc2ad4fa01d7730b1458a7415061ed40b0198495ddb36fbb035d738352`；validation `68ab5a06440447f31bbfcb8fa4678bf248b5ab3f718d978cba25d8b568e77246`。
 - 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4a-3 factorized targets 已完成并冻结，Phase 0.4a-4 为 `completed`，真实生成、验证及人工审核均已通过；Phase 0.4a overall gate 为 `PASS`。Phase 0.4b-A real GPU smoke 为 `completed` / `PASS`；Phase 0.4b validation/full training 与 Phase 0.4b-B 尚未开始。
-- Phase 0.4 仅可使用 train/validation 进行开发与模型选择，不得使用本次已消费 test 的任何信息进行调参、候选选择或规则修改。
-- 后续无偏最终评估必须使用新的外部 held-out dataset 或新的、未被访问的 evaluation protocol。
