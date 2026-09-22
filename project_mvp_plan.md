@@ -183,19 +183,16 @@ unit: meter
 第一版主结构在后续 Phase（阶段）中按以下接口实现：
 
 ```text
-shared pinned Qwen3-VL
-├── semantic decision branch
-│   └── structured factorized meta-action
-└── planning visual branch
-    └── per-frame image_embeds → temporal / ego fusion
-
-structured factorized meta-action
-→ decision adapter
-→ action-conditioned waypoint planner [B,6,2]
+shared pinned Qwen3-VL + selected Phase 0.4b LoRA
+Turn 1: historical CAM_FRONT + current/past ego state + fixed semantic task prompt
+→ structured factorized meta-action
+Turn 2: append action as real assistant context tokens + fixed planning prompt
+→ same Qwen3-VL multimodal contextual forward
+→ final contextual hidden states → lightweight continuous waypoint decoder [B,6,2]
 → trajectory-to-action verifier
 ```
 
-Semantic decision branch（语义决策分支）执行完整 Qwen3-VL multimodal forward（多模态前向），保留模型原生 DeepStack，并输出可解释的纵向 / 横向结构化元动作。Planning visual branch（规划视觉分支）只通过冻结的 public `get_image_features` 接口取得 per-frame primary `image_embeds`，再结合时序与自车状态；decision adapter（决策适配器）把高层动作转成紧凑规划条件，waypoint planner（轨迹点规划器）输出 `[B,6,2]`。高层动作回答“准备做什么”，轨迹回答“具体怎么移动”，verifier（验证器）检查两者是否一致。
+Phase 0.4c 主路径采用 DriveMA-inspired two-turn semantic planning with a lightweight continuous waypoint decoder。第一轮动作真实进入第二轮 conversation context；使用 Qwen-VLA-inspired contextual representation → continuous action decoding 思路，以轻量 Transformer decoder 回归轨迹，不以 categorical action embedding 或 autoregressive numeric trajectory text generation 作为主路径。原生 DeepStack 保留在 Qwen3-VL 内部；Phase 0.3 冻结的 public `get_image_features` 保留为 optional baseline / diagnostic，不再是主 planner mandatory path。
 
 Legacy coarse action schema（旧版粗粒度动作模式）继续作为 Phase 0.3 历史基线，不替代结构化 factorized decision（因子化决策）与连续规划接口。若未来保留 `[B,4]` / `[B,3]` classifier heads（分类头），只能作为 optional auxiliary diagnostic（可选辅助诊断），不得成为 Phase 0.4 主 semantic decision interface（语义决策接口）。
 
@@ -812,7 +809,7 @@ legacy action parser
 legacy baseline prediction format
 ```
 
-其中 planning visual feature interface（规划视觉特征接口）及其 model / processor revision（模型 / 处理器修订版）是 Phase 0.4 的核心输入合同；legacy action parser（旧版动作解析器）、legacy six-action prompt（旧六类动作提示）和 legacy baseline prediction format（旧版基线预测格式）只服务 Phase 0.3 基线与历史兼容，不限制 Phase 0.4 的 structured factorized meta-action（结构化因子化元动作）。冻结前必须以真实 adapter record（适配器记录）、真实 processor output（处理器输出）和真实 pinned model visual output（固定模型视觉输出）核验 shape（形状），不能手写猜测 consumer schema（消费者模式）。
+其中 model / processor revision（模型 / 处理器修订版）由 Phase 0.4 复用；planning visual feature interface（规划视觉特征接口）作为 Phase 0.3 冻结能力保留，用于 optional baseline / diagnostic，Phase 0.4c 主路径改用完整 two-turn contextual forward；legacy action parser（旧版动作解析器）、legacy six-action prompt（旧六类动作提示）和 legacy baseline prediction format（旧版基线预测格式）只服务 Phase 0.3 基线与历史兼容，不限制 Phase 0.4 的 structured factorized meta-action（结构化因子化元动作）。冻结前必须以真实 adapter record（适配器记录）、真实 processor output（处理器输出）和真实 pinned model visual output（固定模型视觉输出）核验 shape（形状），不能手写猜测 consumer schema（消费者模式）。
 
 真实验证已确认 planning branch（规划分支）使用 public `Qwen3VLForConditionalGeneration.get_image_features(...)`，获得按输入图像顺序排列的 primary `image_embeds [N_i,2560] bfloat16`；`N_i` 由 `image_grid_thw` 与 `spatial_merge_size=2` 决定并保持动态。真实样本观察到 `image_grid_thw=[[1,56,100]]`、`pixel_values [5600,1536]` 与 `image_embeds [1400,2560]`，其中 `5600 / 1400` 不是全局固定维度。Native DeepStack 的 3 个 observed levels 均为 `[1400,2560] bfloat16`，但只保留在完整 Qwen3-VL semantic branch 内，不成为 planner mandatory public interface。
 
@@ -903,7 +900,7 @@ Phase 0.3 Gate 已满足。下一实际执行子阶段为 `Phase 0.4a — factor
 #### 10.2.1 阶段状态、目的与边界
 
 - **阶段状态：** `planned`。
-- **阶段目的：** 从 Phase 0.3 的 legacy six-class baseline（旧六分类基线）升级为 Qwen3-VL 结构化 factorized meta-action（因子化元动作）与 action-conditioned continuous future waypoints（动作条件化连续未来轨迹点）的双分支 planning model（规划模型），并用规则化 verifier（验证器）检查动作与轨迹是否一致。
+- **阶段目的：** 从 Phase 0.3 的 legacy six-class baseline（旧六分类基线）升级为 Qwen3-VL 结构化 factorized meta-action（因子化元动作）与 action-conditioned continuous future waypoints（动作条件化连续未来轨迹点）的 two-turn planning model（两轮规划模型），并用规则化 verifier（验证器）检查动作与轨迹是否一致。
 - **为什么需要：** 单帧六分类不能表达纵向与横向动作组合，也不能描述未来路径；factorized action（因子化动作）提供可解释高层意图，action-conditioned waypoint（动作条件化轨迹点）提供可评估低层运动，verifier（验证器）把两者连接成可核查证据链。
 - **前置条件：** Phase 0.3 的 dataset adapter interface（数据集适配器接口）、model / processor revision（模型 / 处理器修订版）、planning visual feature interface（规划视觉特征接口）与 ego-state serialization（自车状态序列化）已冻结。Phase 0.4 使用独立 fixed task prompt（固定任务提示）；其 tokenizer-level output protocol、assistant masking 与 strict parser version 必须在 Phase 0.4b 真实验证后冻结。Legacy action parser（旧版动作解析器）只用于历史兼容，不是本阶段 consumer contract（消费者协议）。
 
@@ -935,40 +932,24 @@ Learned multimodal candidate trajectories（学习式多模态候选轨迹）是
 #### 10.2.2 最终核心架构
 
 ```text
-current / past CAM_FRONT
-+ current / past ego state
-+ fixed task prompt
-        │
-        ▼
-shared pinned Qwen3-VL
-        │
-        ├─────────────────────────────┐
-        │                             │
-Semantic decision branch       Planning visual branch
-        │                             │
-full Qwen3-VL multimodal       model.get_image_features()
-forward                               │
-        │                       per-frame image_embeds
-native DeepStack                     [N_i, 2560]
-inside Qwen3-VL                       │
-        │                       temporal fusion
-structured factorized                 │
-meta-action                           + ego encoder
-        │                             │
-        └──── decision adapter ───────┤
-                                      ▼
-                         action-conditioned waypoint
-                              predicted [B,6,2]
-                                      │
-                                      ▼
-                         trajectory-to-action verifier
+historical CAM_FRONT + current/past ego motion + Phase 0.4b TASK_PROMPT
+→ shared pinned Qwen3-VL + selected Phase 0.4b LoRA
+→ Turn 1: longitudinal=<value>; lateral=<value>
+→ append exact predicted action as assistant context tokens
+→ Turn 2: fixed planning prompt + assistant generation prefix
+→ same Qwen3-VL contextual forward (output_hidden_states=True)
+→ final contextual hidden states [B,L,H_qwen] + attention_mask
+→ context projection H_qwen → D_planner
+→ 6 learnable waypoint queries + small Transformer decoder
+→ Linear(D_planner, 2) → predicted_waypoints [B,6,2]
+→ trajectory-to-action verifier
 ```
 
-Semantic decision branch（语义决策分支）执行完整 Qwen3-VL multimodal forward，原生 DeepStack 只在 Qwen3-VL 内部参与语义建模；主输出是 one-step structured factorized meta-action，语义固定为 `longitudinal ∈ {stop, decelerate, keep, accelerate}` 与 `lateral ∈ {left, straight, right}`。Canonical serialization（规范序列化）可采用 `longitudinal=<value>; lateral=<value>`，但具体 token 序列、mask 与 parser 尚为 `planned`，必须在 Phase 0.4b 真实验证后冻结。
+主 semantic decision interface 复用 Phase 0.4b 已冻结的 prompt、serialization、generation config 与 strict parser；动作语义保持 `longitudinal ∈ {stop, decelerate, keep, accelerate}` 与 `lateral ∈ {left, straight, right}`。第一轮预测必须作为真实 assistant message tokens 进入第二轮，而非仅转换为 categorical embedding。
 
-Planning visual branch（规划视觉分支）固定调用 `Qwen3VLForConditionalGeneration.get_image_features(pixel_values, image_grid_thw)`，消费 primary `image_embeds` 的 per-image `[N_i,2560]` 表示；`N_i` 随图像网格动态变化，`2560` 是当前 pinned revision 经 merger / projector 后的稳定 feature dimension。该分支不直接绑定 `model.model.visual(...)`，不暴露 ViT block private API，也不把三个 DeepStack level 作为 temporal planner（时序规划器）的 mandatory public input（必需公共输入）。
+Phase 0.4c-1 冻结 Qwen3-VL base 与 selected Phase 0.4b LoRA，只训练 context projection、waypoint queries、轻量 Transformer decoder 与最终 waypoint projection。有效 contextual positions 直接作为 decoder memory，由 `attention_mask` 屏蔽 padding；不额外设计 action-token pooling。实际 hidden-state output 字段及 shape 以模型运行证据为准，`H_qwen≈2560` 尚需真实 smoke 核验。
 
-Decision adapter（决策适配器）只冻结职责与 I/O 语义：将 Qwen3-VL factorized meta-action decision 转换为 compact conditioning representation（紧凑条件表示），再与 temporal visual representation（时序视觉表示）及 ego representation（自车表示）共同输入 waypoint planner。具体采用 action-token hidden-state pooling（动作 token 隐状态池化）、lightweight projection（轻量投影）或其他最小表示，必须根据 Phase 0.4 真实 hidden state 与资源证据决定；本阶段不猜测 hidden-state shape，也不提前实现 adapter。
+主路径采用 DriveMA-style two-turn semantic-action conditioning 与 Qwen-VLA-inspired continuous decoding 思路，不声称复现任一论文。第二轮固定 prompt 只请求 planning representation，不含 waypoint target 或 future-derived information，也不要求 autoregressive trajectory text generation。原 `get_image_features → per-image image_embeds [N_i,2560]` 接口保留为已冻结能力及 optional baseline / diagnostic。
 
 Inference（推理）只能使用模型自身从 current / past observation（当前 / 历史观测）产生的 decision conditioning（决策条件）；禁止使用 GT action（真值动作）或由 future trajectory（未来轨迹）派生的动作作为推理条件。
 
@@ -990,9 +971,10 @@ factorized_action_joint_valid: [B]
 future_waypoints:            [B, 6, 2]
 trajectory_valid_mask:       [B, 6]
 
-planning_image_embeds:             per image [N_i,2560], bfloat16
-structured_meta_action:            one longitudinal + one lateral value
-decision_conditioning:             [B,D_decision] (shape planned)
+contextual_hidden_states:         [B,L,H_qwen] (actual shape pending real smoke)
+context_attention_mask:           [B,L]
+structured_meta_action:            one longitudinal + one lateral value, assistant context tokens
+projected_context:                [B,L,D_planner]
 predicted_waypoints:               [B,6,2]
 ```
 
@@ -1000,12 +982,12 @@ predicted_waypoints:               [B,6,2]
 - `T_hist`：历史帧数；
 - `E`：版本化 ego-motion feature dimension；
 - `H, W`：processor 接收的图像尺寸。
-- `N_i`：第 `i` 帧由 `image_grid_thw` 与 `spatial_merge_size=2` 决定的动态 visual token 数；
-- `D_decision`：decision adapter 输出维度，必须在 Phase 0.4c 根据真实 hidden state 与资源 smoke 冻结。
+- `L`：完整 Turn-2 context 的 token 长度；`H_qwen`：真实 Qwen final hidden-state 维度；
+- `D_planner`：轻量 decoder 维度，第一版默认 256，真实 smoke 尚待验证。
 
 `T_hist`、`H/W` 与 batch size（批大小）允许根据数据可用性和 resource preflight（资源预检）配置；`K=6`、prediction horizon（预测时域）`=3.0 s` 与 sampling interval（采样间隔）`=0.5 s` 是当前主线固定合同，不得由资源预检改变。六个轨迹点依次对应当前时刻后的 `0.5 / 1.0 / 1.5 / 2.0 / 2.5 / 3.0 s`，全部位于 current ego frame（当前自车坐标系），`x` 轴向前为正，`y` 轴向左为正，单位为米。任何其他 horizon（预测时域）或采样间隔只能作为 optional extension（可选扩展）使用独立 schema version（模式版本），不得替换当前主线。
 
-Future waypoints（未来轨迹点）与 factorized actions（因子化动作）只作为 target（目标）；模型输入只允许 current / past（当前 / 历史）图像、ego motion（自车运动状态）与固定 `task_prompt`。缺失历史帧与 future target（未来目标）分别由 `history_valid_mask` 和 `trajectory_valid_mask` 显式处理，loss（损失）不得在 invalid position（无效位置）上计算。`longitudinal_action_valid` 与 `lateral_action_valid` 分别控制对应动作监督；任一方向无效都不得自动丢弃另一方向仍然有效的监督。`factorized_action_joint_valid` 只表示完整动作对是否可用于联合动作条件化，不替代两个独立有效性字段。
+Future waypoints（未来轨迹点）只作为 regression target；正式模型输入为 current / past 图像、ego motion、固定 prompts 与模型自身预测的 action context。Train 允许 GT factorized action 作为 teacher-forced assistant context；GT-action diagnostic 单独标记，正式 inference 禁止使用 GT action。缺失历史帧与 future target（未来目标）分别由 `history_valid_mask` 和 `trajectory_valid_mask` 显式处理，loss（损失）不得在 invalid position（无效位置）上计算。`longitudinal_action_valid` 与 `lateral_action_valid` 分别控制对应动作监督；任一方向无效都不得自动丢弃另一方向仍然有效的监督。`factorized_action_joint_valid` 只表示完整动作对是否可用于联合动作条件化，不替代两个独立有效性字段。
 
 #### 10.2.4 Factorized target + temporal dataset contract（因子化目标与时序数据合同）
 
@@ -1081,54 +1063,30 @@ Temporal / factorized manifest（时序 / 因子化清单）至少追溯：ancho
 
 #### 10.2.6 模型模块合同
 
-##### Visual semantic encoder
+##### Two-turn contextual encoder
+
+复用 Phase 0.3 冻结的 model / processor revision，以及 Phase 0.4b selected LoRA、TASK_PROMPT、structured serialization、strict parser 和 generation config。历史图像及 current/past ego motion 通过已有 observation serializer 输入同一个 Qwen3-VL，native DeepStack 保留在模型内部；`get_image_features` 的冻结接口继续用于 optional baseline / diagnostic。
+
+Ego motion 的 availability / valid mask 继续由已有 serializer 表达；missing values 不得被无记录地替换为真实零运动。若 baseline 使用 normalization statistics，仍只从 train 计算并持久化，validation 只用于评估。
 
 ```text
-historical images
-→ pinned Qwen3-VL processor
-→ Qwen3VLForConditionalGeneration.get_image_features
-→ primary per-frame image_embeds [N_i,2560] bfloat16
+user: historical CAM_FRONT + ego history + semantic TASK_PROMPT
+assistant: longitudinal=<value>; lateral=<value>
+user: fixed planning prompt
+assistant: generation prefix only
 ```
 
-第一版复用 Phase 0.3 冻结的 model / processor revision 与 public extraction policy。真实 pinned model 已确认内部 visual encoder 为 `Qwen3VLVisionModel`，primary `image_embeds` 已经过模型原生 merger / projector；每帧按输入 image 与 `image_grid_thw` 的同一顺序一一对齐。`N_i = T_i × H_i × W_i / 2²`，因此 visual token 维动态，不能把真实样本观察到的 `1400` 写成全局固定值；stable feature dimension 为 `2560`。
-
-Native DeepStack（原生深层堆叠特征）保留在完整 Qwen3-VL semantic decision branch 内运行。真实样本观察到三个 DeepStack levels，各为 `[1400,2560]` bfloat16；这只是该样本 observation，不是 planning branch 的 mandatory public interface，也不得自行重实现 Qwen DeepStack。
-
-##### Temporal fusion
-
-模块接口统一接收 primary per-frame `image_embeds [N_i,2560]`、relative timestamps 与 `history_valid_mask`。第一版默认优先实现结构简单、便于 dynamic-token shape / mask 调试的 lightweight temporal attention pooling；其他方案只作为后续备选，不同时并行实现论文级消融。若 resource preflight 或 smoke evidence 否定默认方案，必须记录替换原因并提升 config/version。
-
-##### Ego-state encoder
+##### Continuous waypoint decoder
 
 ```text
-speed
-longitudinal acceleration
-yaw rate
-availability / valid mask
-→ MLP projection
-→ ego token / ego embedding
-```
-
-输入 normalization statistics 只从 train 计算并持久化；validation 只用于评估。Missing values 不得被无记录地替换为真实零运动。
-
-##### Decision adapter
-
-```text
-structured factorized meta-action
-→ compact decision conditioning
-```
-
-本阶段只冻结 decision adapter 的职责与 I/O 语义，不冻结尚未实测的 hidden-state pooling、projection 结构或 `D_decision`。候选实现必须在 Phase 0.4c 使用真实 Qwen hidden state 与 resource evidence 选择；不得让 planner 接收 GT action 或 future-derived action。
-
-##### Planning fusion 与输出
-
-```text
-temporal visual representation
-+ ego representation
-+ predicted decision conditioning
-→ action-conditioned waypoint planner
+Turn-2 final contextual hidden states [B,L,H_qwen]
+→ Linear(H_qwen, D_planner)
+→ TransformerDecoder(6 learnable waypoint queries, contextual memory, attention_mask)
+→ Linear(D_planner, 2)
 → predicted_waypoints [B,6,2]
 ```
+
+第一版配置为 `D_planner=256`、2 decoder layers、4 attention heads、dropout 0.1、6 learnable waypoint queries。资源调整可以降低维度与 heads，保持六点、时间及坐标合同；不做 architecture search。Decision conditioning 在 Qwen conversation tokens 中完成，不新增独立 temporal fusion / ego encoder 或 categorical action embedding 主路径。
 
 主 semantic decision interface 是 Qwen3-VL 生成的 structured factorized meta-action，主 planning output 是 `predicted_waypoints [B,6,2]`。Legacy six-class parser / prompt 保持 Phase 0.3 冻结状态但不进入本接口；`[B,4]` / `[B,3]` classifier heads 若未来保留，只能默认关闭并标记为 optional auxiliary diagnostic，不得替代 semantic decision branch 或影响正式推理协议。
 
@@ -1169,7 +1127,11 @@ Action-token supervision（动作 token 监督）必须保持两个方向独立�
 
 该表只冻结 supervision semantics（监督语义），不冻结具体 token index、serialization、field delimiter（字段分隔符）或 masking implementation（掩码实现）。这些实现细节必须在 Phase 0.4b 使用真实 Qwen3-VL tokenizer / processor 输出验证后冻结，本阶段不得手写猜测 token boundary（token 边界）。
 
-Phase 0.4c 冻结或按已批准范围复用 semantic branch，使用 primary per-frame `image_embeds`、temporal fusion、ego encoder 与 predicted decision conditioning 训练 waypoint planner。正式实现时在 SmoothL1 / Huber（平滑 L1 / Huber）等价配置中选择并版本化一个方案；`L_trajectory` 只在 `trajectory_valid_mask` 为真处计算。`factorized_action_joint_valid` 决定完整动作对能否作为 action-conditioning 监督或诊断依据，但正式 inference 只能消费模型预测 decision，禁止注入 GT action。
+Phase 0.4c-1 冻结 Qwen base 与 selected LoRA，仅训练 continuous waypoint decoder（包括 projection 与 queries），使用 masked SmoothL1，默认 beta=1.0；loss 对 valid waypoint 的两个坐标取均值，不使用 language-token cross entropy。`factorized_action_joint_valid` 决定完整 GT 动作对能否用于 teacher forcing 或 diagnostic。
+
+- Train：`observation → GT action assistant context → Turn-2 Qwen hidden states → waypoint decoder → GT waypoint loss`；训练时无需先逐样本生成 predicted action。
+- Formal validation / inference：`observation → predicted action → exact assistant context → Turn-2 hidden states → predicted waypoints`；正式指标只来自该路径。
+- Diagnostic：GT-action context 仅作为单独诊断，明确标记 `conditioning_type=gt_action_diagnostic`；不能冒充正式 inference。
 
 第一版不引入复杂 scheduled sampling（计划采样）、GRPO（组相对策略优化）、不可微 safety loss（安全损失）或复杂 consistency loss（一致性损失）。Action-trajectory consistency（动作—轨迹一致性）首先作为规则化评测指标和 failure signal（失败信号），不进入梯度路径。Verifier（验证器）遵循以下语义：
 
@@ -1214,11 +1176,11 @@ left / straight / right
 
 ##### Phase 0.4c：action-conditioned waypoint planning（动作条件化轨迹点规划）
 
-1. 对每个 historical frame 使用同一 pinned processor 与 `get_image_features`，按 `image_grid_thw` 顺序取得 primary per-frame `image_embeds [N_i,2560]`。
-2. 构建 lightweight temporal fusion、ego encoder 与 decision adapter；decision adapter 的具体 hidden-state pooling / projection 只依据真实 smoke 冻结。
-3. 训练 `image_embeds + temporal fusion + ego + predicted decision conditioning → predicted_waypoints [B,6,2]`，使用 masked SmoothL1 / Huber。
-4. 运行 constant-velocity、ego-history MLP 与 direct waypoint without action conditioning 三个最小 baseline，并检查小样本 overfit、checkpoint round-trip 与坐标反归一化。
-5. 正式 inference 使用模型预测 decision conditioning；GT factorized action 只可用于清楚标记的 diagnostic，不得冒充正式推理。
+1. 冻结同一 Qwen3-VL base 与 selected Phase 0.4b LoRA；复用第一轮 structured action protocol。
+2. 把 action text 真实 append 为 assistant context，追加固定 planning prompt 与 generation prefix，以完整 Turn-2 forward 提取 contextual hidden states 和 attention mask。
+3. 以 lightweight projection、6 learnable waypoint queries、small Transformer decoder 与 Linear 输出 `[B,6,2]`；train 使用 GT action teacher forcing 与 masked SmoothL1，正式 inference 使用 predicted action context。
+4. Phase 0.4c-1 仅用 1–2 train samples 验证 teacher-forced backward、planner nonzero gradients、Qwen/LoRA frozen 和至少 1 个 predicted-action inference 链路；真实 GPU smoke 尚待执行，不标记 completed，不进行 full training。
+5. 后续 Phase 0.4c 训练与评测再运行 constant-velocity、ego-history MLP 与 direct waypoint without action conditioning 三个最小 baseline，并检查小样本 overfit、checkpoint round-trip 与坐标反归一化；GT-action diagnostic 始终单独标记。
 
 ##### Phase 0.4d：decision / trajectory consistency verification + validation evaluation（决策 / 轨迹一致性验证与验证集评估）
 
@@ -1305,7 +1267,7 @@ VRU presence（弱势道路使用者存在性）只作为 offline stratification
 - current ego frame transform 和左右轴方向；
 - 固定 `[B,6,2]` waypoint（轨迹点）、`[B,6]` mask（掩码）、3.0 秒时域、0.5 秒间隔、单位与 collator batch（批处理整理）；
 - structured factorized meta-action serialization / assistant masking / strict parser（结构化因子化元动作序列化 / 助手掩码 / 严格解析器）与 `predicted_waypoints [B,6,2]`；
-- `get_image_features` primary `image_embeds` 的 dynamic `N_i`、stable `2560`、bfloat16、grid / spatial-merge token count 与 frame alignment；
+- two-turn assistant action tokens、contextual hidden-state shape、attention mask、Qwen / LoRA freeze 与 continuous decoder backward；`get_image_features` 的已有冻结测试保留为 optional baseline / diagnostic 证据；
 - decision adapter 不接受 GT action、future trajectory、GT geometry 或 legacy six-class parser output 作为正式 inference conditioning；
 - masked SmoothL1 / Huber 只使用 `trajectory_valid_mask`，且 action-centric SFT 与 waypoint regression 的监督边界分离；
 - `invalid prediction rate` 对 structured parser、NaN / Inf、shape（形状）、有效点数量、mask（掩码）、坐标反归一化和 verifier projection（验证器投影）失败的确定性计数；
@@ -1326,7 +1288,7 @@ Phase 0.4 通过条件：
 - temporal dataset（时序数据集）、固定 `[B,6,2]` waypoint（轨迹点）、`[B,6]` mask（掩码）、坐标与时间 contract（协议）完整且审核通过；
 - 模型可稳定训练、保存、加载和推理；
 - Qwen3-VL semantic decision branch 使用经过真实 tokenizer / processor 验证的独立 prompt、assistant masking 与 strict parser，输出 one-step structured longitudinal / lateral meta-action；
-- planning branch 使用冻结的 `get_image_features → per-image image_embeds [N_i,2560]` 接口，decision adapter 使用模型预测的结构化动作条件化 `predicted_waypoints [B,6,2]`；
+- planning branch 将模型预测的 structured action 作为真实 Turn-2 assistant context，经同一 Qwen3-VL contextual hidden states 与轻量 continuous decoder 输出 `predicted_waypoints [B,6,2]`；
 - predicted trajectory（预测轨迹）的 current ego frame（当前自车坐标系）、轴方向、单位和 0.5 秒间隔正确；
 - constant-velocity（匀速外推）、ego-history MLP（仅自车历史状态）、direct waypoint（直接轨迹点）与 factorized conditioned VLA（因子化条件视觉-语言-动作模型）完成同协议比较；
 - shuffled-image diagnostic（图像打乱诊断）能够回答视觉是否真实发挥作用，结果无论正负均保留；
@@ -1351,9 +1313,9 @@ historical CAM_FRONT sequence
 + current/past ego state
  + fixed task prompt
 → Qwen3-VL structured factorized meta-action
-→ decision adapter conditioning
-+ per-frame primary image_embeds [N_i,2560]
-+ temporal / ego fusion
+→ append predicted action as real assistant context + fixed planning prompt
+→ same Qwen3-VL Turn-2 contextual hidden states
+→ lightweight continuous Transformer decoder
 → predicted_waypoints [B,6,2]
 → trajectory-implied actions
 → longitudinal / lateral / joint consistency
