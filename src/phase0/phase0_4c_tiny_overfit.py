@@ -128,18 +128,21 @@ def train_planner(planner: WaypointDecoder, contexts: list[CachedContext], *,
     started, total_loss = time.monotonic(), 0.0
     with history_path.open("w") as stream:
         for index in range(config.max_optimizer_steps):
-            context = contexts[index % len(contexts)]
             optimizer.zero_grad(set_to_none=True)
-            prediction = planner(context.hidden_states.to(device), context.attention_mask.to(device))
-            loss = masked_waypoint_loss(prediction, context.target.to(device),
-                                        context.valid_mask.to(device), beta=config.smooth_l1_beta)
-            if not torch.isfinite(loss):
-                raise ValueError("non-finite planner training loss")
-            loss.backward()
+            step_loss = 0.0
+            for context in contexts:
+                prediction = planner(context.hidden_states.to(device), context.attention_mask.to(device))
+                loss = masked_waypoint_loss(prediction, context.target.to(device),
+                                            context.valid_mask.to(device), beta=config.smooth_l1_beta)
+                if not torch.isfinite(loss):
+                    raise ValueError("non-finite planner training loss")
+                (loss / len(contexts)).backward()
+                step_loss += float(loss.detach())
             optimizer.step()
-            value = float(loss.detach())
+            value = step_loss / len(contexts)
             total_loss += value
-            entry = {"step": index + 1, "sample_token": context.sample_token, "loss": value,
+            entry = {"optimizer_step": index + 1, "samples_consumed": (index + 1) * len(contexts),
+                     "mean_step_loss": value,
                      "running_mean_loss": total_loss / (index + 1),
                      "elapsed_seconds": time.monotonic() - started}
             stream.write(json.dumps(entry, allow_nan=False) + "\n")
@@ -190,6 +193,14 @@ def fit_cached_contexts(*, contexts: list[CachedContext], config: TinyOverfitCon
     write_json(output / "metrics_after.json", after[0])
     (output / "predictions_after.jsonl").write_text(
         "".join(json.dumps(row, allow_nan=False) + "\n" for row in after[1]))
+    per_sample = [
+        {"sample_token": initial["sample_token"],
+         "initial_loss": initial["loss"], "final_loss": final["loss"],
+         "initial_ADE": initial["ade_m"], "final_ADE": final["ade_m"],
+         "initial_FDE": initial["fde_m"], "final_FDE": final["fde_m"]}
+        for initial, final in zip(before[1], after[1], strict=True)
+    ]
+    write_json(output / "per_sample_metrics.json", per_sample)
     checkpoint = {
         "planner_state_dict": {name: value.detach().cpu() for name, value in planner.state_dict().items()},
         "planner_config": {name: getattr(config, name) for name in PlannerConfig.__dataclass_fields__},
@@ -213,6 +224,12 @@ def fit_cached_contexts(*, contexts: list[CachedContext], config: TinyOverfitCon
         "learning_gate_passed": learning_passed, "planner_parameters_updated": updated,
         "planner_trainable_parameters": parameter_count, "reload_consistency": consistency["reload_consistency"],
         "initial_metrics": initial, "final_metrics": final, "optimizer_steps": config.max_optimizer_steps,
+        "samples_consumed": config.max_optimizer_steps * len(contexts),
+        "samples_per_optimizer_step": len(contexts),
+        "update_policy": "mean_gradient_over_complete_tiny_subset",
+        **{f"per_sample_improved_{metric}_count": sum(
+            row[f"final_{metric}"] < row[f"initial_{metric}"] for row in per_sample
+        ) for metric in ("loss", "ADE", "FDE")},
         "initial_loss": initial["loss"], "final_loss": final["loss"],
         "loss_ratio": final["loss"] / initial["loss"] if initial["loss"] > 0 else None,
         "initial_ADE": initial["ade_m"], "final_ADE": final["ade_m"],

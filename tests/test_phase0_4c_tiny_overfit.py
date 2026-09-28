@@ -108,7 +108,7 @@ def test_cache_runs_one_frozen_forward_per_sample_and_keeps_targets_out_of_conte
 
 def test_cpu_tiny_overfit_optimizer_and_fresh_reload(config, contexts, tmp_path, monkeypatch):
     config = replace(config, planner_dimension=16, num_heads=4, num_decoder_layers=1,
-                     dropout=0., max_optimizer_steps=300)
+                     dropout=0., max_optimizer_steps=60)
     backbone = nn.ModuleDict({"qwen": nn.Linear(16, 16), "lora_A": nn.Linear(16, 2)})
     freeze_backbone(backbone)
     backbone_weights = {name: value.clone() for name, value in backbone.state_dict().items()}
@@ -144,8 +144,11 @@ def test_cpu_tiny_overfit_optimizer_and_fresh_reload(config, contexts, tmp_path,
         p.numel() for p in checkpoint["planner_state_dict"].values())
     assert all(torch.equal(value, backbone_weights[name]) for name, value in backbone.state_dict().items())
     history = [json.loads(line) for line in (tmp_path / "training_history.jsonl").read_text().splitlines()]
-    assert len(history) == 300
-    assert [row["sample_token"] for row in history] == [contexts[i % 8].sample_token for i in range(300)]
+    assert len(history) == config.max_optimizer_steps
+    assert [row["optimizer_step"] for row in history] == list(range(1, config.max_optimizer_steps + 1))
+    assert [row["samples_consumed"] for row in history] == [8 * i for i in range(1, 61)]
+    assert result["samples_consumed"] == 480
+    assert result["samples_per_optimizer_step"] == 8
     saved = json.loads((tmp_path / "training_summary.json").read_text())
     assert saved == result
     assert result["learning_gate_passed"]
@@ -156,6 +159,15 @@ def test_cpu_tiny_overfit_optimizer_and_fresh_reload(config, contexts, tmp_path,
     predictions = [json.loads(line) for line in (tmp_path / "predictions_after.jsonl").read_text().splitlines()]
     for metric in ("loss", "ade_m", "fde_m"):
         assert result["final_metrics"][metric] == pytest.approx(sum(r[metric] for r in predictions) / 8)
+    diagnostics = json.loads((tmp_path / "per_sample_metrics.json").read_text())
+    before = [json.loads(line) for line in (tmp_path / "predictions_before.jsonl").read_text().splitlines()]
+    assert [row["sample_token"] for row in diagnostics] == [c.sample_token for c in contexts]
+    for label, metric in (("loss", "loss"), ("ADE", "ade_m"), ("FDE", "fde_m")):
+        for row, initial, final in zip(diagnostics, before, predictions, strict=True):
+            assert row[f"initial_{label}"] == initial[metric]
+            assert row[f"final_{label}"] == final[metric]
+        assert result[f"per_sample_improved_{label}_count"] == sum(
+            row[f"final_{label}"] < row[f"initial_{label}"] for row in diagnostics)
 
 
 @pytest.mark.parametrize("failure", ["learning", "reload"])
@@ -215,8 +227,72 @@ def test_cli_help_dry_run_and_exit_code(capsys, tmp_path, monkeypatch):
 
 
 def test_config_reuses_frozen_architecture(config):
-    assert config.train_subset_size == 8 and config.max_optimizer_steps == 1500
-    assert config.log_every_steps == 50
-    assert config.output_relative_dir == "phase_0_4/two_turn_planner_tiny_overfit_v0_2"
+    assert config.train_subset_size == 8 and config.max_optimizer_steps == 200
+    assert config.log_every_steps == 10
+    assert config.output_relative_dir == "phase_0_4/two_turn_planner_tiny_overfit_v0_3"
     assert config.seed == 20260812
+    assert (config.planner_dimension, config.num_decoder_layers, config.num_heads,
+            config.num_waypoint_queries, config.dropout, config.smooth_l1_beta) == (256, 2, 4, 6, .1, 1.)
+    assert (config.optimizer, config.learning_rate, config.weight_decay) == ("AdamW", .001, .0001)
     assert sum(p.numel() for p in WaypointDecoder(2560, config).parameters()) == 2_764_546
+
+
+def test_full_subset_mean_gradient_and_1600_exposures(config, contexts, tmp_path, monkeypatch):
+    class ScalarPlanner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.value = nn.Parameter(torch.tensor(0.25))
+            self.lengths = []
+
+        def forward(self, hidden, mask):
+            self.lengths.append(hidden.shape[1])
+            return self.value.expand(1, 6, 2)
+
+    planner = ScalarPlanner()
+    steps, means = [], []
+    original_optimizer = torch.optim.AdamW
+
+    class CheckedAdamW(original_optimizer):
+        def step(self, closure=None):
+            assert planner.lengths == [c.hidden_states.shape[1] for c in contexts]
+            reference = planner.value.detach().clone().requires_grad_()
+            losses = [training.masked_waypoint_loss(reference.expand(1, 6, 2), c.target,
+                                                   c.valid_mask, beta=config.smooth_l1_beta)
+                      for c in contexts]
+            mean = torch.stack(losses).mean()
+            expected_gradient, = torch.autograd.grad(mean, reference)
+            torch.testing.assert_close(planner.value.grad, expected_gradient)
+            means.append(float(mean.detach()))
+            steps.append(len(planner.lengths))
+            planner.lengths.clear()
+            return super().step(closure)
+
+    monkeypatch.setattr(torch.optim, "AdamW", CheckedAdamW)
+    history_path = tmp_path / "history.jsonl"
+    training.train_planner(planner, contexts, config=config, device="cpu", history_path=history_path)
+    history = [json.loads(line) for line in history_path.read_text().splitlines()]
+    assert len(steps) == 200 and sum(steps) == 1600
+    assert not planner.lengths
+    assert history[-1]["optimizer_step"] == 200 and history[-1]["samples_consumed"] == 1600
+    for index, row in enumerate(history):
+        assert row["mean_step_loss"] == pytest.approx(means[index])
+        assert row["running_mean_loss"] == pytest.approx(sum(means[:index + 1]) / (index + 1))
+
+
+def test_prior_artifacts_untouched(config, contexts, tmp_path):
+    previous = []
+    for version in ("v0_1", "v0_2"):
+        path = tmp_path / "phase_0_4" / f"two_turn_planner_tiny_overfit_{version}" / "training_summary.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"preserved {version}")
+        previous.append((path, path.read_bytes(), path.stat().st_mtime_ns))
+    output = tmp_path / config.output_relative_dir
+    output.mkdir()
+    training.fit_cached_contexts(
+        contexts=contexts, config=replace(config, planner_dimension=16, num_decoder_layers=1,
+                                          max_optimizer_steps=1),
+        hidden_size=16, device="cpu", output=output, provenance={"run_kind": "synthetic_cpu_test"},
+    )
+    assert (output / "training_summary.json").exists()
+    for path, content, modified_at in previous:
+        assert path.read_bytes() == content and path.stat().st_mtime_ns == modified_at
