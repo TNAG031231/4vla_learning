@@ -36,7 +36,7 @@ def load_config(path: Path) -> TinyOverfitConfig:
     config = TinyOverfitConfig(**(asdict(planner) | values))
     if config.train_subset_size != 8 or config.optimizer != "AdamW":
         raise ValueError("tiny overfit requires eight train samples and AdamW")
-    if (not 1 <= config.max_optimizer_steps <= 500 or config.log_every_steps < 1
+    if (not 1 <= config.max_optimizer_steps <= 1500 or config.log_every_steps < 1
             or not math.isfinite(config.learning_rate) or config.learning_rate <= 0
             or not math.isfinite(config.weight_decay) or config.weight_decay < 0):
         raise ValueError("invalid tiny-overfit optimizer settings")
@@ -213,6 +213,10 @@ def fit_cached_contexts(*, contexts: list[CachedContext], config: TinyOverfitCon
         "learning_gate_passed": learning_passed, "planner_parameters_updated": updated,
         "planner_trainable_parameters": parameter_count, "reload_consistency": consistency["reload_consistency"],
         "initial_metrics": initial, "final_metrics": final, "optimizer_steps": config.max_optimizer_steps,
+        "initial_loss": initial["loss"], "final_loss": final["loss"],
+        "loss_ratio": final["loss"] / initial["loss"] if initial["loss"] > 0 else None,
+        "initial_ADE": initial["ade_m"], "final_ADE": final["ade_m"],
+        "initial_FDE": initial["fde_m"], "final_FDE": final["fde_m"],
         "train_sample_tokens": saved["tiny_sample_tokens"], "train_sample_count": len(contexts),
         "conditioning_type": "gt_action_teacher_forced_train", "generalization_evaluated": False,
         "coordinate_units": "meter", "metric_aggregation": "mean_per_sample_on_exact_tiny_train_subset",

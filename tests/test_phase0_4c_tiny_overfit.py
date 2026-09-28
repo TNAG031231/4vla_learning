@@ -107,7 +107,8 @@ def test_cache_runs_one_frozen_forward_per_sample_and_keeps_targets_out_of_conte
 
 
 def test_cpu_tiny_overfit_optimizer_and_fresh_reload(config, contexts, tmp_path, monkeypatch):
-    config = replace(config, planner_dimension=16, num_heads=4, num_decoder_layers=1, dropout=0.)
+    config = replace(config, planner_dimension=16, num_heads=4, num_decoder_layers=1,
+                     dropout=0., max_optimizer_steps=300)
     backbone = nn.ModuleDict({"qwen": nn.Linear(16, 16), "lora_A": nn.Linear(16, 2)})
     freeze_backbone(backbone)
     backbone_weights = {name: value.clone() for name, value in backbone.state_dict().items()}
@@ -147,6 +148,11 @@ def test_cpu_tiny_overfit_optimizer_and_fresh_reload(config, contexts, tmp_path,
     assert [row["sample_token"] for row in history] == [contexts[i % 8].sample_token for i in range(300)]
     saved = json.loads((tmp_path / "training_summary.json").read_text())
     assert saved == result
+    assert result["learning_gate_passed"]
+    assert result["loss_ratio"] == pytest.approx(result["final_loss"] / result["initial_loss"])
+    for label, metric in (("loss", "loss"), ("ADE", "ade_m"), ("FDE", "fde_m")):
+        for stage in ("initial", "final"):
+            assert result[f"{stage}_{label}"] == result[f"{stage}_metrics"][metric]
     predictions = [json.loads(line) for line in (tmp_path / "predictions_after.jsonl").read_text().splitlines()]
     for metric in ("loss", "ade_m", "fde_m"):
         assert result["final_metrics"][metric] == pytest.approx(sum(r[metric] for r in predictions) / 8)
@@ -209,6 +215,8 @@ def test_cli_help_dry_run_and_exit_code(capsys, tmp_path, monkeypatch):
 
 
 def test_config_reuses_frozen_architecture(config):
-    assert config.train_subset_size == 8 and config.max_optimizer_steps == 300
+    assert config.train_subset_size == 8 and config.max_optimizer_steps == 1500
+    assert config.log_every_steps == 50
+    assert config.output_relative_dir == "phase_0_4/two_turn_planner_tiny_overfit_v0_2"
     assert config.seed == 20260812
     assert sum(p.numel() for p in WaypointDecoder(2560, config).parameters()) == 2_764_546
