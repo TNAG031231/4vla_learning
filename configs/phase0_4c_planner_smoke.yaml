@@ -1,0 +1,10 @@
+seed: 20260812
+train_subset_size: 2
+selected_adapter_relative_path: phase_0_4/structured_action_lora_full_v0_1/adapter_step_3564
+output_relative_dir: phase_0_4/two_turn_planner_smoke_v0_1
+planner_dimension: 256
+num_decoder_layers: 2
+num_heads: 4
+dropout: 0.1
+num_waypoint_queries: 6
+smooth_l1_beta: 1.0

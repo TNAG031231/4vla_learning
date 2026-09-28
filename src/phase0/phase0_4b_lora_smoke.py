@@ -70,6 +70,12 @@ def load_samples(repository: Path, derived_root: Path, *, split: str = "train") 
 
 
 def load_temporal_samples(repository: Path, derived_root: Path, *, split: str) -> list[SFTSample]:
+    records = load_temporal_records(repository, derived_root, split=split)
+    ego_config = load_ego_config(repository / "configs/phase0_3_dataset_adapter.yaml")
+    return [adapt_record(row, ego_config, expected_split=split) for row in records]
+
+
+def load_temporal_records(repository: Path, derived_root: Path, *, split: str) -> list[dict]:
     if split not in ("train", "validation"):
         raise ValueError("temporal intake only permits train and validation")
     source = load_source_config(repository / "configs/phase0_4_source_projection.yaml", repository)
@@ -77,8 +83,7 @@ def load_temporal_samples(repository: Path, derived_root: Path, *, split: str) -
     selection = development.select_development_scenes(mapping, source.source_contract)
     temporal = yaml.safe_load((repository / "configs/phase0_4_temporal_dataset.yaml").read_text())
     path = resolve_derived_path(derived_root, temporal["output_relative_dir"]) / f"{split}.jsonl"
-    ego_config = load_ego_config(repository / "configs/phase0_3_dataset_adapter.yaml")
-    samples, seen = [], set()
+    records, seen = [], set()
     with path.open() as stream:
         for line in stream:
             row = json.loads(line)
@@ -88,30 +93,37 @@ def load_temporal_samples(repository: Path, derived_root: Path, *, split: str) -
                 raise ValueError("temporal record split mapping mismatch")
             if row["history_length"] != temporal["history_length"]:
                 raise ValueError("temporal history length mismatch")
-            sample = adapt_record(row, ego_config, expected_split=split)
-            if sample.sample_token in seen:
+            if row["sample_token"] in seen:
                 raise ValueError("duplicate temporal sample")
-            seen.add(sample.sample_token)
-            samples.append(sample)
-    if len(samples) != source.source_contract.expected_sample_counts[split]:
+            seen.add(row["sample_token"])
+            records.append(row)
+    if len(records) != source.source_contract.expected_sample_counts[split]:
         raise ValueError("temporal count differs from frozen producer")
-    return samples
+    return records
 
 
 def predict_sample(model: object, sample: SFTSample, collator: StructuredCollator,
                    generation_kwargs: dict, device: str, *, expected_split: str) -> dict:
-    inputs = collator.processor.apply_chat_template(
-        collator.messages(sample, expected_split=expected_split), tokenize=True,
+    prediction = generate_action(
+        model, collator.messages(sample, expected_split=expected_split),
+        collator.processor, generation_kwargs, device,
+    )
+    return {"sample_token": sample.sample_token, "scene_token": sample.scene_token,
+            "split": sample.split, "target": asdict(sample.target), **prediction}
+
+
+def generate_action(model: object, messages: list[dict], processor: object,
+                    generation_kwargs: dict, device: str) -> dict:
+    inputs = processor.apply_chat_template(
+        messages, tokenize=True,
         add_generation_prompt=True, return_dict=True, return_tensors="pt",
     )
     output = model.generate(**_move_batch(inputs, device), **generation_kwargs)
-    raw = collator.processor.batch_decode(
+    raw = processor.batch_decode(
         output[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
-    return {"sample_token": sample.sample_token, "scene_token": sample.scene_token,
-            "split": sample.split, "target": asdict(sample.target),
-            "raw_output": raw, "parsed_action": parse_action(raw)}
+    return {"raw_output": raw, "parsed_action": parse_action(raw)}
 
 
 def select_tiny(samples: list[SFTSample], size: int, seed: int) -> list[SFTSample]:

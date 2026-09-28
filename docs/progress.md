@@ -282,10 +282,21 @@ source_audit_record
 - Runtime：训练 `26,132.13 s`（`7.2589 h`，排除 checkpoint/validation callbacks），平均 `1.83345 s/train sample`；四次 milestone validation 分别 `0.9384 / 0.9316 / 0.9487 / 0.9523 h`，fresh final validation `0.9268 h`；total run `43,059.06 s`（`11.9609 h`，截止 summary 写入前）。
 - 主要瓶颈仍为 longitudinal：decelerate→keep `297` 条、accelerate→keep `270` 条；lateral 错误主要为 left/right 与 straight 混淆，left→right / right→left 仅 `6/7` 条。Failure taxonomy：fully correct `2327`、longitudinal wrong only `937`、lateral wrong only `187`、both wrong `143`、invalid structured output `0`。
 - `test_records_read`、`combined_manifest_records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 全部为 `0`；`test_evaluation_performed=false`。Artifact 位于 `$VLA_DERIVED_ROOT/phase_0_4/structured_action_lora_full_v0_1/`，配置、history、四次 validation、最终 predictions/metrics、baseline、reload consistency 与 adapter metadata 均已核验，`full_model_saved=false`；产物未提交 Git。
-- 当前能力边界：已获得 full-train structured-action SFT 与 scene-separated validation generalization 的真实 GPU 证据；本轮仅核验和记录，未重新训练，Phase 0.4c 尚未进入。
+- 当前能力边界：已获得 full-train structured-action SFT 与 scene-separated validation generalization 的真实 GPU 证据；该轮仅核验和记录，未重新训练。Phase 0.4c 最新状态见下节。
+
+## Phase 0.4c-1 Two-turn Planner Real-GPU Smoke
+
+- 状态：`completed` / `PASS`，`status=smoke_passed`、`run_kind=two_turn_planner_chain_only`；依据用户本人在 AutoDL 执行并提供的真实结果，execution commit 为 `9f432dea873d0c7806431733eb7ec2dd74105901`。Artifact：`$VLA_DERIVED_ROOT/phase_0_4/two_turn_planner_smoke_v0_1/smoke_result.json`；本轮仅做 documentation closeout。
+- 模型 `Qwen/Qwen3-VL-4B-Instruct`，model / processor revision 均为 `ebb281ec70b05090aa6165b016eac8ec08e71b17`；selected adapter 为 `$VLA_DERIVED_ROOT/phase_0_4/structured_action_lora_full_v0_1/adapter_step_3564`，fresh load 成功，`selected_adapter_loaded=true`。Runtime：Transformers `4.57.6`、PEFT `0.19.1`。
+- 真实 hidden size `2560`；planner 为 context projection → 6 waypoint queries → 2-layer / 4-head Transformer decoder（`D=256`、dropout `0.1`）→ waypoint projection，trainable parameters `2,764,546`，masked SmoothL1 `beta=1.0`。`qwen_and_lora_frozen=true`、`lora_parameter_tensors=288`、`lora_frozen=true`、`planner_trainable=true`。
+- 两个 train samples `caf1afbc89944f168ac7caad1256a98d` / `2707886d13294583be28d81d1fb235a4` 分别以 GT `keep + straight` / `stop + straight` 做 teacher forcing，`action_context_matches=true`；真实 `hidden_states[-1]` 均为 `[1,4658,2560]`、`torch.bfloat16`，输出 `[1,6,2]` 且 finite。Loss 分别为 `6.382595062255859` / `0.11986953020095825`，backward 均成功；context projection、waypoint queries、decoder、waypoint projection 的 gradients 均 finite / nonzero。两项 loss 仅证明链路与 backward 正常，不作性能比较。
+- 正式 predicted-action inference 使用首个 sample：GT 为 `longitudinal=keep; lateral=straight`，selected adapter 实际预测及 Turn-2 assistant context / decoded action 均为 `longitudinal=decelerate; lateral=straight`，`conditioning_type=predicted_action`、`action_context_matches=true`。真实路径为 observation → predicted semantic action → assistant context tokens → Turn-2 Qwen contextual forward → continuous waypoint decoder；hidden state 为 `[1,4660,2560]`、`torch.bfloat16`，输出 `[1,6,2]` 且 finite，与 GT teacher-forced training path 分离。
+- Isolation：`train_records_validated=14253`、`train_sample_count=2`、`validation_sample_count=0`、`predicted_action_sample_count=1`、`optimizer_steps=0`；`test_records_read`、`combined_manifest_records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 全部为 `0`，`test_evaluation_performed=false`，test isolation `PASS`。
+- 能力边界：真实模型、selected adapter、two-turn conditioning、continuous decoder 和 backward 链路已验证；decoder 尚未训练，`trajectory_performance_evaluated=false`，**trajectory performance = NOT EVALUATED**。不声称 waypoint accuracy、trajectory generalization、ADE/FDE improvement、planner 已学会驾驶或 DriveMA / Qwen-VLA reproduction。
 
 ## Next Gate
 
+- Phase 0.4c-1 real GPU smoke 为 `completed` / `PASS` → 下一 gate 为 **Phase 0.4c-2 tiny overfit**（尚未开始）：验证 frozen Qwen3-VL + frozen semantic LoRA contextual representation 上的 lightweight waypoint decoder 是否能学习 continuous trajectory。
 - Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
 - 当前 test 不进入 Phase 0.4b / 0.4c / 0.4d 的模型选择或开发反馈；test 保留给最终冻结 VLA pipeline 的一次正式 evaluation。
 - 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。
@@ -293,4 +304,4 @@ source_audit_record
 - Phase 0.3 overall 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
 - Phase 0.4a-1 real-data gate 已通过（用户确认的 AutoDL artifact audit）：train 14,253 records / 560 scenes，validation 3,594 records / 140 scenes；unique sample_token 17,847，scene overlap 0，malformed trajectories 0，7-point raw trajectory contract PASS。
 - Source artifact SHA-256：train `8c1ad5cc2ad4fa01d7730b1458a7415061ed40b0198495ddb36fbb035d738352`；validation `68ab5a06440447f31bbfcb8fa4678bf248b5ab3f718d978cba25d8b568e77246`。
-- 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4a-3 factorized targets 已完成并冻结，Phase 0.4a-4 为 `completed`，真实生成、验证及人工审核均已通过；Phase 0.4a overall gate 为 `PASS`。Phase 0.4b-A real GPU smoke 为 `completed` / `PASS`；Phase 0.4b validation/full training 与 Phase 0.4b-B 尚未开始。
+- 该 AutoDL gate 的 `combined_manifest_records_parsed`、`combined_manifest.records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 均为 0；Phase 0.4a-3 factorized targets 已完成并冻结，Phase 0.4a-4 为 `completed`，真实生成、验证及人工审核均已通过；Phase 0.4a overall gate 为 `PASS`。Phase 0.4b-A real GPU smoke 与 Phase 0.4b-B full-train / full-validation 均为 `completed` / `PASS`。
