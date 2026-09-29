@@ -16,6 +16,7 @@ import torch
 from src.phase0.phase0_4b_lora_full import load_config as load_semantic_config
 from src.phase0.phase0_4b_lora_smoke import load_temporal_records
 from src.phase0.phase0_4c_collapse_diagnostic import diagnose
+from src.phase0.phase0_4c_layer2_diagnostic import diagnose_layer2
 from src.phase0.phase0_4c_tiny_overfit import cache_contexts, load_config, select_training_samples, write_json
 from src.phase0.phase0_4c_two_turn_planner import PlannerConfig, WaypointDecoder, freeze_backbone
 from src.phase0.qwen3vl_dataset_adapter import (
@@ -25,12 +26,16 @@ from src.phase0.qwen3vl_interface import FIXED_MODEL_ID, FIXED_REVISION
 from src.phase0.qwen3vl_lora_smoke import default_runtime_dependencies
 
 OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_collapse_diagnostic_v0_3"
+LAYER2_OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_layer2_diagnostic_v0_3"
 
 
-def run(*, dataset_root: Path, derived_root: Path, split: str = "train") -> dict:
+def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: str = "collapse") -> dict:
     if split != "train":
         raise ValueError("collapse diagnostic only permits train")
-    output = resolve_derived_path(derived_root, OUTPUT_RELATIVE_DIR)
+    if probe not in ("collapse", "layer2"):
+        raise ValueError("probe must be collapse or layer2")
+    relative_dir = OUTPUT_RELATIVE_DIR if probe == "collapse" else LAYER2_OUTPUT_RELATIVE_DIR
+    output = resolve_derived_path(derived_root, relative_dir)
     if output.is_relative_to(ROOT):
         raise ValueError("diagnostic artifacts must be outside repository")
     if output.exists():
@@ -73,7 +78,8 @@ def run(*, dataset_root: Path, derived_root: Path, split: str = "train") -> dict
     torch.cuda.empty_cache()
     planner = WaypointDecoder(saved["hidden_size"], PlannerConfig(**saved["planner_config"])).to(device)
     planner.load_state_dict(saved["planner_state_dict"])
-    result = diagnose(planner, contexts, beta=config.smooth_l1_beta, device=device)
+    result = (diagnose(planner, contexts, beta=config.smooth_l1_beta, device=device)
+              if probe == "collapse" else diagnose_layer2(planner, contexts, device=device))
     result["provenance"] = {
         "checkpoint": str(checkpoint_path), "checkpoint_provenance": saved["provenance"],
         "diagnostic_git_commit": diagnostic_commit,
@@ -94,12 +100,24 @@ def run(*, dataset_root: Path, derived_root: Path, split: str = "train") -> dict
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only v0.3 checkpoint collapse diagnostic; no optimizer.")
     parser.add_argument("--split", choices=("train",), default="train")
+    parser.add_argument("--probe", choices=("collapse", "layer2"), default="collapse")
     parser.add_argument("--dataset-root", type=Path, default=os.environ.get("NUSCENES_ROOT"))
     parser.add_argument("--derived-root", type=Path, default=os.environ.get("VLA_DERIVED_ROOT"))
     args = parser.parse_args(argv)
     if args.dataset_root is None or args.derived_root is None:
         parser.error("set NUSCENES_ROOT and VLA_DERIVED_ROOT or provide root arguments")
-    result = run(dataset_root=args.dataset_root, derived_root=args.derived_root, split=args.split)
+    result = run(dataset_root=args.dataset_root, derived_root=args.derived_root, split=args.split, probe=args.probe)
+    if args.probe == "layer2":
+        print(json.dumps({
+            "status": result["status"], "norm_first": result["norm_first"],
+            "planner_state_unchanged": result["planner_state_unchanged"],
+            "execution_order": result["execution_order"], "stages": result["stage_aggregates"],
+            "attention": result["attention_aggregate"],
+            "attention_replay_max_absolute_difference": max(
+                s["cross_attention"]["replay_output_max_absolute_difference"] for s in result["per_sample"]),
+            "output": str(args.derived_root / LAYER2_OUTPUT_RELATIVE_DIR / "diagnostic.json"),
+        }, indent=2, allow_nan=False))
+        return 0
     print(json.dumps({
         "status": result["status"], "planner_state_unchanged": result["planner_state_unchanged"],
         "query_pairwise_l2": result["query_embeddings"]["off_diagonal_l2"],

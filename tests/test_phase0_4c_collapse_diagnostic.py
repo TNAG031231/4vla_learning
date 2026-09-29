@@ -126,7 +126,8 @@ def test_backward_once_matches_full_mean_and_never_updates_parameters(setup, mon
 
 
 @pytest.mark.parametrize("mismatch", [None, "configuration", "sample order"])
-def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkeypatch, mismatch):
+@pytest.mark.parametrize("probe", ["collapse", "layer2"])
+def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkeypatch, mismatch, probe):
     planner, contexts, config = setup
     source = tmp_path / config.output_relative_dir
     source.mkdir(parents=True)
@@ -147,6 +148,11 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("preserve")
         paths.append(path)
+    if probe == "layer2":
+        old_diagnostic = tmp_path / cli.OUTPUT_RELATIVE_DIR / "diagnostic.json"
+        old_diagnostic.parent.mkdir(parents=True)
+        old_diagnostic.write_text("preserve previous collapse diagnostic")
+        paths.append(old_diagnostic)
     before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}
     monkeypatch.setattr(cli, "load_config", lambda path: config)
     monkeypatch.setattr(cli, "collect_git_provenance", lambda path: SimpleNamespace(commit="test-only"))
@@ -155,7 +161,7 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
     if mismatch:
         monkeypatch.setattr(cli, "default_runtime_dependencies", lambda: pytest.fail("model accessed"))
         with pytest.raises(ValueError, match=mismatch):
-            cli.run(dataset_root=tmp_path, derived_root=tmp_path)
+            cli.run(dataset_root=tmp_path, derived_root=tmp_path, probe=probe)
         return
     model = nn.Linear(16, 16)
     model.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=16))
@@ -172,15 +178,15 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
 
     monkeypatch.setattr(cli, "cache_contexts", cache)
     monkeypatch.setattr(torch, "save", lambda *a, **kw: pytest.fail("checkpoint saved"))
-    result = cli.run(dataset_root=tmp_path, derived_root=tmp_path)
-    output = tmp_path / cli.OUTPUT_RELATIVE_DIR
+    result = cli.run(dataset_root=tmp_path, derived_root=tmp_path, probe=probe)
+    output = tmp_path / (cli.OUTPUT_RELATIVE_DIR if probe == "collapse" else cli.LAYER2_OUTPUT_RELATIVE_DIR)
     assert json.loads((output / "diagnostic.json").read_text()) == result
     assert list(output.iterdir()) == [output / "diagnostic.json"]
     assert result["provenance"]["qwen_and_lora_frozen"]
     for path, (content, modified) in before.items():
         assert path.read_bytes() == content and path.stat().st_mtime_ns == modified
     with pytest.raises(FileExistsError):
-        cli.run(dataset_root=tmp_path, derived_root=tmp_path)
+        cli.run(dataset_root=tmp_path, derived_root=tmp_path, probe=probe)
 
 
 @pytest.mark.parametrize("split", ["validation", "test"])
