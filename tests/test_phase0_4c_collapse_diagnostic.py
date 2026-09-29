@@ -126,7 +126,7 @@ def test_backward_once_matches_full_mean_and_never_updates_parameters(setup, mon
 
 
 @pytest.mark.parametrize("mismatch", [None, "configuration", "sample order"])
-@pytest.mark.parametrize("probe", ["collapse", "layer2"])
+@pytest.mark.parametrize("probe", ["collapse", "layer2", "qkv"])
 def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkeypatch, mismatch, probe):
     planner, contexts, config = setup
     source = tmp_path / config.output_relative_dir
@@ -148,16 +148,22 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("preserve")
         paths.append(path)
-    if probe == "layer2":
+    if probe != "collapse":
         old_diagnostic = tmp_path / cli.OUTPUT_RELATIVE_DIR / "diagnostic.json"
         old_diagnostic.parent.mkdir(parents=True)
         old_diagnostic.write_text("preserve previous collapse diagnostic")
         paths.append(old_diagnostic)
+    if probe == "qkv":
+        old_layer2 = tmp_path / cli.LAYER2_OUTPUT_RELATIVE_DIR / "diagnostic.json"
+        old_layer2.parent.mkdir(parents=True)
+        old_layer2.write_text("preserve previous layer2 diagnostic")
+        paths.append(old_layer2)
     before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}
     monkeypatch.setattr(cli, "load_config", lambda path: config)
     monkeypatch.setattr(cli, "collect_git_provenance", lambda path: SimpleNamespace(commit="test-only"))
     monkeypatch.setattr(cli, "load_temporal_records", lambda *a, **kw: [{"sample_token": c.sample_token} for c in contexts])
-    monkeypatch.setattr(cli, "select_training_samples", lambda *a: [SimpleNamespace(sample_token=c.sample_token) for c in contexts])
+    monkeypatch.setattr(cli, "select_training_samples", lambda *a: [
+        SimpleNamespace(sample_token=c.sample_token, observation=SimpleNamespace(frame_texts=())) for c in contexts])
     if mismatch:
         monkeypatch.setattr(cli, "default_runtime_dependencies", lambda: pytest.fail("model accessed"))
         with pytest.raises(ValueError, match=mismatch):
@@ -165,24 +171,35 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
         return
     model = nn.Linear(16, 16)
     model.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=16))
+    tokenizer = SimpleNamespace(convert_ids_to_tokens=str, decode=lambda ids: str(ids), all_special_ids=[])
     runtime = SimpleNamespace(
         device_selector=lambda value: "cpu", dtype_selector=lambda value: torch.bfloat16,
-        processor_loader=lambda *a: object(), model_loader=lambda *a: model,
+        processor_loader=lambda *a: SimpleNamespace(tokenizer=tokenizer), model_loader=lambda *a: model,
         adapter_loader=lambda base, path: base, package_version=lambda name: "synthetic",
     )
     monkeypatch.setattr(cli, "default_runtime_dependencies", lambda: runtime)
 
     def cache(**kwargs):
         assert all(not p.requires_grad and p.grad is None for p in kwargs["model"].parameters())
+        if probe == "qkv":
+            monkeypatch.setattr(model, "forward", lambda **kwargs: None)
+            for context in contexts:
+                model(input_ids=torch.arange(context.hidden_states.shape[1])[None])
+            return contexts, [{"action_token_ids": [0]} for _ in contexts]
         return contexts, []
 
     monkeypatch.setattr(cli, "cache_contexts", cache)
     monkeypatch.setattr(torch, "save", lambda *a, **kw: pytest.fail("checkpoint saved"))
     result = cli.run(dataset_root=tmp_path, derived_root=tmp_path, probe=probe)
-    output = tmp_path / (cli.OUTPUT_RELATIVE_DIR if probe == "collapse" else cli.LAYER2_OUTPUT_RELATIVE_DIR)
+    output = tmp_path / {"collapse": cli.OUTPUT_RELATIVE_DIR, "layer2": cli.LAYER2_OUTPUT_RELATIVE_DIR,
+                         "qkv": cli.QKV_OUTPUT_RELATIVE_DIR}[probe]
     assert json.loads((output / "diagnostic.json").read_text()) == result
     assert list(output.iterdir()) == [output / "diagnostic.json"]
     assert result["provenance"]["qwen_and_lora_frozen"]
+    assert not model._forward_pre_hooks
+    if probe == "qkv":
+        assert all(token["token_id"] == token["absolute_index"] for s in result["per_sample"]
+                   for h in s["heads"] for q in h["queries"] for token in q["top_tokens"])
     for path, (content, modified) in before.items():
         assert path.read_bytes() == content and path.stat().st_mtime_ns == modified
     with pytest.raises(FileExistsError):

@@ -17,6 +17,7 @@ from src.phase0.phase0_4b_lora_full import load_config as load_semantic_config
 from src.phase0.phase0_4b_lora_smoke import load_temporal_records
 from src.phase0.phase0_4c_collapse_diagnostic import diagnose
 from src.phase0.phase0_4c_layer2_diagnostic import diagnose_layer2
+from src.phase0.phase0_4c_qkv_diagnostic import diagnose_qkv, token_context
 from src.phase0.phase0_4c_tiny_overfit import cache_contexts, load_config, select_training_samples, write_json
 from src.phase0.phase0_4c_two_turn_planner import PlannerConfig, WaypointDecoder, freeze_backbone
 from src.phase0.qwen3vl_dataset_adapter import (
@@ -27,14 +28,17 @@ from src.phase0.qwen3vl_lora_smoke import default_runtime_dependencies
 
 OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_collapse_diagnostic_v0_3"
 LAYER2_OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_layer2_diagnostic_v0_3"
+QKV_OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_qkv_diagnostic_v0_3"
 
 
 def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: str = "collapse") -> dict:
     if split != "train":
         raise ValueError("collapse diagnostic only permits train")
-    if probe not in ("collapse", "layer2"):
-        raise ValueError("probe must be collapse or layer2")
-    relative_dir = OUTPUT_RELATIVE_DIR if probe == "collapse" else LAYER2_OUTPUT_RELATIVE_DIR
+    directories = {"collapse": OUTPUT_RELATIVE_DIR, "layer2": LAYER2_OUTPUT_RELATIVE_DIR,
+                   "qkv": QKV_OUTPUT_RELATIVE_DIR}
+    if probe not in directories:
+        raise ValueError("probe must be collapse, layer2 or qkv")
+    relative_dir = directories[probe]
     output = resolve_derived_path(derived_root, relative_dir)
     if output.is_relative_to(ROOT):
         raise ValueError("diagnostic artifacts must be outside repository")
@@ -69,17 +73,37 @@ def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: 
     freeze_backbone(model)
     if model.config.text_config.hidden_size != saved["hidden_size"]:
         raise ValueError("checkpoint and Qwen hidden sizes differ")
-    contexts, evidence = cache_contexts(
-        model=model, processor=processor, samples=samples, records=targets,
-        dataset_root=dataset_root, device=device, runtime=runtime,
-    )
+    captured_ids = []
+
+    def capture_ids(module: torch.nn.Module, args: tuple, kwargs: dict) -> None:
+        captured_ids.append(kwargs["input_ids"][0].detach().cpu().tolist())
+
+    handle = model.register_forward_pre_hook(capture_ids, with_kwargs=True) if probe == "qkv" else None
+    try:
+        contexts, evidence = cache_contexts(
+            model=model, processor=processor, samples=samples, records=targets,
+            dataset_root=dataset_root, device=device, runtime=runtime,
+        )
+    finally:
+        if handle is not None:
+            handle.remove()
+    tokenizer = processor.tokenizer if probe == "qkv" else None
+    token_contexts = None
+    if probe == "qkv":
+        token_contexts = {
+            sample.sample_token: token_context(ids, tokenizer, sample.observation.frame_texts, item["action_token_ids"])
+            for sample, ids, item in zip(samples, captured_ids, evidence, strict=True)
+        }
     frozen = all(not p.requires_grad and p.grad is None for p in model.parameters())
     del model, base, processor
     torch.cuda.empty_cache()
     planner = WaypointDecoder(saved["hidden_size"], PlannerConfig(**saved["planner_config"])).to(device)
     planner.load_state_dict(saved["planner_state_dict"])
-    result = (diagnose(planner, contexts, beta=config.smooth_l1_beta, device=device)
-              if probe == "collapse" else diagnose_layer2(planner, contexts, device=device))
+    if probe == "qkv":
+        result = diagnose_qkv(planner, contexts, device=device, token_contexts=token_contexts, tokenizer=tokenizer)
+    else:
+        result = (diagnose(planner, contexts, beta=config.smooth_l1_beta, device=device)
+                  if probe == "collapse" else diagnose_layer2(planner, contexts, device=device))
     result["provenance"] = {
         "checkpoint": str(checkpoint_path), "checkpoint_provenance": saved["provenance"],
         "diagnostic_git_commit": diagnostic_commit,
@@ -100,13 +124,23 @@ def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only v0.3 checkpoint collapse diagnostic; no optimizer.")
     parser.add_argument("--split", choices=("train",), default="train")
-    parser.add_argument("--probe", choices=("collapse", "layer2"), default="collapse")
+    parser.add_argument("--probe", choices=("collapse", "layer2", "qkv"), default="collapse")
     parser.add_argument("--dataset-root", type=Path, default=os.environ.get("NUSCENES_ROOT"))
     parser.add_argument("--derived-root", type=Path, default=os.environ.get("VLA_DERIVED_ROOT"))
     args = parser.parse_args(argv)
     if args.dataset_root is None or args.derived_root is None:
         parser.error("set NUSCENES_ROOT and VLA_DERIVED_ROOT or provide root arguments")
     result = run(dataset_root=args.dataset_root, derived_root=args.derived_root, split=args.split, probe=args.probe)
+    if args.probe == "qkv":
+        print(json.dumps({
+            "status": result["status"], "interpretation": result["interpretation"],
+            "mask_accounting": [{"sample_token": s["sample_token"], **s["mask"]} for s in result["per_sample"]],
+            "q_projection_weights": result["q_projection_weights"],
+            "logits": result["logit_aggregate_over_samples_heads_queries"],
+            "planner_state_unchanged": result["planner_state_unchanged"],
+            "output": str(args.derived_root / QKV_OUTPUT_RELATIVE_DIR / "diagnostic.json"),
+        }, indent=2, allow_nan=False))
+        return 0
     if args.probe == "layer2":
         print(json.dumps({
             "status": result["status"], "norm_first": result["norm_first"],
