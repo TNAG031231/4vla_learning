@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts import diagnose_phase0_4c_collapse as cli
 from src.phase0 import phase0_4c_collapse_diagnostic as diagnostic
-from src.phase0.phase0_4c_tiny_overfit import CachedContext, load_config
+from src.phase0.phase0_4c_tiny_overfit import CachedContext, evaluate, load_config
 from src.phase0.phase0_4c_two_turn_planner import PlannerConfig, WaypointDecoder, masked_waypoint_loss
 
 
@@ -126,7 +126,7 @@ def test_backward_once_matches_full_mean_and_never_updates_parameters(setup, mon
 
 
 @pytest.mark.parametrize("mismatch", [None, "configuration", "sample order"])
-@pytest.mark.parametrize("probe", ["collapse", "layer2", "qkv"])
+@pytest.mark.parametrize("probe", ["collapse", "layer2", "qkv", "init-vs-trained"])
 def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkeypatch, mismatch, probe):
     planner, contexts, config = setup
     source = tmp_path / config.output_relative_dir
@@ -143,6 +143,17 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
     checkpoint = source / "planner_state.pt"
     torch.save(saved, checkpoint)
     paths = [checkpoint]
+    if probe == "init-vs-trained":
+        torch.manual_seed(config.seed)
+        initial = WaypointDecoder(16, config)
+        _, predictions = evaluate(initial, contexts, beta=config.smooth_l1_beta, device="cpu")
+        reference = source / "predictions_before.jsonl"
+        reference.write_text("".join(json.dumps(row) + "\n" for row in predictions))
+        paths.append(reference)
+        old_qkv = tmp_path / cli.QKV_OUTPUT_RELATIVE_DIR / "diagnostic.json"
+        old_qkv.parent.mkdir(parents=True)
+        old_qkv.write_text("preserve previous QKV diagnostic")
+        paths.append(old_qkv)
     for version in ("v0_1", "v0_2", "v0_3"):
         path = tmp_path / "phase_0_4" / f"two_turn_planner_tiny_overfit_{version}" / "sentinel.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +164,7 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
         old_diagnostic.parent.mkdir(parents=True)
         old_diagnostic.write_text("preserve previous collapse diagnostic")
         paths.append(old_diagnostic)
-    if probe == "qkv":
+    if probe in ("qkv", "init-vs-trained"):
         old_layer2 = tmp_path / cli.LAYER2_OUTPUT_RELATIVE_DIR / "diagnostic.json"
         old_layer2.parent.mkdir(parents=True)
         old_layer2.write_text("preserve previous layer2 diagnostic")
@@ -192,11 +203,13 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
     monkeypatch.setattr(torch, "save", lambda *a, **kw: pytest.fail("checkpoint saved"))
     result = cli.run(dataset_root=tmp_path, derived_root=tmp_path, probe=probe)
     output = tmp_path / {"collapse": cli.OUTPUT_RELATIVE_DIR, "layer2": cli.LAYER2_OUTPUT_RELATIVE_DIR,
-                         "qkv": cli.QKV_OUTPUT_RELATIVE_DIR}[probe]
+                         "qkv": cli.QKV_OUTPUT_RELATIVE_DIR, "init-vs-trained": cli.INIT_OUTPUT_RELATIVE_DIR}[probe]
     assert json.loads((output / "diagnostic.json").read_text()) == result
     assert list(output.iterdir()) == [output / "diagnostic.json"]
     assert result["provenance"]["qwen_and_lora_frozen"]
     assert not model._forward_pre_hooks
+    if probe == "init-vs-trained":
+        assert result["comparison_performed"] and result["initialization_fidelity"]["passed"]
     if probe == "qkv":
         assert all(token["token_id"] == token["absolute_index"] for s in result["per_sample"]
                    for h in s["heads"] for q in h["queries"] for token in q["top_tokens"])

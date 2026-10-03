@@ -16,6 +16,7 @@ import torch
 from src.phase0.phase0_4b_lora_full import load_config as load_semantic_config
 from src.phase0.phase0_4b_lora_smoke import load_temporal_records
 from src.phase0.phase0_4c_collapse_diagnostic import diagnose
+from src.phase0.phase0_4c_init_diagnostic import diagnose_initial_vs_trained
 from src.phase0.phase0_4c_layer2_diagnostic import diagnose_layer2
 from src.phase0.phase0_4c_qkv_diagnostic import diagnose_qkv, token_context
 from src.phase0.phase0_4c_tiny_overfit import cache_contexts, load_config, select_training_samples, write_json
@@ -29,15 +30,16 @@ from src.phase0.qwen3vl_lora_smoke import default_runtime_dependencies
 OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_collapse_diagnostic_v0_3"
 LAYER2_OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_layer2_diagnostic_v0_3"
 QKV_OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_qkv_diagnostic_v0_3"
+INIT_OUTPUT_RELATIVE_DIR = "phase_0_4/two_turn_planner_init_vs_trained_diagnostic_v0_3"
 
 
 def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: str = "collapse") -> dict:
     if split != "train":
         raise ValueError("collapse diagnostic only permits train")
     directories = {"collapse": OUTPUT_RELATIVE_DIR, "layer2": LAYER2_OUTPUT_RELATIVE_DIR,
-                   "qkv": QKV_OUTPUT_RELATIVE_DIR}
+                   "qkv": QKV_OUTPUT_RELATIVE_DIR, "init-vs-trained": INIT_OUTPUT_RELATIVE_DIR}
     if probe not in directories:
-        raise ValueError("probe must be collapse, layer2 or qkv")
+        raise ValueError("probe must be collapse, layer2, qkv or init-vs-trained")
     relative_dir = directories[probe]
     output = resolve_derived_path(derived_root, relative_dir)
     if output.is_relative_to(ROOT):
@@ -99,7 +101,10 @@ def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: 
     torch.cuda.empty_cache()
     planner = WaypointDecoder(saved["hidden_size"], PlannerConfig(**saved["planner_config"])).to(device)
     planner.load_state_dict(saved["planner_state_dict"])
-    if probe == "qkv":
+    if probe == "init-vs-trained":
+        result = diagnose_initial_vs_trained(planner, contexts, config=config,
+            hidden_size=saved["hidden_size"], recorded_path=source / "predictions_before.jsonl", device=device)
+    elif probe == "qkv":
         result = diagnose_qkv(planner, contexts, device=device, token_contexts=token_contexts, tokenizer=tokenizer)
     else:
         result = (diagnose(planner, contexts, beta=config.smooth_l1_beta, device=device)
@@ -124,13 +129,20 @@ def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only v0.3 checkpoint collapse diagnostic; no optimizer.")
     parser.add_argument("--split", choices=("train",), default="train")
-    parser.add_argument("--probe", choices=("collapse", "layer2", "qkv"), default="collapse")
+    parser.add_argument("--probe", choices=("collapse", "layer2", "qkv", "init-vs-trained"), default="collapse")
     parser.add_argument("--dataset-root", type=Path, default=os.environ.get("NUSCENES_ROOT"))
     parser.add_argument("--derived-root", type=Path, default=os.environ.get("VLA_DERIVED_ROOT"))
     args = parser.parse_args(argv)
     if args.dataset_root is None or args.derived_root is None:
         parser.error("set NUSCENES_ROOT and VLA_DERIVED_ROOT or provide root arguments")
     result = run(dataset_root=args.dataset_root, derived_root=args.derived_root, split=args.split, probe=args.probe)
+    if args.probe == "init-vs-trained":
+        print(json.dumps({"status": result["status"], "interpretation": result["interpretation"],
+                          "initialization_fidelity": result["initialization_fidelity"],
+                          "comparison_performed": result["comparison_performed"],
+                          "output": str(args.derived_root / INIT_OUTPUT_RELATIVE_DIR / "diagnostic.json")},
+                         indent=2, allow_nan=False))
+        return 0
     if args.probe == "qkv":
         print(json.dumps({
             "status": result["status"], "interpretation": result["interpretation"],
