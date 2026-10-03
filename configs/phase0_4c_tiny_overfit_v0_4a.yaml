@@ -1,0 +1,9 @@
+planner_config: phase0_4c_planner_smoke.yaml
+train_subset_size: 8
+optimizer: AdamW
+learning_rate: 0.001
+weight_decay: 0.0001
+max_optimizer_steps: 200
+log_every_steps: 10
+memory_normalization: true
+output_relative_dir: phase_0_4/two_turn_planner_tiny_overfit_v0_4a
