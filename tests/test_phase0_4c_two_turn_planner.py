@@ -61,9 +61,10 @@ def test_real_processor_two_turn_context_has_exact_action_and_no_targets(process
         assert field not in repr(messages)
 
 
-def test_decoder_shape_masked_memory_and_backward(config):
+@pytest.mark.parametrize("memory_normalization", [False, True])
+def test_decoder_shape_masked_memory_and_backward(config, memory_normalization):
     torch.manual_seed(config.seed)
-    planner = WaypointDecoder(32, config).eval()
+    planner = WaypointDecoder(32, replace(config, memory_normalization=memory_normalization)).eval()
     memory = torch.randn(2, 9, 32)
     mask = torch.tensor([[1] * 9, [1] * 4 + [0] * 5])
     prediction = planner(memory, mask)
@@ -74,8 +75,10 @@ def test_decoder_shape_masked_memory_and_backward(config):
     assert torch.isfinite(prediction).all()
     prediction.square().mean().backward()
     for module in planner.children():
-        assert all(p.requires_grad for p in module.parameters())
-        assert sum(p.grad.abs().sum() for p in module.parameters()) > 0
+        parameters = list(module.parameters())
+        assert all(p.requires_grad for p in parameters)
+        if parameters:
+            assert sum(p.grad.abs().sum() for p in parameters) > 0
 
 
 def test_loss_masks_invalid_targets_and_gradients():

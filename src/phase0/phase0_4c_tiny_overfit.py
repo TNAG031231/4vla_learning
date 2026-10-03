@@ -186,8 +186,14 @@ def fit_cached_contexts(*, contexts: list[CachedContext], config: TinyOverfitCon
     write_json(output / "metrics_before.json", before[0])
     (output / "predictions_before.jsonl").write_text(
         "".join(json.dumps(row, allow_nan=False) + "\n" for row in before[1]))
+    if config.memory_normalization:
+        from src.phase0.phase0_4c_memory_ablation import collect_diagnostics
+
+        write_json(output / "diagnostics_initial.json", collect_diagnostics(planner, contexts, before[1], device=device))
     train_planner(planner, contexts, config=config, device=device, history_path=output / "training_history.jsonl")
     after = evaluate(planner, contexts, beta=config.smooth_l1_beta, device=device)
+    if config.memory_normalization:
+        write_json(output / "diagnostics_trained.json", collect_diagnostics(planner, contexts, after[1], device=device))
     updated = any(not torch.equal(initial_weights[name], value.detach().cpu())
                   for name, value in planner.state_dict().items())
     write_json(output / "metrics_after.json", after[0])
@@ -240,5 +246,22 @@ def fit_cached_contexts(*, contexts: list[CachedContext], config: TinyOverfitCon
         "checkpoint": "planner_state.pt", "full_model_saved": False, "hidden_state_cache_saved": False,
         **provenance,
     }
+    if config.memory_normalization:
+        conditions = {
+            "final_loss_lt_initial": final["loss"] < initial["loss"],
+            "final_loss_le_0_30_initial": final["loss"] <= .30 * initial["loss"],
+            "final_ADE_lt_initial": final["ade_m"] < initial["ade_m"],
+            "final_FDE_lt_initial": final["fde_m"] < initial["fde_m"],
+            "planner_parameters_updated": updated,
+            "reload_consistency": consistency["reload_consistency"],
+        }
+        result.update(
+            ablation="v0.4a_memory_layernorm", tiny_overfit_gate="PASS" if passed else "FAIL",
+            gate_conditions=conditions, failed_gate_conditions=[name for name, ok in conditions.items() if not ok],
+            memory_norm_trainable=all(p.requires_grad for p in fresh.memory_norm.parameters()),
+            memory_norm_parameters=sum(p.numel() for p in fresh.memory_norm.parameters()),
+            diagnostic_artifacts=["diagnostics_initial.json", "diagnostics_trained.json"],
+            attention_saturation_hypothesis="requires_review_of_measured_diagnostics_separately_from_gate",
+        )
     write_json(output / "training_summary.json", result)
     return result

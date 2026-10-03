@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -36,11 +36,25 @@ def run(*, dataset_root: Path, derived_root: Path, config: TinyOverfitConfig,
         raise ValueError("tiny-overfit artifacts must be outside repository")
     if output.exists():
         raise FileExistsError(f"tiny-overfit output already exists: {output}")
+    baseline = None
+    if config.memory_normalization:
+        baseline_config = load_config(ROOT / "configs/phase0_4c_tiny_overfit.yaml")
+        expected = replace(baseline_config, memory_normalization=True,
+                           output_relative_dir="phase_0_4/two_turn_planner_tiny_overfit_v0_4a")
+        if config != expected:
+            raise ValueError("v0.4a changes only memory normalization and the output directory relative to v0.3")
+        baseline = torch.load(resolve_derived_path(derived_root, baseline_config.output_relative_dir)
+                              / "planner_state.pt", map_location="cpu", weights_only=True)
+        if TinyOverfitConfig(**baseline["training_config"]) != baseline_config:
+            raise ValueError("v0.3 reference checkpoint configuration differs from the fixed baseline")
     semantic = load_semantic_config(ROOT / "configs/phase0_4b_lora_full.yaml")
     records = load_temporal_records(ROOT, derived_root, split="train")
     samples = select_training_samples(
         records, load_ego_config(ROOT / "configs/phase0_3_dataset_adapter.yaml"), config,
     )
+    if baseline is not None and [s.sample_token for s in samples] != baseline["tiny_sample_tokens"]:
+        raise ValueError("v0.4a sample identities/order differ from the v0.3 checkpoint")
+    del baseline
     selected_tokens = {sample.sample_token for sample in samples}
     targets = {row["sample_token"]: row for row in records if row["sample_token"] in selected_tokens}
     runtime = default_runtime_dependencies()
@@ -67,8 +81,12 @@ def run(*, dataset_root: Path, derived_root: Path, config: TinyOverfitConfig,
     }
     print(json.dumps({"event": "selected_adapter_loaded", **counts}), flush=True)
     if (counts["qwen_trainable_parameters"] or counts["lora_trainable_parameters"]
-            or not counts["lora_parameter_tensors"] or counts["planner_trainable_parameters"] != 2_764_546):
+            or not counts["lora_parameter_tensors"]
+            or counts["planner_trainable_parameters"] != 2_764_546 + (2 * config.planner_dimension if config.memory_normalization else 0)):
         raise ValueError("frozen Qwen/LoRA or Phase 0.4c-1 planner parameter contract mismatch")
+    if config.memory_normalization:
+        counts.update(memory_norm_trainable=all(p.requires_grad for p in planner.memory_norm.parameters()),
+                      memory_norm_parameters=sum(p.numel() for p in planner.memory_norm.parameters()))
     del planner
     output.mkdir(parents=True)
     write_json(output / "resolved_config.json", asdict(config))

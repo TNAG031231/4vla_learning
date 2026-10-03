@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -32,6 +32,7 @@ class PlannerConfig:
     dropout: float
     num_waypoint_queries: int
     smooth_l1_beta: float
+    memory_normalization: bool = field(default=False, kw_only=True)
 
 
 def load_config(path: Path) -> PlannerConfig:
@@ -102,6 +103,7 @@ class WaypointDecoder(nn.Module):
         super().__init__()
         dimension = config.planner_dimension
         self.context_projection = nn.Linear(hidden_size, dimension)
+        self.memory_norm = nn.LayerNorm(dimension) if config.memory_normalization else nn.Identity()
         self.waypoint_queries = nn.Embedding(config.num_waypoint_queries, dimension)
         layer = nn.TransformerDecoderLayer(
             dimension, config.num_heads, dim_feedforward=4 * dimension,
@@ -112,6 +114,7 @@ class WaypointDecoder(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         memory = self.context_projection(hidden_states.to(self.context_projection.weight.dtype))
+        memory = self.memory_norm(memory)
         queries = self.waypoint_queries.weight.unsqueeze(0).expand(memory.shape[0], -1, -1)
         decoded = self.decoder(queries, memory, memory_key_padding_mask=~attention_mask.bool())
         return self.waypoint_projection(decoded)

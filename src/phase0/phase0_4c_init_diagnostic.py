@@ -100,7 +100,7 @@ def state_diagnostic(planner: WaypointDecoder, contexts: list[CachedContext], *,
 
     layer = planner.decoder.layers[1]
     handles = [planner.register_forward_pre_hook(start_sample),
-               planner.context_projection.register_forward_hook(capture_memory)]
+               planner.memory_norm.register_forward_hook(capture_memory)]
     for name, module, input_value in (
         ("layer1_output", planner.decoder.layers[0], False),
         ("layer2_input", layer, True),

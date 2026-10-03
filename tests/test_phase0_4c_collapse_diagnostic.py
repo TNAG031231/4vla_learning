@@ -136,6 +136,8 @@ def test_cli_checkpoint_intake_and_artifact_preservation(setup, tmp_path, monkey
              "planner_config": {name: getattr(config, name) for name in PlannerConfig.__dataclass_fields__},
              "training_config": asdict(config), "hidden_size": 16,
              "tiny_sample_tokens": [c.sample_token for c in contexts], "provenance": {"run_kind": "synthetic"}}
+    saved["planner_config"].pop("memory_normalization")
+    saved["training_config"].pop("memory_normalization")
     if mismatch == "configuration":
         saved["training_config"]["smooth_l1_beta"] = 2.
     elif mismatch == "sample order":

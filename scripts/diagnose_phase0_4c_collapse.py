@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -19,7 +18,9 @@ from src.phase0.phase0_4c_collapse_diagnostic import diagnose
 from src.phase0.phase0_4c_init_diagnostic import diagnose_initial_vs_trained
 from src.phase0.phase0_4c_layer2_diagnostic import diagnose_layer2
 from src.phase0.phase0_4c_qkv_diagnostic import diagnose_qkv, token_context
-from src.phase0.phase0_4c_tiny_overfit import cache_contexts, load_config, select_training_samples, write_json
+from src.phase0.phase0_4c_tiny_overfit import (
+    TinyOverfitConfig, cache_contexts, load_config, select_training_samples, write_json,
+)
 from src.phase0.phase0_4c_two_turn_planner import PlannerConfig, WaypointDecoder, freeze_backbone
 from src.phase0.qwen3vl_dataset_adapter import (
     collect_git_provenance, load_config as load_ego_config, resolve_derived_path,
@@ -51,7 +52,7 @@ def run(*, dataset_root: Path, derived_root: Path, split: str = "train", probe: 
     source = resolve_derived_path(derived_root, config.output_relative_dir)
     checkpoint_path = source / "planner_state.pt"
     saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if saved["training_config"] != asdict(config):
+    if TinyOverfitConfig(**saved["training_config"]) != config:
         raise ValueError("checkpoint training configuration differs from v0.3 configuration")
     records = load_temporal_records(ROOT, derived_root, split="train")
     samples = select_training_samples(
