@@ -294,11 +294,24 @@ source_audit_record
 - Isolation：`train_records_validated=14253`、`train_sample_count=2`、`validation_sample_count=0`、`predicted_action_sample_count=1`、`optimizer_steps=0`；`test_records_read`、`combined_manifest_records_parsed`、`test_scene_traversal_attempts`、`test_sample_records_read`、`test_images_opened`、`test_labels_read` 全部为 `0`，`test_evaluation_performed=false`，test isolation `PASS`。
 - 能力边界：真实模型、selected adapter、two-turn conditioning、continuous decoder 和 backward 链路已验证；decoder 尚未训练，`trajectory_performance_evaluated=false`，**trajectory performance = NOT EVALUATED**。不声称 waypoint accuracy、trajectory generalization、ADE/FDE improvement、planner 已学会驾驶或 DriveMA / Qwen-VLA reproduction。
 
+## Phase 0.4c-2 Tiny-overfit / Memory LayerNorm
+
+- 状态：`completed` / `PASS`；PR #48 已合并，依据用户确认的真实 AutoDL v0.4a 单变量消融结果。Qwen / selected LoRA frozen，仅 planner 的 `2,765,058` 个参数可训练；保留 projection → Memory LayerNorm(256) → 两层 / 四头 Post-LN decoder。
+- 固定 8 个 train samples：loss `5.2900016978 → 0.0208129949`，ratio `0.0039344`；ADE `10.5019 → 0.2593 m`，FDE `18.2182 → 0.2459 m`；tiny-overfit gate `PASS`，attention-saturation hypothesis `SUPPORTED`。这是小样本学习能力证据，尚非 full-training validation 泛化结果。
+
+## Phase 0.4c-3 Full Planner Training / Validation
+
+- 已实现 `scripts/run_phase0_4c_full_train.py` 与版本化配置 `configs/phase0_4c_full_train.yaml`；真实 AutoDL full training / validation 为 `NOT RUN`。固定 v0.4a 架构；train 使用 GT-action teacher forcing 和 masked SmoothL1，formal validation 使用 strict parsed predicted action，GT-action diagnostic 单独保存且不参与选优。
+- 初始配置：完整 train 1 epoch，micro batch 1 / gradient accumulation 4，AdamW constant LR `1e-4`、weight decay `1e-4`、beta `1.0`。LR 比 tiny-overfit diagnostic 的 `1e-3` 低一个数量级，采用保守初始步长；不进行 LR search。每 891 optimizer steps 及最后一步保存 checkpoint / 评估完整 validation；按 invalid count、ADE、FDE、较早 step 依次选优，无 early stopping。
+- 复用 frozen temporal v0.1 intake（六个有效未来点）；train eligibility 额外要求 joint action valid，formal validation 保留 GT action invalid 样本，diagnostic 单独统计 action exclusions。运行时输出总数、eligible/excluded 数与原因；本轮未重新读取真实全量数据，实际计数待运行确认。
+- 输出目录为 `$VLA_DERIVED_ROOT/phase_0_4/two_turn_planner_full_v0_1/`，已有目录拒绝覆盖；保存 planner-only checkpoints、provenance、逐步 history、正式/诊断 predictions 与 metrics、paired ADE/FDE gap。ADE 是每条样本有效点误差均值再跨样本平均；overall FDE 取最后有效点，1/2/3 s FDE 要求对应端点有效；invalid predictions 单独计数，不以 GT 替代。
+- Fresh planner reload 使用按 sample token 排序的前 8 个有效正式预测样本，重新执行预测动作与 Turn-2，容差沿用 `atol=rtol=1e-5`；同时检查 decoder memory、trajectory 与 planner parameters finite。全量 hidden states / attention tensors 不缓存或持久化；test isolation counters 随数据 summary 保存，Phase 0.4d 尚未实现。
+
 ## Next Gate
 
-- Phase 0.4c-1 real GPU smoke 为 `completed` / `PASS` → 下一 gate 为 **Phase 0.4c-2 tiny overfit**（尚未开始）：验证 frozen Qwen3-VL + frozen semantic LoRA contextual representation 上的 lightweight waypoint decoder 是否能学习 continuous trajectory。
+- Phase 0.4c-2 tiny-overfit 为 `completed` / `PASS` → 下一 gate 为 **Phase 0.4c-3 用户执行 AutoDL full training / predicted-action validation 并返回 artifact 核验**；当前只有本地实现，尚无真实 full-training 结果。
 - Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
-- 当前 test 不进入 Phase 0.4b / 0.4c / 0.4d 的模型选择或开发反馈；test 保留给最终冻结 VLA pipeline 的一次正式 evaluation。
+- 当前 test 已被 Phase 0.2d 永久消费，不进入 Phase 0.4b / 0.4c / 0.4d 的读取、模型选择、开发反馈或重新 evaluation；未来正式评估须另行批准独立 untouched protocol。
 - 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。
 - 历史 Phase 0.2d 曾有一次 failed rule-baseline test execution attempt，但没有产生正式 test metrics，也没有影响当前模型训练或 checkpoint selection。
 - Phase 0.3 overall 与 Phase 0.3e-2 均为 `completed`；PR #37 已 merged，Learning & Capability Closeout 已完成。
