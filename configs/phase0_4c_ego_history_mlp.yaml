@@ -1,0 +1,16 @@
+protocol_version: phase0.4c-ego-history-mlp-v0.1
+output_relative_dir: phase_0_4/ego_history_mlp_baseline_v0_1
+history_length: 3
+hidden_dim: 128
+seed: 20260812
+batch_size: 256
+optimizer: AdamW
+learning_rate: 0.001
+weight_decay: 0.0001
+smooth_l1_beta: 1.0
+max_epochs: 20
+normalization_epsilon: 0.000001
+device: cpu
+num_threads: 1
+reload_atol: 0.000001
+reload_rtol: 0.000001

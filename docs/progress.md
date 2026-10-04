@@ -314,9 +314,17 @@ source_audit_record
 - 复用 frozen validation intake 和 Phase 0.4c-3 ADE/FDE helper；run metadata 固定记录 speed source、speed semantics、direction assumption、motion model 与零 train fitting/test access。可选读取正式 planner predictions，按相同 token、target/mask、双方有效预测重算六项配对指标和 CV-minus-planner 差值，并报告匹配及有效覆盖数；无 reference 参数时独立评测。
 - 输出 `$VLA_DERIVED_ROOT/phase_0_4/constant_velocity_baseline_v0_1/`，已有目录拒绝覆盖；保存 predictions、metrics、data summary、run metadata、resolved config，以及启用时的 comparison。无 checkpoint；真实样本数量、CV 有效率和误差待用户 AutoDL artifact 核验。
 
+## Phase 0.4c-4B Ego-History MLP Trajectory Baseline
+
+- Implementation complete；真实 AutoDL training / validation 为 `NOT RUN`。在 PR #50 同一 baseline-suite 分支新增 `scripts/run_phase0_4c_ego_history_mlp.py`、版本化配置、MLP 模块与 producer-backed tests；既有 Constant Velocity 实现保持不变。
+- 输入为 frozen H=3、oldest→current、左侧 null padding；每帧按 speed / acceleration / yaw rate 的归一化数值与 availability mask，再加 history mask，构成 `[3,7]→21`。只用 TRAIN 有限可用的历史观测出现次数计算 float64 mean / population std，保存 count、mean、std、`scale=max(std,1e-6)` 及训练 token；缺失数值在归一化空间置零，掩码保留，padding 与真实但 motion unavailable 的帧可区分。Validation 只读取保存的 TRAIN stats。
+- 固定 `21→128→GELU→128→GELU→12→[6,2]`；seed `20260812`、batch `256`、AdamW LR `1e-3` / weight decay `1e-4`、masked SmoothL1 beta `1.0`、20 epochs；CPU 单线程、PyTorch deterministic algorithms，无调参搜索。复用既有 loss / ADE/FDE，按 validation overall ADE、FDE、较早 epoch 选优。
+- 外部输出 `$VLA_DERIVED_ROOT/phase_0_4/ego_history_mlp_baseline_v0_1/`，已有目录拒绝覆盖；保存 best checkpoint、TRAIN normalization stats、训练 history、重载后的完整 validation predictions/metrics、隔离记录及 reload consistency（`atol=rtol=1e-6`）。运行需要已有 CV 与 formal planner predictions；分别核对 token/scene/target/mask，只在共同有效样本上重算配对六项指标，报告 unmatched tokens 与覆盖数，差值为 `MLP-reference`，负值表示误差较低。
+- 本地测试覆盖 producer→JSON intake→normalization→training→checkpoint→fresh reload→paired comparison；无真实数据性能结论，实际样本数与指标待用户 AutoDL artifact 核验。无 image、Qwen、LoRA、action 或 future information 作为模型输入；test access 为零。
+
 ## Next Gate
 
-- 下一 gate 为 **Phase 0.4c-4A 用户执行 AutoDL constant-velocity validation 并返回 artifact 核验**；Ego-History MLP、Direct Waypoint 与 Phase 0.4d 尚未进入本轮实现。
+- 下一 gate 为 **用户执行 AutoDL Phase 0.4c-4A / 4B baseline suite 并返回 artifact 核验**；Direct Waypoint 与 Phase 0.4d 尚未进入本轮实现。
 - Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
 - 当前 test 已被 Phase 0.2d 永久消费，不进入 Phase 0.4b / 0.4c / 0.4d 的读取、模型选择、开发反馈或重新 evaluation；未来正式评估须另行批准独立 untouched protocol。
 - 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。
