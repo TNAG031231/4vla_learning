@@ -307,9 +307,16 @@ source_audit_record
 - 输出目录为 `$VLA_DERIVED_ROOT/phase_0_4/two_turn_planner_full_v0_1/`，已有目录拒绝覆盖；保存 planner-only checkpoints、provenance、逐步 history、正式/诊断 predictions 与 metrics、paired ADE/FDE gap。ADE 是每条样本有效点误差均值再跨样本平均；overall FDE 取最后有效点，1/2/3 s FDE 要求对应端点有效；invalid predictions 单独计数，不以 GT 替代。
 - Fresh planner reload 使用按 sample token 排序的前 8 个有效正式预测样本，重新执行预测动作与 Turn-2，容差沿用 `atol=rtol=1e-5`；同时检查 decoder memory、trajectory 与 planner parameters finite。全量 hidden states / attention tensors 不缓存或持久化；test isolation counters 随数据 summary 保存，Phase 0.4d 尚未实现。
 
+## Phase 0.4c-4A Constant-Velocity Trajectory Baseline
+
+- 前置条件已核实：PR #49 已合并，顶层 [Learning & Capability Closeout](https://github.com/TNAG031231/4vla_learning/pull/49#issuecomment-5979534499) 已发布；该评论记录 Phase 0.4c-3 真实执行证据，前节为其实现交付时的状态。
+- Implementation complete；real validation evaluation pending。入口 `scripts/run_phase0_4c_constant_velocity.py`，配置 `configs/phase0_4c_constant_velocity.yaml`；仅使用 `ego_motion_history[-1].speed_mps`（最近历史区间平均速度大小），假设沿 current ego frame +x，以六个 0.5–3.0 s 时刻预测 `x=v*t, y=0`，不推断速度符号。零速合法；缺失最新 entry/mask/speed 或非有限速度产生明确 invalid reason，保留全体 validation 分母，无历史回退或参数拟合。
+- 复用 frozen validation intake 和 Phase 0.4c-3 ADE/FDE helper；run metadata 固定记录 speed source、speed semantics、direction assumption、motion model 与零 train fitting/test access。可选读取正式 planner predictions，按相同 token、target/mask、双方有效预测重算六项配对指标和 CV-minus-planner 差值，并报告匹配及有效覆盖数；无 reference 参数时独立评测。
+- 输出 `$VLA_DERIVED_ROOT/phase_0_4/constant_velocity_baseline_v0_1/`，已有目录拒绝覆盖；保存 predictions、metrics、data summary、run metadata、resolved config，以及启用时的 comparison。无 checkpoint；真实样本数量、CV 有效率和误差待用户 AutoDL artifact 核验。
+
 ## Next Gate
 
-- Phase 0.4c-2 tiny-overfit 为 `completed` / `PASS` → 下一 gate 为 **Phase 0.4c-3 用户执行 AutoDL full training / predicted-action validation 并返回 artifact 核验**；当前只有本地实现，尚无真实 full-training 结果。
+- 下一 gate 为 **Phase 0.4c-4A 用户执行 AutoDL constant-velocity validation 并返回 artifact 核验**；Ego-History MLP、Direct Waypoint 与 Phase 0.4d 尚未进入本轮实现。
 - Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
 - 当前 test 已被 Phase 0.2d 永久消费，不进入 Phase 0.4b / 0.4c / 0.4d 的读取、模型选择、开发反馈或重新 evaluation；未来正式评估须另行批准独立 untouched protocol。
 - 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。
