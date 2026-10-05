@@ -322,9 +322,17 @@ source_audit_record
 - 外部输出 `$VLA_DERIVED_ROOT/phase_0_4/ego_history_mlp_baseline_v0_1/`，已有目录拒绝覆盖；保存 best checkpoint、TRAIN normalization stats、训练 history、重载后的完整 validation predictions/metrics、隔离记录及 reload consistency（`atol=rtol=1e-6`）。运行需要已有 CV 与 formal planner predictions；分别核对 token/scene/target/mask，只在共同有效样本上重算配对六项指标，报告 unmatched tokens 与覆盖数，差值为 `MLP-reference`，负值表示误差较低。
 - 本地测试覆盖 producer→JSON intake→normalization→training→checkpoint→fresh reload→paired comparison；无真实数据性能结论，实际样本数与指标待用户 AutoDL artifact 核验。无 image、Qwen、LoRA、action 或 future information 作为模型输入；test access 为零。
 
+## Phase 0.4c-4C Direct Qwen Waypoint Diagnostic
+
+- Implementation complete；真实 AutoDL Qwen execution / training / validation 为 `NOT RUN`。同一 PR #50 新增 direct track，既有 CV、Ego-History MLP 与 formal two-turn planner 实现保持不变；本轮不作架构优劣或信息瓶颈结论。
+- 单个 user message 使用冻结的 `phase0.4c-direct-waypoint-prompt-v0.1`：保留同一 Observation 的历史 CAM_FRONT 顺序、availability 和 ego-state 文本，替换为 direct trajectory planning instruction；`add_generation_prompt=True` 后直接 frozen contextual forward，使用 `hidden_states[-1]` 与同一 WaypointDecoder。无 action generation、assistant action response 或第二轮 planning prompt；动作值不进入预测或 loss。
+- 复用 formal train/validation intake、eligibility、scene/sample isolation 与 exact train token list；joint action validity 仅用于复现 formal TRAIN 样本集合，DirectSample 不携带 ActionTarget。配置对齐 formal planner：selected `adapter_step_3564`、Qwen/LoRA frozen、Memory LayerNorm、256 维两层四头 decoder、seed `20260812`、1 epoch、accumulation 4、AdamW LR/weight decay `1e-4`、masked SmoothL1 beta 1、每 891 steps 和最后一步评估/保存，按 invalid count→ADE→FDE→earliest 选优。
+- 输出 `$VLA_DERIVED_ROOT/phase_0_4/direct_qwen_waypoint_v0_1/`，已有目录拒绝覆盖；沿用 formal checkpoint serialization，选中 decoder fresh reload 后重跑完整 validation，以 `atol=rtol=1e-5` 核对预测与指标。保存 hidden field/shape/dtype、attention mask/output shape、冻结/动作/test 隔离记录及运行产物；继承的 `reload_subset_size` 在该完整重载检查中不使用。
+- 运行需要已有 formal planner、MLP、CV predictions；三组比较核对 token/scene/target/mask，仅在共同有效样本上重算六项指标，报告 unmatched tokens 和每项分母，delta 固定为 `direct-reference`。本地 producer-backed tests 与随机小型 Qwen 接口测试通过，真实 frozen 4B/LoRA 训练结果待用户 AutoDL artifact 核验。
+
 ## Next Gate
 
-- 下一 gate 为 **用户执行 AutoDL Phase 0.4c-4A / 4B baseline suite 并返回 artifact 核验**；Direct Waypoint 与 Phase 0.4d 尚未进入本轮实现。
+- 下一 gate 为 **用户执行 AutoDL Phase 0.4c-4A / 4B / 4C baseline suite 并返回 artifact 核验**；Phase 0.4d 尚未进入本轮实现。
 - Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
 - 当前 test 已被 Phase 0.2d 永久消费，不进入 Phase 0.4b / 0.4c / 0.4d 的读取、模型选择、开发反馈或重新 evaluation；未来正式评估须另行批准独立 untouched protocol。
 - 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。
