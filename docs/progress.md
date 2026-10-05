@@ -307,9 +307,65 @@ source_audit_record
 - 输出目录为 `$VLA_DERIVED_ROOT/phase_0_4/two_turn_planner_full_v0_1/`，已有目录拒绝覆盖；保存 planner-only checkpoints、provenance、逐步 history、正式/诊断 predictions 与 metrics、paired ADE/FDE gap。ADE 是每条样本有效点误差均值再跨样本平均；overall FDE 取最后有效点，1/2/3 s FDE 要求对应端点有效；invalid predictions 单独计数，不以 GT 替代。
 - Fresh planner reload 使用按 sample token 排序的前 8 个有效正式预测样本，重新执行预测动作与 Turn-2，容差沿用 `atol=rtol=1e-5`；同时检查 decoder memory、trajectory 与 planner parameters finite。全量 hidden states / attention tensors 不缓存或持久化；test isolation counters 随数据 summary 保存，Phase 0.4d 尚未实现。
 
+## Phase 0.4c-4A Constant-Velocity Trajectory Baseline
+
+- 前置条件已核实：PR #49 已合并，顶层 [Learning & Capability Closeout](https://github.com/TNAG031231/4vla_learning/pull/49#issuecomment-5979534499) 已发布；该评论记录 Phase 0.4c-3 真实执行证据，前节为其实现交付时的状态。
+- 状态：`completed`；真实 AutoDL validation 已完成（依据用户提供的执行结果）。入口 `scripts/run_phase0_4c_constant_velocity.py`，配置 `configs/phase0_4c_constant_velocity.yaml`；仅使用 `ego_motion_history[-1].speed_mps`（最近历史区间平均速度大小），假设沿 current ego frame +x，以六个 0.5–3.0 s 时刻预测 `x=v*t, y=0`，不推断速度符号。零速合法；缺失最新 entry/mask/speed 或非有限速度产生明确 invalid reason，保留全体 validation 分母，无历史回退或参数拟合。
+- 复用 frozen validation intake 和 Phase 0.4c-3 ADE/FDE helper；run metadata 固定记录 speed source、speed semantics、direction assumption、motion model 与零 train fitting/test access。可选读取正式 planner predictions，按相同 token、target/mask、双方有效预测重算六项配对指标和 CV-minus-planner 差值，并报告匹配及有效覆盖数；无 reference 参数时独立评测。
+- 输出 `$VLA_DERIVED_ROOT/phase_0_4/constant_velocity_baseline_v0_1/`，已有目录拒绝覆盖；保存 predictions、metrics、data summary、run metadata、resolved config，以及启用时的 comparison。无 checkpoint；与 MLP / Direct 的共同有效 validation 比较均为 3500 个样本，指标见下表。
+
+## Phase 0.4c-4B Ego-History MLP Trajectory Baseline
+
+- 状态：`completed`；真实 AutoDL training / validation 已完成（依据用户提供的执行结果）。在 PR #50 同一 baseline-suite 分支新增 `scripts/run_phase0_4c_ego_history_mlp.py`、版本化配置、MLP 模块与 producer-backed tests；既有 Constant Velocity 实现保持不变。
+- 输入为 frozen H=3、oldest→current、左侧 null padding；每帧按 speed / acceleration / yaw rate 的归一化数值与 availability mask，再加 history mask，构成 `[3,7]→21`。只用 TRAIN 有限可用的历史观测出现次数计算 float64 mean / population std，保存 count、mean、std、`scale=max(std,1e-6)` 及训练 token；缺失数值在归一化空间置零，掩码保留，padding 与真实但 motion unavailable 的帧可区分。Validation 只读取保存的 TRAIN stats。
+- 固定 `21→128→GELU→128→GELU→12→[6,2]`；seed `20260812`、batch `256`、AdamW LR `1e-3` / weight decay `1e-4`、masked SmoothL1 beta `1.0`、20 epochs；CPU 单线程、PyTorch deterministic algorithms，无调参搜索。复用既有 loss / ADE/FDE，按 validation overall ADE、FDE、较早 epoch 选优。
+- 外部输出 `$VLA_DERIVED_ROOT/phase_0_4/ego_history_mlp_baseline_v0_1/`，已有目录拒绝覆盖；保存 best checkpoint、TRAIN normalization stats、训练 history、重载后的完整 validation predictions/metrics、隔离记录及 reload consistency（`atol=rtol=1e-6`）。运行需要已有 CV 与 formal planner predictions；分别核对 token/scene/target/mask，只在共同有效样本上重算配对六项指标，报告 unmatched tokens 与覆盖数，差值为 `MLP-reference`，负值表示误差较低。
+- 本地测试覆盖 producer→JSON intake→normalization→training→checkpoint→fresh reload→paired comparison；真实 validation 为 `sample_count=3594`、`valid_prediction_count=3594`、`invalid_prediction_count=0`，best checkpoint 为 epoch 16；完整 reload 的 `predictions_match=true`、`metrics_match=true`、`sample_count=3594`。无 image、Qwen、LoRA、action 或 future information 作为模型输入；test access 为零。
+
+## Phase 0.4c-4C Direct Qwen Waypoint Diagnostic
+
+- 状态：`completed`；真实 AutoDL Qwen execution / training / validation 已完成（依据用户提供的执行结果）。同一 PR #50 新增 direct track，既有 CV、Ego-History MLP 与 formal two-turn planner 实现保持不变；受控比较结论与限制见下文。
+- 单个 user message 使用冻结的 `phase0.4c-direct-waypoint-prompt-v0.1`：保留同一 Observation 的历史 CAM_FRONT 顺序、availability 和 ego-state 文本，替换为 direct trajectory planning instruction；`add_generation_prompt=True` 后直接 frozen contextual forward，使用 `hidden_states[-1]` 与同一 WaypointDecoder。无 action generation、assistant action response 或第二轮 planning prompt；动作值不进入预测或 loss。
+- 复用 formal train/validation intake、eligibility、scene/sample isolation 与 exact train token list；joint action validity 仅用于复现 formal TRAIN 样本集合，DirectSample 不携带 ActionTarget。配置对齐 formal planner：selected `adapter_step_3564`、Qwen/LoRA frozen、Memory LayerNorm、256 维两层四头 decoder、seed `20260812`、1 epoch、accumulation 4、AdamW LR/weight decay `1e-4`、masked SmoothL1 beta 1、每 891 steps 和最后一步评估/保存，按 invalid count→ADE→FDE→earliest 选优。
+- 输出 `$VLA_DERIVED_ROOT/phase_0_4/direct_qwen_waypoint_v0_1/`，已有目录拒绝覆盖；沿用 formal checkpoint serialization，选中 decoder fresh reload 后重跑完整 validation，以 `atol=rtol=1e-5` 核对预测与指标。保存 hidden field/shape/dtype、attention mask/output shape、冻结/动作/test 隔离记录及运行产物；继承的 `reload_subset_size` 在该完整重载检查中不使用。
+- 运行需要已有 formal planner、MLP、CV predictions；三组比较核对 token/scene/target/mask，仅在共同有效样本上重算六项指标，报告 unmatched tokens 和每项分母，delta 固定为 `direct-reference`。本地 producer-backed tests 与随机小型 Qwen 接口测试通过；真实执行 commit 为 `082a301563cc484228b16a8413a8ac8fc4ab4c64`，消耗 14253 train samples、3564 optimizer steps，best checkpoint 为 `planner_step_3564.pt`；validation 3594 / 3594 valid，完整 validation reload 的 `reload_consistency=true`、`predictions_match=true`、`metrics_match=true`。
+- 4C runtime：Qwen trainable parameters `0`、LoRA trainable parameters `0`、planner trainable parameters `2,765,058`；`action_generation_calls`、`action_tokens_inserted`、`action_values_used_for_prediction`、`action_values_used_for_loss`、`future_information_inputs` 均为 `0`。首次训练 forward 记录 `hidden_states[-1]` 为 `[1,4557,2560]`，waypoint output 为 `[1,6,2]`；这是首次观测形状，不表示所有样本的序列长度相同。
+- 4C validation curve（step: ADE / FDE，m）：`891: 2.4952088835740924 / 5.287755865070909`；`1782: 1.640249492166254 / 3.552886839486238`；`2673: 1.4941065636280515 / 3.0070789072415898`；`3564: 1.2371284147412513 / 2.397060518083046`。Direct 在冻结的单 epoch 协议下直到最终 checkpoint 仍在改善；此观察不构成收敛结论。
+
+### Phase 0.4c-4 Baseline Suite：真实 validation 结果与能力边界
+
+- 4A / 4B / 4C 均为 `completed`，baseline suite gate = `PASS`；formal Action-Conditioned Planner 此前已完成并作为 reference。以下数值来自用户提供的真实 AutoDL 结果，本次 documentation closeout 未重新执行实验或独立重算外部 artifacts。
+- 全部为 **validation-only** 证据；本组实验未访问 test split。4C 记录 `test_records_read=0`、`test_images_opened=0`、`test_labels_read=0`、`test_evaluation_performed=false`。这不改变既有 Phase 0.2d consumed-test 状态。
+- MLP、formal predicted-action Planner、Direct 的配对比较均为完全匹配且共同有效的 **3594** 个 validation samples；下表误差单位为 m。相对差值统一为 `(左侧模型-reference)/reference`，负值表示误差更低。
+
+| 指标 | Ego-History MLP | Action-Conditioned Planner | Direct Qwen | Direct − Planner (m) | Direct vs Planner（约） | MLP vs Planner（约） | Direct vs MLP（约） |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ADE@1s | 0.2198339891279221 | 0.4833564437168112 | 0.4935457403369924 | +0.010189296620181199 | +2.108% | −54.5% | +124.508% |
+| ADE@2s | 0.4598319687723541 | 0.7721170835325502 | 0.8181583155288621 | +0.04604123199631194 | +5.963% | −40.4% | +77.925% |
+| ADE@3s | 0.8145325565262365 | 1.1878918724452778 | 1.2371284147412513 | +0.04923654229597352 | +4.145% | −31.4% | +51.882% |
+| FDE@1s | 0.3058402292787939 | 0.591347504965339 | 0.6323533395827946 | +0.04100583461745555 | +6.934% | −48.3% | +106.759% |
+| FDE@2s | 0.8610133790052416 | 1.2420878008403957 | 1.3194896764866697 | +0.07740187564627399 | +6.232% | −30.7% | +53.248% |
+| FDE@3s | 1.7724578323181663 | 2.337162316182362 | 2.397060518083046 | +0.05989820190068418 | +2.563% | −24.2% | +35.239% |
+
+CV 比较使用 **3500** 个共同有效样本；不能将此分母下的数值直接与上表混为总排名。
+
+| 指标 | MLP（paired） | CV（paired） | Direct（paired） | MLP vs CV relative delta |
+| --- | --- | --- | --- | --- |
+| ADE@1s | 0.16443787914554456 | 0.25900937684672226 | 0.46039015623075624 | -0.3651276986668465 |
+| ADE@2s | 0.36853344793990256 | 0.6153174853440694 | 0.7692843319518226 | -0.4010678117917804 |
+| ADE@3s | 0.689638052075303 | 1.113421309257412 | 1.1749269234846744 | -0.3806135679806128 |
+| FDE@1s | 0.23200760279818705 | 0.38011115030603376 | 0.5888003418659792 | -0.3896322099170364 |
+| FDE@2s | 0.7164920530034495 | 1.2058378460012669 | 1.2485338024725872 | -0.40581392815008993 |
+| FDE@3s | 1.565134460949472 | 2.4416090015130902 | 2.3045649990407484 | -0.3589741600806919 |
+
+- **主要能力结论：** 在 3594 样本的六项指标上，Ego-History MLP 最强，其次为 Action-Conditioned Qwen Planner，再次为 Direct Qwen Waypoint。MLP 在 3500 样本受控比较中较 CV 降低约 36–41% 误差，支持 learned ego-motion dynamics 是当前轨迹能力的重要解释来源；当前 Qwen 多模态 / structured-action 输入尚未转化为超过该简单 learned dynamics baseline 的精度，不由此推断更强的因果机制。
+- **4C 主比较：** 移除 explicit structured-action-conditioned two-turn pathway 未改善轨迹精度；Direct 六项误差均比 Planner 高约 2–7%，Planner 保持小幅一致优势。当前证据不支持该路径是主要轨迹瓶颈；两条路径的 prompt topology 同时变化，因此不能归因于离散 action token 单独的因果收益。
+- Direct 在与 CV 的配对比较中仅 FDE@3s 较好，relative delta 为 `-0.05612856210286506`；其余五项均较差。该单项长时域终点收益不足以说明跨时域的一致优势；CV 仍是重要简单 baseline，其位置取决于 horizon、metric 和有效样本分母。
+- **关键限制：** 两条 Qwen 轨迹路径均使用 structured-action-trained LoRA adapter，而非 trajectory-specialized adaptation objective。结果仅表明当前 Qwen + action-specialized LoRA + trajectory-decoder pipeline 尚未将多模态观测转化为超过 ego-history MLP 的轨迹表现；不能据此声称视觉无用、多模态信息有害或 Qwen/VLM 表征无法改善轨迹预测。Phase 0.4d 尚未启动。
+
 ## Next Gate
 
-- Phase 0.4c-2 tiny-overfit 为 `completed` / `PASS` → 下一 gate 为 **Phase 0.4c-3 用户执行 AutoDL full training / predicted-action validation 并返回 artifact 核验**；当前只有本地实现，尚无真实 full-training 结果。
+- Phase 0.4c-4 baseline suite gate 已 `PASS`；PR #50 保持 OPEN / Draft / unmerged，等待后续审阅与合并后的 Learning & Capability Closeout；Phase 0.4d 尚未启动。
 - Phase 0.4 后续开发、调参和 checkpoint selection 只能使用 train / validation。
 - 当前 test 已被 Phase 0.2d 永久消费，不进入 Phase 0.4b / 0.4c / 0.4d 的读取、模型选择、开发反馈或重新 evaluation；未来正式评估须另行批准独立 untouched protocol。
 - 不允许重新切 test、重命名 test 为新的 holdout，或根据 test 结果反向调参。

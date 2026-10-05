@@ -1,0 +1,7 @@
+protocol_version: phase0.4c-constant-velocity-v0.1
+output_relative_dir: phase_0_4/constant_velocity_baseline_v0_1
+waypoint_times_sec: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+speed_source: ego_motion_history[-1].speed_mps
+speed_semantics: latest_available_past_interval_average_speed_magnitude
+direction_assumption: current_ego_frame_positive_x
+motion_model: straight_line_constant_velocity
