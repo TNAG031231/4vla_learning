@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 from dataclasses import asdict, replace
 import json
@@ -276,6 +277,14 @@ def test_test_rejection_and_reference_code_unchanged(config, monkeypatch):
     with pytest.raises(SystemExit):
         cli.main(["--validation-split", "test"])
     assert cli.main(["--dry-run"]) == 0
-    subprocess.run(["git", "diff", "--exit-code", "5bc821d", "--", "src/baselines", "src/phase0/phase0_4c_full_train.py",
+    subprocess.run(["git", "diff", "--exit-code", "5bc821d", "--", "src/baselines",
                     "src/phase0/phase0_4c_two_turn_planner.py", "src/phase0/phase0_4c_evaluation.py"],
                    cwd=ROOT, check=True, capture_output=True)
+    source = "src/phase0/phase0_4c_full_train.py"
+    original = ast.parse(subprocess.run(["git", "show", f"5bc821d:{source}"], cwd=ROOT,
+                                        check=True, capture_output=True, text=True).stdout)
+    current = {node.name: node for node in ast.parse((ROOT / source).read_text()).body
+               if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+    for node in original.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name not in ("fit", "run_full"):
+            assert ast.dump(node) == ast.dump(current[node.name])

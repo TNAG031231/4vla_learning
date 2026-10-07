@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import asdict, replace
+import json
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+import pytest
+import torch
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts import run_phase0_4c_convergence as cli
+from src.phase0 import phase0_4c_convergence as convergence
+from src.phase0 import phase0_4c_full_train as full
+from src.phase0.phase0_4c_evaluation import aggregate_metrics
+from src.phase0.phase0_4c_two_turn_planner import WaypointDecoder, freeze_backbone
+from test_phase0_4c_full_train import Backbone, SyntheticRunner, case, data, records
+
+
+@pytest.fixture
+def config():
+    return convergence.load_config(ROOT / "configs/phase0_4c_convergence.yaml")
+
+
+def inputs(config, data):
+    train, validation, records, summary = data
+    torch.manual_seed(config.seed)
+    model = Backbone()
+    freeze_backbone(model)
+    return dict(model=model, planner=WaypointDecoder(16, config), runner=SyntheticRunner(),
+                train=train, validation=validation, records=records, provenance={"data": summary})
+
+
+@pytest.fixture
+def synthetic(config, data, tmp_path):
+    config = replace(config, planner_dimension=16, num_decoder_layers=1,
+                     gradient_accumulation_steps=3, expected_validation_count=4,
+                     expected_motion_unavailable_count=1)
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    original = replace(config, num_train_epochs=1)
+    full.fit(**inputs(original, data), config=original, output=baseline)
+    metrics = json.loads((baseline / "validation_step_0002_metrics.json").read_text())
+    return replace(config, epoch1_reference={k: metrics[k] for k in config.epoch1_reference}), baseline
+
+
+@pytest.mark.parametrize("key,value", [
+    ("num_train_epochs", 5), ("seed", 1), ("learning_rate", .001),
+    ("weight_decay", .001), ("memory_normalization", False),
+    ("planner_dimension", 128), ("validation_schedule", "step"),
+    ("protocol_version", "direct"), ("validation_interval", 891),
+    ("selected_adapter_relative_path", "other"), ("output_relative_dir", "old"),
+    ("reproduction_rtol", float("nan")), ("epoch1_reference", {}),
+])
+def test_protocol_rejects_changes(config, tmp_path, key, value):
+    values = asdict(config)
+    values.pop("train_subset_size")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({**values, key: value}))
+    with pytest.raises(ValueError):
+        convergence.load_config(path)
+
+
+def test_production_protocol(config):
+    assert config.num_train_epochs == 3
+    assert config.validation_schedule == "epoch_end"
+    assert config.reproduction_rtol == config.extension_min_relative_improvement == .01
+    assert config.expected_validation_count == 3594
+    assert config.expected_motion_unavailable_count == 94
+    assert config.epoch1_reference["ade_3s_m"] == 1.1878918724
+    assert config.mlp_reference["fde_3s_m"] == 1.7724578323
+
+
+def test_reproduction_and_extension_decisions(config):
+    metrics = {**config.epoch1_reference, "sample_count": 3594, "invalid_prediction_count": 0}
+    gate = convergence.reproduction_gate(metrics, config)
+    assert gate["passed"] and all(v == 0 for v in gate["new_minus_old"].values())
+    for key, value in (("ade_1s_m", metrics["ade_1s_m"] * 1.011),
+                       ("fde_3s_m", metrics["fde_3s_m"] * .989),
+                       ("invalid_prediction_count", 1), ("sample_count", 3500), ("ade_3s_m", None)):
+        assert not convergence.reproduction_gate({**metrics, key: value}, config)["passed"]
+    second = {"metrics": metrics}
+    for factor, expected in ((.98, True), (.995, False), (1., False), (1.1, False)):
+        third = {"metrics": {**metrics, "ade_3s_m": metrics["ade_3s_m"] * factor,
+                             "fde_3s_m": metrics["fde_3s_m"] * factor}}
+        assert convergence.extension_gate([second, second, third], config)["allowed"] is expected
+    third["metrics"].update(ade_3s_m=0.1, fde_3s_m=.1, invalid_prediction_count=1)
+    assert not convergence.extension_gate([second, second, third], config)["allowed"]
+
+
+def test_three_epochs_reproduce_and_persist(synthetic, data, tmp_path):
+    config, baseline = synthetic
+    output = tmp_path / "convergence"
+    output.mkdir()
+    kwargs = inputs(config, data)
+    original = deepcopy(kwargs["model"].state_dict())
+    result = convergence.fit(**kwargs, config=config, output=output)
+    assert [e["epoch"] for e in result["epochs"]] == [1, 2, 3]
+    assert result["optimizer_steps"] == 6
+    old = torch.load(baseline / "planner_step_0002.pt", weights_only=True)
+    new = torch.load(output / "epoch_1.pt", weights_only=True)
+    assert all(torch.equal(p, new["planner_state_dict"][n]) for n, p in old["planner_state_dict"].items())
+    assert new["optimizer_state_dict"]["state"]
+    assert new["epoch"] == 1 and new["optimizer_step"] == 2
+    assert new["training_config"] == asdict(config)
+    assert all(torch.equal(p, kwargs["model"].state_dict()[n]) for n, p in original.items())
+    assert json.loads((output / "epoch1_reproduction.json").read_text())["passed"]
+    validation_calls = [c for c in kwargs["runner"].calls if c[0] == "validation"]
+    assert len(validation_calls) == 3 * 4 + 4  # Epoch-end full validation plus selected reload subset.
+    assert {c[1] for c in validation_calls} == {"predicted_action"}
+    assert {c[0] for c in kwargs["runner"].calls} == {"train", "validation"}
+    for epoch in result["epochs"]:
+        rows = [json.loads(line) for line in
+                (output / f"epoch_{epoch['epoch']}_predictions.jsonl").read_text().splitlines()]
+        assert epoch["metrics"] == aggregate_metrics(rows, "predicted_action")
+        missing = epoch["motion_unavailable"]
+        assert missing["metrics"]["sample_count"] == 1
+        expected = [r for r in rows if r["sample_token"] == "sample-0-validation"]
+        assert missing["metrics"] == aggregate_metrics(expected, "predicted_action")
+        assert epoch["minus_mlp"]["ade_3s_m"] == epoch["metrics"]["ade_3s_m"] - config.mlp_reference["ade_3s_m"]
+    best = min(result["epochs"], key=lambda e: (e["metrics"]["invalid_prediction_count"],
+               e["metrics"]["ade_m"], e["metrics"]["fde_m"], e["optimizer_step"]))
+    assert result["best_epoch"] == best["epoch"]
+    assert result["Direct multi-epoch control"] == "NOT RUN"
+    assert result["test_isolation"]["test_records_read"] == 0
+    assert result["test_isolation"]["test_images_opened"] == 0
+    assert result["test_isolation"]["test_labels_read"] == 0
+    assert result["test_isolation"]["test_evaluation_performed"] is False
+    assert result["reload_consistency"]["reload_consistency"]
+    assert not (output / "epoch_4.pt").exists()
+
+
+def test_reproduction_failure_stops_before_epoch2(synthetic, data, tmp_path):
+    config, _ = synthetic
+    config = replace(config, epoch1_reference={k: v * 2 for k, v in config.epoch1_reference.items()})
+    output = tmp_path / "failure"
+    output.mkdir()
+    kwargs = inputs(config, data)
+    with pytest.raises(ValueError, match="STOP before epoch 2"):
+        convergence.fit(**kwargs, config=config, output=output)
+    assert (output / "epoch_1.pt").exists()
+    assert not (output / "epoch_2.pt").exists()
+    assert len([c for c in kwargs["runner"].calls if c[0] == "train"]) == 4
+    gate = json.loads((output / "epoch1_reproduction.json").read_text())
+    assert not gate["passed"] and len(gate["new_minus_old"]) == 6
+
+
+def assert_state_equal(first, second):
+    if isinstance(first, torch.Tensor):
+        assert torch.equal(first, second)
+    elif isinstance(first, dict):
+        assert first.keys() == second.keys()
+        for key in first:
+            assert_state_equal(first[key], second[key])
+    elif isinstance(first, list):
+        assert len(first) == len(second)
+        for a, b in zip(first, second):
+            assert_state_equal(a, b)
+    else:
+        assert first == second
+
+
+def test_optimizer_and_dropout_resume_matches_uninterrupted(synthetic, data, tmp_path):
+    config, _ = synthetic
+    uninterrupted, split = tmp_path / "uninterrupted", tmp_path / "split"
+    uninterrupted.mkdir()
+    split.mkdir()
+    # Internal five-epoch run is the continuity oracle, not a supported public configuration.
+    full_config = replace(config, num_train_epochs=5)
+    convergence.fit(**inputs(full_config, data), config=full_config, output=uninterrupted)
+    convergence.fit(**inputs(config, data), config=config, output=split)
+    saved = torch.load(split / "epoch_3.pt", weights_only=True)
+    torch.manual_seed(1)
+    convergence.fit(**inputs(config, data), config=config, output=split, resume=saved)
+    expected = torch.load(uninterrupted / "epoch_5.pt", weights_only=True)
+    actual = torch.load(split / "epoch_5.pt", weights_only=True)
+    for key in ("planner_state_dict", "optimizer_state_dict", "torch_rng_state", "optimizer_step"):
+        assert_state_equal(expected[key], actual[key])
+    assert expected["epochs"] == actual["epochs"]
+    assert actual["epoch"] == 5
+
+
+def test_resume_gate_reads_producer_checkpoint(synthetic, data, tmp_path):
+    config, _ = synthetic
+    output = tmp_path / "resume"
+    output.mkdir()
+    convergence.fit(**inputs(config, data), config=config, output=output)
+    path = output / "epoch_3.pt"
+    saved = torch.load(path, weights_only=True)
+    # Controlled metric changes isolate the gate using a real checkpoint producer shape.
+    for epoch, factor in zip(saved["epochs"][1:], (1., .98)):
+        for key in ("ade_3s_m", "fde_3s_m"):
+            epoch["metrics"][key] = config.epoch1_reference[key] * factor
+    torch.save(saved, path)
+    assert convergence.load_resume(output, config)["epoch"] == 3
+    with pytest.raises(ValueError, match="protocol"):
+        convergence.load_resume(output, replace(config, seed=1))
+    saved["epochs"][2]["metrics"]["ade_3s_m"] *= 2
+    torch.save(saved, path)
+    with pytest.raises(ValueError, match="STOP at epoch 3"):
+        convergence.load_resume(output, config)
+    full.save_checkpoint(path, inputs(config, data)["planner"], config, {}, 2)
+    with pytest.raises((KeyError, ValueError)):
+        convergence.load_resume(output, config)
+
+
+def test_entrypoint_isolation_and_rerun_before_access(config, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(full, "prepare_run", lambda *a: pytest.fail("data/model accessed"))
+    monkeypatch.setattr(convergence, "validate_git_provenance", lambda p: SimpleNamespace(commit="synthetic"))
+    kwargs = dict(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path,
+                  config=config, git_provenance=None)
+    for option in ("--train-split", "--validation-split"):
+        with pytest.raises(SystemExit):
+            cli.main([option, "test", "--dry-run"])
+    assert cli.main(["--dry-run"]) == 0
+    assert "dry_run_no_data_or_model_access" in capsys.readouterr().out
+    for key in ("train_split", "validation_split"):
+        with pytest.raises(ValueError, match="train/validation only"):
+            convergence.run(**kwargs, **{key: "test"})
+    output = tmp_path / config.output_relative_dir
+    output.mkdir(parents=True)
+    with pytest.raises(FileExistsError):
+        convergence.run(**kwargs)
+    with pytest.raises(FileNotFoundError):
+        convergence.run(**kwargs, extend_to_five=True)
+
+
+def test_public_runner_uses_shared_initialization(synthetic, data, tmp_path, monkeypatch):
+    config, _ = synthetic
+    prepared = inputs(config, data)
+    monkeypatch.setattr(full, "prepare_run", lambda *a: prepared)
+    monkeypatch.setattr(convergence, "validate_git_provenance", lambda p: SimpleNamespace(commit="synthetic"))
+    result = convergence.run(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path,
+                             config=config, git_provenance=None)
+    assert result["epochs"][-1]["epoch"] == 3
+    assert (tmp_path / config.output_relative_dir / "data_summary.json").exists()
+
+
+@pytest.mark.parametrize("better_fde,expected_epoch", [(False, 1), (True, 3)])
+def test_selection_invalid_priority_and_earliest_tie(synthetic, data, tmp_path, monkeypatch,
+                                                    better_fde, expected_epoch):
+    config, _ = synthetic
+    output = tmp_path / "selection"
+    output.mkdir()
+    evaluate = full.evaluate
+    calls, first = 0, None
+
+    def controlled_metrics(*args):
+        nonlocal calls, first
+        metrics, rows = evaluate(*args)
+        calls += 1
+        if calls == 1:
+            first = deepcopy(metrics)
+        elif calls == 2:
+            metrics.update(invalid_prediction_count=1, ade_m=0., fde_m=0.)
+        elif calls == 3:
+            metrics.update(invalid_prediction_count=0, ade_m=first["ade_m"],
+                           fde_m=first["fde_m"] - (1 if better_fde else 0))
+        return metrics, rows
+
+    monkeypatch.setattr(full, "evaluate", controlled_metrics)
+    result = convergence.fit(**inputs(config, data), config=config, output=output)
+    assert result["best_epoch"] == expected_epoch
+
+
+def test_subset_count_and_invalid_predictions(synthetic, data, tmp_path):
+    config, _ = synthetic
+    kwargs = inputs(config, data)
+    _, rows = full.evaluate(kwargs["planner"], kwargs["runner"], kwargs["validation"],
+                            kwargs["records"], "predicted_action")
+    with pytest.raises(ValueError, match="subset count"):
+        convergence.motion_subset(rows, kwargs["records"], replace(config, expected_motion_unavailable_count=94))
+    missing = next(r for r in rows if r["sample_token"] == "sample-0-validation")
+    missing.update(prediction_valid=False, invalid_reason="invalid_structured_action", predicted_waypoints=None)
+    subset = convergence.motion_subset(rows, kwargs["records"], config)
+    assert subset["metrics"]["sample_count"] == subset["metrics"]["invalid_prediction_count"] == 1
+    assert subset["minus_mlp"]["ade_3s_m"] is None

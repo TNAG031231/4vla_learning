@@ -1,0 +1,45 @@
+protocol_version: phase0.4c-action-conditioned-convergence-v0.1
+seed: 20260812
+selected_adapter_relative_path: phase_0_4/structured_action_lora_full_v0_1/adapter_step_3564
+output_relative_dir: phase_0_4/action_conditioned_convergence_v0_1
+planner_dimension: 256
+num_decoder_layers: 2
+num_heads: 4
+dropout: 0.1
+num_waypoint_queries: 6
+memory_normalization: true
+smooth_l1_beta: 1.0
+num_train_epochs: 3
+micro_batch_size: 1
+gradient_accumulation_steps: 4
+optimizer: AdamW
+learning_rate: 0.0001
+weight_decay: 0.0001
+lr_scheduler: constant
+checkpoint_interval: 1
+validation_interval: 1
+log_every_steps: 25
+early_stopping: false
+selection_policy: invalid_count_then_ade_then_fde_then_earliest
+reload_subset_size: 8
+validation_schedule: epoch_end
+reproduction_rtol: 0.01
+extension_min_relative_improvement: 0.01
+expected_validation_count: 3594
+expected_motion_unavailable_count: 94
+epoch1_reference:
+  ade_1s_m: 0.4833564437
+  ade_2s_m: 0.7721170835
+  ade_3s_m: 1.1878918724
+  fde_1s_m: 0.5913475050
+  fde_2s_m: 1.2420878008
+  fde_3s_m: 2.3371623162
+mlp_reference:
+  ade_3s_m: 0.8145325565
+  fde_3s_m: 1.7724578323
+motion_planner_reference:
+  ade_3s_m: 3.1673829384
+  fde_3s_m: 5.7129852009
+motion_mlp_reference:
+  ade_3s_m: 5.4648598499
+  fde_3s_m: 9.4919450641
