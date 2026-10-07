@@ -10,14 +10,16 @@ from torch import nn
 import yaml
 
 from src.phase0 import phase0_4c_full_train as full
-from src.phase0.phase0_4b_lora_full import epoch_groups
-from src.phase0.phase0_4b_protocol import SFTSample
+from src.phase0.phase0_4b_lora_full import epoch_groups, load_config as load_semantic_config
+from src.phase0.phase0_4b_protocol import PARSER_VERSION, PROMPT_VERSION, SERIALIZATION_VERSION, SFTSample
 from src.phase0.phase0_4c_evaluation import aggregate_metrics, compare_reload
 from src.phase0.phase0_4c_tiny_overfit import write_json
-from src.phase0.phase0_4c_two_turn_planner import WaypointDecoder
+from src.phase0.phase0_4c_two_turn_planner import WaypointDecoder, freeze_backbone, masked_waypoint_loss
 from src.phase0.qwen3vl_dataset_adapter import (
     GitProvenance, resolve_derived_path, validate_git_provenance,
 )
+from src.phase0.qwen3vl_interface import FIXED_MODEL_ID, FIXED_REVISION
+from src.phase0.qwen3vl_lora_smoke import default_runtime_dependencies
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,26 @@ def load_resume(output: Path, config: ConvergenceConfig) -> dict:
     return saved
 
 
+def train_group(planner: WaypointDecoder, runner: full.PlannerRunner, group: list[SFTSample],
+                records: dict, config: ConvergenceConfig, optimizer: torch.optim.Optimizer) -> float:
+    planner.train()
+    optimizer.zero_grad(set_to_none=True)
+    loss_sum = 0.0
+    for sample in group:
+        prediction, _ = runner.predict(planner, sample, "gt_action_teacher_forced_train")
+        row = records[sample.sample_token]
+        target = torch.tensor([row["future_waypoints"]], device=runner.device, dtype=torch.float32)
+        mask = torch.tensor([row["trajectory_valid_mask"]], device=runner.device, dtype=torch.bool)
+        loss = masked_waypoint_loss(prediction, target, mask, beta=config.smooth_l1_beta)
+        if not torch.isfinite(prediction).all() or not torch.isfinite(loss):
+            raise ValueError("nonfinite planner training output/loss")
+        (loss / len(group)).backward()
+        loss_sum += float(loss.detach())
+        del prediction, loss
+    optimizer.step()
+    return loss_sum
+
+
 def fit(*, model: nn.Module, planner: WaypointDecoder, runner: full.PlannerRunner,
         train: list[SFTSample], validation: list[SFTSample], records: dict,
         config: ConvergenceConfig, output: Path, provenance: dict, resume: dict | None = None) -> dict:
@@ -161,7 +183,7 @@ def fit(*, model: nn.Module, planner: WaypointDecoder, runner: full.PlannerRunne
         for epoch in range(start, end):
             epoch_loss, consumed = 0., 0
             for group in epoch_groups(train, config.gradient_accumulation_steps, config.seed + epoch):
-                loss_sum = full.train_group(planner, runner, group, records, config, optimizer)
+                loss_sum = train_group(planner, runner, group, records, config, optimizer)
                 step += 1
                 consumed += len(group)
                 epoch_loss += loss_sum
@@ -232,9 +254,49 @@ def run(*, repository: Path, dataset_root: Path, derived_root: Path, config: Con
     if output.exists() and not extend_to_five:
         raise FileExistsError(f"convergence output already exists: {output}")
     resume = load_resume(output, config) if extend_to_five else None
-    inputs = full.prepare_run(repository, dataset_root, derived_root, config, git)
+    inputs = prepare_run(repository, dataset_root, derived_root, config, git)
     if not extend_to_five:
         output.mkdir(parents=True)
         write_json(output / "resolved_config.json", asdict(config))
         write_json(output / "data_summary.json", inputs["provenance"]["data"])
     return fit(**inputs, config=config, output=output, resume=resume)
+
+
+def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,
+                config: ConvergenceConfig, git: GitProvenance) -> dict:
+    train, validation, records, data = full.prepare_data(repository, derived_root)
+    semantic = load_semantic_config(repository / "configs/phase0_4b_lora_full.yaml")
+    runtime = default_runtime_dependencies()
+    device = runtime.device_selector("cuda:0")
+    dtype = runtime.dtype_selector(semantic.precision)
+    if dtype != torch.bfloat16:
+        raise ValueError("selected Phase 0.4b model requires BF16 support")
+    torch.manual_seed(config.seed)
+    processor = runtime.processor_loader(FIXED_MODEL_ID, FIXED_REVISION, semantic.local_files_only)
+    base = runtime.model_loader(FIXED_MODEL_ID, FIXED_REVISION, dtype,
+                                semantic.attention_implementation, semantic.local_files_only)
+    adapter = resolve_derived_path(derived_root, config.selected_adapter_relative_path)
+    model = runtime.adapter_loader(base, adapter).to(device)
+    freeze_backbone(model)
+    if model.config.text_config.hidden_size != 2560:
+        raise ValueError("Qwen planner interface must have hidden size 2560")
+    planner = WaypointDecoder(2560, config).to(device)
+    runner = full.PlannerRunner(model, processor, runtime, dataset_root,
+                               {**semantic.generation_kwargs, "use_cache": True}, device)
+    provenance = {
+        "execution_git_commit": git.commit, "config": asdict(config), "seed": config.seed,
+        "model_id": FIXED_MODEL_ID, "model_revision": FIXED_REVISION, "processor_revision": FIXED_REVISION,
+        "selected_adapter": config.selected_adapter_relative_path, "selected_adapter_loaded": True,
+        "prompt_version": PROMPT_VERSION, "parser_version": PARSER_VERSION,
+        "serialization_version": SERIALIZATION_VERSION, "data": data,
+        "train_sample_count": len(train), "validation_sample_count": len(validation),
+        "conditioning_protocol": {"train": "gt_action_teacher_forced_train", "validation": "predicted_action",
+                                  "diagnostic": "gt_action_diagnostic"},
+        "planner_architecture": "2560->256->MemoryLayerNorm->6queries->2layer4headPostLN->2",
+        "memory_norm_enabled": True, "waypoint_times_sec": [0.5, 1., 1.5, 2., 2.5, 3.],
+        "coordinates": "current_ego_frame_x_forward_y_left_meters", "hidden_state_cache": False,
+        "transformers_version": runtime.package_version("transformers"),
+        "peft_version": runtime.package_version("peft"),
+    }
+    return dict(model=model, planner=planner, runner=runner, train=train, validation=validation,
+                records=records, provenance=provenance)

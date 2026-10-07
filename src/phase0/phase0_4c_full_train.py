@@ -225,26 +225,6 @@ def reload_planner(path: Path, device: str) -> WaypointDecoder:
     return planner
 
 
-def train_group(planner: WaypointDecoder, runner: PlannerRunner, group: list[SFTSample],
-                records: dict, config: FullConfig, optimizer: torch.optim.Optimizer) -> float:
-    planner.train()
-    optimizer.zero_grad(set_to_none=True)
-    loss_sum = 0.0
-    for sample in group:
-        prediction, _ = runner.predict(planner, sample, "gt_action_teacher_forced_train")
-        row = records[sample.sample_token]
-        target = torch.tensor([row["future_waypoints"]], device=runner.device, dtype=torch.float32)
-        mask = torch.tensor([row["trajectory_valid_mask"]], device=runner.device, dtype=torch.bool)
-        loss = masked_waypoint_loss(prediction, target, mask, beta=config.smooth_l1_beta)
-        if not torch.isfinite(prediction).all() or not torch.isfinite(loss):
-            raise ValueError("nonfinite planner training output/loss")
-        (loss / len(group)).backward()
-        loss_sum += float(loss.detach())
-        del prediction, loss
-    optimizer.step()
-    return loss_sum
-
-
 def fit(*, model: nn.Module, planner: WaypointDecoder, runner: PlannerRunner,
         train: list[SFTSample], validation: list[SFTSample], records: dict,
         config: FullConfig, output: Path, provenance: dict) -> dict:
@@ -262,7 +242,21 @@ def fit(*, model: nn.Module, planner: WaypointDecoder, runner: PlannerRunner,
     with (output / "training_history.jsonl").open("w") as history:
         for epoch in range(config.num_train_epochs):
             for group in epoch_groups(train, config.gradient_accumulation_steps, config.seed + epoch):
-                loss_sum = train_group(planner, runner, group, records, config, optimizer)
+                planner.train()
+                optimizer.zero_grad(set_to_none=True)
+                loss_sum = 0.0
+                for sample in group:
+                    prediction, _ = runner.predict(planner, sample, "gt_action_teacher_forced_train")
+                    row = records[sample.sample_token]
+                    target = torch.tensor([row["future_waypoints"]], device=runner.device, dtype=torch.float32)
+                    mask = torch.tensor([row["trajectory_valid_mask"]], device=runner.device, dtype=torch.bool)
+                    loss = masked_waypoint_loss(prediction, target, mask, beta=config.smooth_l1_beta)
+                    if not torch.isfinite(prediction).all() or not torch.isfinite(loss):
+                        raise ValueError("nonfinite planner training output/loss")
+                    (loss / len(group)).backward()
+                    loss_sum += float(loss.detach())
+                    del prediction, loss
+                optimizer.step()
                 step += 1
                 consumed += len(group)
                 entry = {"optimizer_step": step, "epoch": epoch + 1, "samples_consumed": consumed,
@@ -349,15 +343,6 @@ def run_full(*, repository: Path, dataset_root: Path, derived_root: Path,
         raise ValueError("planner artifacts must be outside repository")
     if output.exists():
         raise FileExistsError(f"full planner output already exists: {output}")
-    inputs = prepare_run(repository, dataset_root, derived_root, config, git)
-    output.mkdir(parents=True)
-    write_json(output / "resolved_config.json", asdict(config))
-    write_json(output / "data_summary.json", inputs["provenance"]["data"])
-    return fit(**inputs, config=config, output=output)
-
-
-def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,
-                config: FullConfig, git: GitProvenance) -> dict:
     train, validation, records, data = prepare_data(repository, derived_root)
     semantic = load_semantic_config(repository / "configs/phase0_4b_lora_full.yaml")
     runtime = default_runtime_dependencies()
@@ -392,5 +377,8 @@ def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,
         "transformers_version": runtime.package_version("transformers"),
         "peft_version": runtime.package_version("peft"),
     }
-    return dict(model=model, planner=planner, runner=runner, train=train, validation=validation,
-                records=records, provenance=provenance)
+    output.mkdir(parents=True)
+    write_json(output / "resolved_config.json", asdict(config))
+    write_json(output / "data_summary.json", data)
+    return fit(model=model, planner=planner, runner=runner, train=train, validation=validation,
+               records=records, config=config, output=output, provenance=provenance)

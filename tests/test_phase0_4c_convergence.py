@@ -210,7 +210,7 @@ def test_resume_gate_reads_producer_checkpoint(synthetic, data, tmp_path):
 
 
 def test_entrypoint_isolation_and_rerun_before_access(config, tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(full, "prepare_run", lambda *a: pytest.fail("data/model accessed"))
+    monkeypatch.setattr(convergence, "prepare_run", lambda *a: pytest.fail("data/model accessed"))
     monkeypatch.setattr(convergence, "validate_git_provenance", lambda p: SimpleNamespace(commit="synthetic"))
     kwargs = dict(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path,
                   config=config, git_provenance=None)
@@ -230,10 +230,10 @@ def test_entrypoint_isolation_and_rerun_before_access(config, tmp_path, monkeypa
         convergence.run(**kwargs, extend_to_five=True)
 
 
-def test_public_runner_uses_shared_initialization(synthetic, data, tmp_path, monkeypatch):
+def test_public_runner_uses_local_preparation(synthetic, data, tmp_path, monkeypatch):
     config, _ = synthetic
     prepared = inputs(config, data)
-    monkeypatch.setattr(full, "prepare_run", lambda *a: prepared)
+    monkeypatch.setattr(convergence, "prepare_run", lambda *a: prepared)
     monkeypatch.setattr(convergence, "validate_git_provenance", lambda p: SimpleNamespace(commit="synthetic"))
     result = convergence.run(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path,
                              config=config, git_provenance=None)
@@ -280,3 +280,29 @@ def test_subset_count_and_invalid_predictions(synthetic, data, tmp_path):
     subset = convergence.motion_subset(rows, kwargs["records"], config)
     assert subset["metrics"]["sample_count"] == subset["metrics"]["invalid_prediction_count"] == 1
     assert subset["minus_mlp"]["ade_3s_m"] is None
+
+
+def test_local_preparation_matches_historical_initialization(config, data, tmp_path, monkeypatch):
+    def load_model(*args):
+        model = Backbone()
+        model.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=2560))
+        return model
+
+    runtime = SimpleNamespace(
+        device_selector=lambda d: "cpu", dtype_selector=lambda d: torch.bfloat16,
+        processor_loader=lambda *a: object(), model_loader=load_model,
+        adapter_loader=lambda model, path: model, package_version=lambda name: "synthetic")
+    git = SimpleNamespace(commit="synthetic")
+    monkeypatch.setattr(full, "prepare_data", lambda *a: data)
+    monkeypatch.setattr(full, "default_runtime_dependencies", lambda: runtime)
+    monkeypatch.setattr(convergence, "default_runtime_dependencies", lambda: runtime)
+    monkeypatch.setattr(full, "validate_git_provenance", lambda p: git)
+    monkeypatch.setattr(full, "fit", lambda **kwargs: kwargs)
+    historical = full.run_full(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path,
+                               config=config, git_provenance=git)
+    local = convergence.prepare_run(ROOT, tmp_path, tmp_path, config, git)
+    assert historical["provenance"] == local["provenance"]
+    assert_state_equal(historical["planner"].state_dict(), local["planner"].state_dict())
+    assert_state_equal(historical["model"].state_dict(), local["model"].state_dict())
+    assert not any(p.requires_grad for p in local["model"].parameters())
+    assert local["runner"].generation_kwargs == historical["runner"].generation_kwargs
