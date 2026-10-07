@@ -363,6 +363,38 @@ CV 比较使用 **3500** 个共同有效样本；不能将此分母下的数值�
 - Direct 在与 CV 的配对比较中仅 FDE@3s 较好，relative delta 为 `-0.05612856210286506`；其余五项均较差。该单项长时域终点收益不足以说明跨时域的一致优势；CV 仍是重要简单 baseline，其位置取决于 horizon、metric 和有效样本分母。
 - **关键限制：** 两条 Qwen 轨迹路径均使用 structured-action-trained LoRA adapter，而非 trajectory-specialized adaptation objective。结果仅表明当前 Qwen + action-specialized LoRA + trajectory-decoder pipeline 尚未将多模态观测转化为超过 ego-history MLP 的轨迹表现；不能据此声称视觉无用、多模态信息有害或 Qwen/VLM 表征无法改善轨迹预测。Phase 0.4d 尚未启动。
 
+## Phase 0.4c-5 Trajectory Capability Stratification
+
+- 状态：`completed`；真实 AutoDL offline validation analysis 已完成，以下事实依据用户提供的执行结果，本次 closeout 未重新执行 AutoDL 或独立重算外部 artifacts。`3594-sample alignment: PASS`、`aggregate reproduction: PASS`、`trajectory stratification: PASS`、`test isolation: PASS`；`Phase 0.4c-5 overall gate: PASS`。
+- Validation sample count = **3594**；Ego-History MLP、Action-Conditioned Planner、Direct Qwen 的 valid count 均为 **3594**；CV valid = **3500**、invalid = **94**，invalid reason 为 `missing_current_speed`。`test access = 0`：`test_records_read=0`、`test_images_opened=0`、`test_labels_read=0`、`test_evaluation_performed=false`。
+- 真实 `summary.json` 与 `sample_analysis.jsonl` 保留在 `$VLA_DERIVED_ROOT/phase_0_4/trajectory_capability_stratification_v0_1/`，不提交 Git。
+
+完整 validation 的总体结果（误差单位 m）：
+
+| 模型 | ADE@3s | FDE@3s |
+| --- | --- | --- |
+| Ego-History MLP | 0.8145325565 | 1.7724578323 |
+| Action-Conditioned Planner | 1.1878918724 | 2.3371623162 |
+| Direct Qwen | 1.2371284147 | 2.3970605181 |
+
+`motion_availability = unavailable` 子集的 `sample_count = 94`；availability 沿用当前帧 `ego_motion_history[-1].availability`：
+
+| 模型 | ADE@3s (m) | FDE@3s (m) |
+| --- | --- | --- |
+| Ego-History MLP | 5.4648598499 | 9.4919450641 |
+| Action-Conditioned Planner | 3.1673829384 | 5.7129852009 |
+
+| Planner vs MLP | Planner win rate | mean planner_minus_mlp (m) |
+| --- | --- | --- |
+| ADE@3s | 64 / 94 ≈ 0.680851 | -2.2974769115 |
+| FDE@3s | 60 / 94 ≈ 0.638298 | -3.7789598632 |
+
+> Under the current validation protocol, Ego-History MLP remains substantially stronger overall, while the Qwen-based trajectory pathways show complementary capability when current ego-motion information is unavailable. This does not establish that visual information alone causes the improvement.
+
+- `left/right` stratification does not show systematic Planner superiority over MLP.
+- `stop` cannot be treated as evidence of multimodal visual benefit because Constant Velocity is especially strong on this subset.
+- Phase 0.4c-5 does not justify an architecture change by itself.
+
 ## Next Gate
 
 - Phase 0.4c-4 baseline suite gate 已 `PASS`；PR #50 保持 OPEN / Draft / unmerged，等待后续审阅与合并后的 Learning & Capability Closeout；Phase 0.4d 尚未启动。
