@@ -1,0 +1,30 @@
+protocol_version: phase0.4c-trajectory-stratification-v0.1
+output_relative_dir: phase_0_4/trajectory_capability_stratification_v0_1
+expected_sample_count: 3594
+expected_cv_valid_count: 3500
+expected_cv_invalid_count: 94
+top_k: 20
+metric_atol: 0.00001
+metric_rtol: 0.00001
+expected_metrics:
+  mlp:
+    ade_1s_m: 0.2198339891279221
+    ade_2s_m: 0.4598319687723541
+    ade_3s_m: 0.8145325565262365
+    fde_1s_m: 0.3058402292787939
+    fde_2s_m: 0.8610133790052416
+    fde_3s_m: 1.7724578323181663
+  planner:
+    ade_1s_m: 0.4833564437168112
+    ade_2s_m: 0.7721170835325502
+    ade_3s_m: 1.1878918724452778
+    fde_1s_m: 0.591347504965339
+    fde_2s_m: 1.2420878008403957
+    fde_3s_m: 2.337162316182362
+  direct:
+    ade_1s_m: 0.4935457403369924
+    ade_2s_m: 0.8181583155288621
+    ade_3s_m: 1.2371284147412513
+    fde_1s_m: 0.6323533395827946
+    fde_2s_m: 1.3194896764866697
+    fde_3s_m: 2.397060518083046
