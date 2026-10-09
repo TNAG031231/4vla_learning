@@ -452,3 +452,152 @@ def test_failed_continuation_can_extend_without_erasing_failure(failed_run):
     assert result["continuation_after_failed_historical_reproduction"] is True
     assert result["provenance"]["historical_epoch1_reproduction_passed"] is False
     assert (output / "epoch1_reproduction.json").read_bytes() == before
+
+
+@pytest.fixture
+def diagnostic_run(failed_run):
+    config, output, kwargs = failed_run
+    convergence.run(**kwargs, continue_after_epoch1_reproduction_fail=True)
+    summary = json.loads((output / "training_summary.json").read_text())
+    # Isolate the required selection state on artifacts made by the actual producer.
+    summary["best_epoch"] = 2
+    summary["extension_gate"]["allowed"] = False
+    convergence.write_json(output / "training_summary.json", summary)
+    return config, output, kwargs
+
+
+def test_diagnostic_reads_both_checkpoints_without_training(diagnostic_run, data, monkeypatch):
+    config, output, kwargs = diagnostic_run
+    before = snapshot(output)
+    prepared = inputs(config, data)
+    monkeypatch.setattr(convergence, "prepare_run", lambda *a: prepared)
+    for owner, name in ((convergence, "fit"), (convergence, "train_group"),
+                        (torch.optim, "AdamW"), (torch.Tensor, "backward")):
+        monkeypatch.setattr(owner, name, lambda *a, **k: pytest.fail("training called"))
+    evaluate = full.evaluate
+    loaded = []
+
+    def checked_evaluate(planner, runner, samples, records, track):
+        epoch = 2 + len(loaded)
+        saved = torch.load(output / f"epoch_{epoch}.pt", weights_only=True)
+        assert_state_equal(planner.state_dict(), saved["planner_state_dict"])
+        assert not planner.training and not prepared["model"].training
+        assert not torch.is_grad_enabled()
+        assert not any(p.requires_grad for p in prepared["model"].parameters())
+        loaded.append(epoch)
+        return evaluate(planner, runner, samples, records, track)
+
+    monkeypatch.setattr(full, "evaluate", checked_evaluate)
+    result = convergence.diagnose_gt_action(**kwargs)
+    assert loaded == [2, 3]
+    assert result["status"] == "gt_action_epoch2_epoch3_diagnostic_completed"
+    assert all((output / name).read_bytes() == content for name, content in before.items())
+    assert len(snapshot(output)) == len(before) + 5
+    assert {c[:2] for c in prepared["runner"].calls} == {("validation", "gt_action_diagnostic")}
+    assert len(prepared["runner"].calls) == 2 * config.expected_validation_count
+    for epoch in (2, 3):
+        metrics = result[f"epoch_{epoch}"]["gt_action_diagnostic"]
+        assert metrics["sample_count"] == metrics["valid_prediction_count"] == 4
+        assert metrics["invalid_prediction_count"] == 0
+        assert result["motion_unavailable"][f"epoch_{epoch}"]["gt_action_diagnostic"]["sample_count"] == 1
+    for key in ("test_records_read", "test_images_opened", "test_labels_read"):
+        assert result["test_isolation"][key] == 0
+    assert result["test_isolation"]["test_evaluation_performed"] is False
+    assert json.loads((output / "gt_action_diagnostic_comparison.json").read_text()) == result
+    after = snapshot(output)
+    with pytest.raises(FileExistsError):
+        convergence.diagnose_gt_action(**kwargs)
+    assert snapshot(output) == after
+
+
+@pytest.mark.parametrize("failure", ["split", "existing", "step", "config", "provenance", "tokens", "target", "coverage"])
+def test_diagnostic_intake_rejects_without_writes(diagnostic_run, data, monkeypatch, failure):
+    config, output, kwargs = diagnostic_run
+    prepared = inputs(config, data)
+    monkeypatch.setattr(convergence, "prepare_run", lambda *a: prepared)
+    if failure == "split":
+        kwargs["validation_split"] = "test"
+        monkeypatch.setattr(convergence, "prepare_run", lambda *a: pytest.fail("data/model accessed"))
+    elif failure == "existing":
+        (output / "epoch_3_gt_action_predictions.jsonl").write_text("partial")
+        monkeypatch.setattr(convergence, "prepare_run", lambda *a: pytest.fail("data/model accessed"))
+    elif failure in ("step", "config", "provenance"):
+        path = output / "epoch_3.pt"
+        saved = torch.load(path, weights_only=True)
+        if failure == "step":
+            saved["optimizer_step"] += 1
+        elif failure == "config":
+            saved["training_config"]["seed"] += 1
+        else:
+            saved["provenance"]["data"]["validation"]["eligible_records"] += 1
+        torch.save(saved, path)
+    elif failure in ("tokens", "target"):
+        path = output / "epoch_3_predictions.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        if failure == "tokens":
+            rows[0]["sample_token"] = "unknown"
+        else:
+            rows[0]["target_waypoints"][0][0] += 1
+        full.write_predictions(path, rows)
+    else:
+        prepared["validation"] = prepared["validation"][:-1]
+    monkeypatch.setattr(full, "evaluate", lambda *a: pytest.fail("evaluation called"))
+    before = snapshot(output)
+    with pytest.raises((ValueError, FileExistsError)):
+        convergence.diagnose_gt_action(**kwargs)
+    assert snapshot(output) == before
+
+
+@pytest.mark.parametrize("option", ["--continue-after-epoch1-reproduction-fail", "--extend-to-five"])
+def test_diagnostic_cli_excludes_training_modes(option):
+    with pytest.raises(SystemExit):
+        cli.main(["--diagnose-gt-action-epoch2-3", option, "--dry-run"])
+
+
+def test_diagnostic_cli_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "run", lambda **k: pytest.fail("training dispatch"))
+    monkeypatch.setattr(cli, "collect_git_provenance", lambda *a: None)
+    calls = []
+    monkeypatch.setattr(cli, "diagnose_gt_action", lambda **k: calls.append(k) or {})
+    assert cli.main(["--diagnose-gt-action-epoch2-3", "--dataset-root", str(tmp_path),
+                     "--derived-root", str(tmp_path)]) == 0
+    assert len(calls) == 1 and calls[0]["validation_split"] == "validation"
+    with pytest.raises(SystemExit):
+        cli.main(["--diagnose-gt-action-epoch2-3", "--validation-split", "test"])
+
+
+@pytest.mark.parametrize("gt_factor,case", [(0.9, "case_a"), (1.005, "case_a"),
+                                           (1.1, "case_b"), (None, "inconclusive")])
+def test_diagnostic_comparison_deltas_and_interpretation(gt_factor, case):
+    metrics = dict.fromkeys(convergence.DIAGNOSTIC_METRICS, 2.)
+    second = {"predicted_action": metrics, "gt_action_diagnostic": metrics}
+    gt = dict.fromkeys(convergence.DIAGNOSTIC_METRICS, 2 * (gt_factor or 1.1))
+    if gt_factor is None:
+        gt["fde_3s_m"] = 1.8
+    third = {"predicted_action": dict.fromkeys(convergence.DIAGNOSTIC_METRICS, 3.),
+             "gt_action_diagnostic": gt}
+    result = convergence.diagnostic_comparison(second, third)
+    assert result["diagnostic_interpretation"]["diagnostic"] == case
+    assert not result["diagnostic_interpretation"]["threshold_is_experiment_gate"]
+    changes = result["epoch2_to_epoch3"]
+    for key in convergence.DIAGNOSTIC_METRICS:
+        assert changes["predicted_action_delta"][key] == 1.
+        assert changes["predicted_action_relative_change"][key] == .5
+        assert changes["gt_action_delta"][key] == gt[key] - 2.
+        assert result["conditioning_gap"]["epoch_3_predicted_minus_gt"][key] == 3. - gt[key]
+
+
+def test_diagnostic_invalid_gt_output_does_not_complete(diagnostic_run, monkeypatch):
+    _, output, kwargs = diagnostic_run
+    evaluate = full.evaluate
+
+    def invalid_output(*args):
+        _, rows = evaluate(*args)
+        rows[0].update(prediction_valid=False, invalid_reason="nonfinite_trajectory", predicted_waypoints=None)
+        return aggregate_metrics(rows, "gt_action_diagnostic"), rows
+
+    monkeypatch.setattr(full, "evaluate", invalid_output)
+    before = snapshot(output)
+    with pytest.raises(ValueError, match="GT-action validation coverage"):
+        convergence.diagnose_gt_action(**kwargs)
+    assert snapshot(output) == before

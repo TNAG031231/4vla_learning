@@ -23,6 +23,8 @@ from src.phase0.qwen3vl_lora_smoke import default_runtime_dependencies
 
 
 EPOCH1_OPTIMIZER_STEP = 3564
+DIAGNOSTIC_METRICS = ("ade_m", "fde_m", "ade_1s_m", "ade_2s_m", "ade_3s_m",
+                      "fde_1s_m", "fde_2s_m", "fde_3s_m")
 
 
 @dataclass(frozen=True)
@@ -382,3 +384,133 @@ def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,
     }
     return dict(model=model, planner=planner, runner=runner, train=train, validation=validation,
                 records=records, provenance=provenance)
+
+
+def diagnostic_comparison(second: dict, third: dict) -> dict:
+    changes = {}
+    for track, prefix in (("predicted_action", "predicted_action"), ("gt_action_diagnostic", "gt_action")):
+        changes[f"{prefix}_delta"] = deltas(third[track], {k: second[track][k] for k in DIAGNOSTIC_METRICS})
+        changes[f"{prefix}_relative_change"] = {
+            k: changes[f"{prefix}_delta"][k] / second[track][k]
+            if second[track][k] is not None and second[track][k] > 0
+            and changes[f"{prefix}_delta"][k] is not None else None for k in DIAGNOSTIC_METRICS}
+    predicted = [changes["predicted_action_relative_change"][k] for k in ("ade_3s_m", "fde_3s_m")]
+    gt = [changes["gt_action_relative_change"][k] for k in ("ade_3s_m", "fde_3s_m")]
+    predicted_worse = all(v is not None and v > 0 for v in predicted)
+    mismatch = predicted_worse and all(v is not None and v < .01 for v in gt)
+    regression = predicted_worse and all(v is not None and v >= .01 for v in gt)
+    return {"epoch_2": second, "epoch_3": third, "epoch2_to_epoch3": changes,
+            "conditioning_gap": {
+                f"epoch_{epoch}_predicted_minus_gt": deltas(
+                    entry["predicted_action"], {k: entry["gt_action_diagnostic"][k] for k in DIAGNOSTIC_METRICS})
+                for epoch, entry in ((2, second), (3, third))},
+            "diagnostic_interpretation": {
+                "diagnostic": "case_a" if mismatch else "case_b" if regression else "inconclusive",
+                "teacher_forcing_predicted_action_mismatch_supported": mismatch,
+                "ordinary_overfitting_alone_supported": regression,
+                "ordinary_overfitting_or_generalization_regression_supported": regression,
+                "descriptive_relative_threshold": .01, "threshold_is_experiment_gate": False,
+                "explanation": (
+                    "GT-action performance improves or remains approximately equal while predicted action regresses; "
+                    "this supports sensitivity to predicted-action errors, not a causal proof."
+                    if mismatch else "Both action tracks regress; ordinary overfitting or generalization regression "
+                    "is supported, not uniquely identified."
+                    if regression else "Mixed or unavailable changes do not distinguish the hypotheses.")}}
+
+
+def diagnose_gt_action(*, repository: Path, dataset_root: Path, derived_root: Path,
+                       config: ConvergenceConfig, git_provenance: GitProvenance,
+                       validation_split: str = "validation") -> dict:
+    if validation_split != "validation":
+        raise ValueError("diagnostic requires validation only")
+    output = resolve_derived_path(derived_root, config.output_relative_dir)
+    if output.is_relative_to(repository.resolve()):
+        raise ValueError("planner artifacts must be outside repository")
+    names = [f"epoch_{epoch}_gt_action_{suffix}" for epoch in (2, 3)
+             for suffix in ("metrics.json", "predictions.jsonl")]
+    names.append("gt_action_diagnostic_comparison.json")
+    for name in names:
+        if (output / name).exists():
+            raise FileExistsError(f"diagnostic output already exists: {name}")
+    summary = json.loads((output / "training_summary.json").read_text())
+    if summary["status"] != "convergence_training_completed" or summary["best_epoch"] != 2:
+        raise ValueError("diagnostic requires completed convergence with best_epoch == 2")
+    checkpoints, historical = {}, {}
+    for epoch in (2, 3):
+        saved = torch.load(output / f"epoch_{epoch}.pt", map_location="cpu", weights_only=True)
+        if saved["epoch"] != epoch or saved["optimizer_step"] != epoch * EPOCH1_OPTIMIZER_STEP:
+            raise ValueError("diagnostic checkpoint epoch/optimizer_step mismatch")
+        if saved["training_config"] != asdict(config):
+            raise ValueError("diagnostic training config mismatch")
+        metrics = json.loads((output / f"epoch_{epoch}_metrics.json").read_text())
+        rows = [json.loads(line) for line in (output / f"epoch_{epoch}_predictions.jsonl").read_text().splitlines()]
+        if (metrics != aggregate_metrics(rows, "predicted_action")
+                or metrics["sample_count"] != config.expected_validation_count
+                or metrics["valid_prediction_count"] != config.expected_validation_count
+                or metrics["invalid_prediction_count"] != 0):
+            raise ValueError("diagnostic historical validation coverage/metrics mismatch")
+        checkpoints[epoch], historical[epoch] = saved, rows
+    prepared = prepare_run(repository, dataset_root, derived_root, config,
+                           validate_git_provenance(git_provenance))
+    validation, records = prepared["validation"], prepared["records"]
+    if (len(validation) != config.expected_validation_count
+            or any(s.split != "validation" for s in validation)
+            or any(not (s.target.longitudinal_valid and s.target.lateral_valid) for s in validation)):
+        raise ValueError("diagnostic requires full valid GT-action validation coverage")
+    tokens = {s.sample_token for s in validation}
+    for epoch in (2, 3):
+        if checkpoints[epoch]["provenance"]["data"] != prepared["provenance"]["data"]:
+            raise ValueError("diagnostic data provenance mismatch")
+        rows = historical[epoch]
+        if len(tokens) != len(validation) or {r["sample_token"] for r in rows} != tokens:
+            raise ValueError("diagnostic historical validation sample mismatch")
+        for row in rows:
+            record = records[row["sample_token"]]
+            target = torch.tensor(record["future_waypoints"], dtype=torch.float32).tolist()
+            if (row["split"] != "validation" or row["scene_token"] != record["scene_token"]
+                    or row["target_waypoints"] != target
+                    or row["trajectory_valid_mask"] != record["trajectory_valid_mask"]):
+                raise ValueError("diagnostic historical validation target/mask mismatch")
+    missing = {s.sample_token for s in validation
+               if records[s.sample_token]["ego_motion_history"][-1]["availability"] == "unavailable"}
+    if len(missing) != config.expected_motion_unavailable_count:
+        raise ValueError("diagnostic motion-unavailable subset count mismatch")
+    model, planner, runner = prepared["model"], prepared["planner"], prepared["runner"]
+    freeze_backbone(model)
+    model.eval()
+    evaluated, overall, subsets = {}, {}, {}
+    with torch.no_grad():
+        for epoch in (2, 3):
+            planner.load_state_dict(checkpoints[epoch]["planner_state_dict"])
+            planner.eval()
+            metrics, rows = full.evaluate(planner, runner, validation, records, "gt_action_diagnostic")
+            if (metrics["sample_count"] != config.expected_validation_count
+                    or metrics["valid_prediction_count"] != config.expected_validation_count
+                    or metrics["invalid_prediction_count"] != 0):
+                raise ValueError("diagnostic GT-action validation coverage mismatch")
+            evaluated[epoch] = rows
+            tracks = {"predicted_action": historical[epoch], "gt_action_diagnostic": rows}
+            overall[epoch] = {track: aggregate_metrics(values, track) for track, values in tracks.items()}
+            subsets[epoch] = {track: aggregate_metrics(
+                [r for r in values if r["sample_token"] in missing], track) for track, values in tracks.items()}
+    result = {"status": "gt_action_epoch2_epoch3_diagnostic_completed",
+              **diagnostic_comparison(overall[2], overall[3]),
+              "motion_unavailable": {"sample_tokens": sorted(missing),
+                                     **diagnostic_comparison(subsets[2], subsets[3])},
+              "provenance": prepared["provenance"], "test_isolation": prepared["provenance"]["data"]}
+    improvements = {}
+    for track, source in (("predicted_action", historical), ("gt_action_diagnostic", evaluated)):
+        previous = {r["sample_token"]: r for r in source[2]}
+        improvements[track] = {}
+        for key in ("ade_3s_m", "fde_3s_m"):
+            pairs = [(previous[r["sample_token"]][key], r[key]) for r in source[3]
+                     if previous[r["sample_token"]][key] is not None and r[key] is not None]
+            count = sum(b < a for a, b in pairs)
+            improvements[track][key] = {"improved_count": count, "paired_sample_count": len(pairs),
+                                       "improved_percentage": 100 * count / len(pairs) if pairs else None}
+    result["sample_level_improvement"] = improvements
+    for epoch in (2, 3):
+        full.write_predictions(output / f"epoch_{epoch}_gt_action_predictions.jsonl", evaluated[epoch])
+        write_json(output / f"epoch_{epoch}_gt_action_metrics.json", overall[epoch]["gt_action_diagnostic"])
+    write_json(output / "gt_action_diagnostic_comparison.json", result)
+    return result
