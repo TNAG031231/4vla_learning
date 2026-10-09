@@ -22,6 +22,9 @@ from src.phase0.qwen3vl_interface import FIXED_MODEL_ID, FIXED_REVISION
 from src.phase0.qwen3vl_lora_smoke import default_runtime_dependencies
 
 
+EPOCH1_OPTIMIZER_STEP = 3564
+
+
 @dataclass(frozen=True)
 class ConvergenceConfig(full.FullConfig):
     validation_schedule: str
@@ -120,8 +123,6 @@ def load_resume(output: Path, config: ConvergenceConfig) -> dict:
         raise ValueError("resume requires a convergence optimizer-state checkpoint")
     if saved["training_config"] != asdict(config) or saved["epoch"] != 3:
         raise ValueError("resume requires this protocol's epoch-3 optimizer checkpoint")
-    if not reproduction_gate(saved["epochs"][0]["metrics"], config)["passed"]:
-        raise ValueError("epoch-1 reproduction gate failed")
     if not extension_gate(saved["epochs"], config)["allowed"]:
         raise ValueError("epoch-4/5 extension gate failed; STOP at epoch 3")
     if not saved["optimizer_state_dict"]["state"]:
@@ -131,6 +132,57 @@ def load_resume(output: Path, config: ConvergenceConfig) -> dict:
     summary = json.loads((output / "training_summary.json").read_text())
     if summary["status"] != "convergence_training_completed" or len(summary["epochs"]) != 3:
         raise ValueError("resume requires a successfully completed three-epoch run")
+    if not reproduction_gate(saved["epochs"][0]["metrics"], config)["passed"]:
+        for evidence in (saved["provenance"], summary):
+            if (evidence.get("historical_epoch1_reproduction_passed") is not False
+                    or evidence.get("continuation_after_failed_historical_reproduction") is not True):
+                raise ValueError("epoch-1 reproduction failed without explicit continuation evidence")
+    return saved
+
+
+def load_failed_epoch1(output: Path, config: ConvergenceConfig) -> dict:
+    required = ("epoch_1.pt", "epoch_1_metrics.json", "epoch_1_predictions.jsonl",
+                "epoch1_reproduction.json", "epoch_comparison.json", "resolved_config.json",
+                "run_metadata.json", "training_history.jsonl")
+    for name in required:
+        if not (output / name).is_file():
+            raise ValueError(f"failed-epoch1 continuation requires {name}")
+    if (any(output.glob("epoch_[2345]*")) or (output / "training_summary.json").exists()
+            or (output / "continuation_metadata.json").exists()
+            or (output / "extension_metadata.json").exists()):
+        raise ValueError("continuation rejects existing epoch-2/3 or later/partial run artifacts")
+    gate = json.loads((output / "epoch1_reproduction.json").read_text())
+    if gate["passed"] is not False:
+        raise ValueError("special continuation requires failed epoch-1 reproduction")
+    saved = torch.load(output / "epoch_1.pt", map_location="cpu", weights_only=True)
+    for key in ("epoch", "optimizer_step", "planner_state_dict", "optimizer_state_dict",
+                "torch_rng_state", "cuda_rng_state", "training_config", "provenance", "epochs"):
+        if key not in saved:
+            raise ValueError(f"epoch-1 checkpoint missing {key}")
+    if saved["epoch"] != 1 or saved["optimizer_step"] != EPOCH1_OPTIMIZER_STEP:
+        raise ValueError("epoch-1 checkpoint epoch/optimizer_step mismatch")
+    if not saved["planner_state_dict"] or not saved["optimizer_state_dict"].get("state"):
+        raise ValueError("continuation requires planner and nonempty AdamW state")
+    if (not isinstance(saved["torch_rng_state"], torch.Tensor)
+            or saved["torch_rng_state"].numel() == 0 or not isinstance(saved["cuda_rng_state"], list)):
+        raise ValueError("continuation requires valid torch/CUDA RNG state")
+    if torch.cuda.is_available() and len(saved["cuda_rng_state"]) != torch.cuda.device_count():
+        raise ValueError("CUDA RNG state does not match current devices")
+    resolved = json.loads((output / "resolved_config.json").read_text())
+    if saved["training_config"] != asdict(config) or resolved != asdict(config):
+        raise ValueError("continuation training config mismatch")
+    metrics = json.loads((output / "epoch_1_metrics.json").read_text())
+    epochs = saved["epochs"]
+    if (len(epochs) != 1 or epochs[0]["epoch"] != 1
+            or epochs[0]["optimizer_step"] != EPOCH1_OPTIMIZER_STEP
+            or epochs[0]["metrics"] != metrics):
+        raise ValueError("checkpoint epoch-1 history/metrics mismatch")
+    if (metrics["sample_count"] != config.expected_validation_count
+            or metrics["valid_prediction_count"] != config.expected_validation_count
+            or metrics["invalid_prediction_count"] != 0):
+        raise ValueError("epoch-1 validation coverage mismatch")
+    if reproduction_gate(metrics, config)["passed"]:
+        raise ValueError("special continuation requires failed historical reproduction metrics")
     return saved
 
 
@@ -156,7 +208,8 @@ def train_group(planner: WaypointDecoder, runner: full.PlannerRunner, group: lis
 
 def fit(*, model: nn.Module, planner: WaypointDecoder, runner: full.PlannerRunner,
         train: list[SFTSample], validation: list[SFTSample], records: dict,
-        config: ConvergenceConfig, output: Path, provenance: dict, resume: dict | None = None) -> dict:
+        config: ConvergenceConfig, output: Path, provenance: dict, resume: dict | None = None,
+        continue_after_epoch1_reproduction_fail: bool = False) -> dict:
     if not train or any(s.split != "train" for s in train):
         raise ValueError("optimization requires train samples only")
     if not validation or any(s.split != "validation" for s in validation):
@@ -166,6 +219,10 @@ def fit(*, model: nn.Module, planner: WaypointDecoder, runner: full.PlannerRunne
     optimizer = torch.optim.AdamW(planner.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     provenance = {**provenance, "freeze_policy": full.verify_freeze(model, planner, optimizer),
                   "Direct multi-epoch control": "NOT RUN"}
+    if continue_after_epoch1_reproduction_fail and (resume is None or resume["epoch"] != 1):
+        raise ValueError("explicit failed-reproduction continuation requires epoch 1")
+    if resume is not None and resume["epoch"] == 1 and not continue_after_epoch1_reproduction_fail:
+        raise ValueError("epoch-1 resume requires explicit failed-reproduction continuation")
     start, step, epochs = 0, 0, []
     if resume is not None:
         if resume["provenance"]["data"] != provenance["data"]:
@@ -177,8 +234,15 @@ def fit(*, model: nn.Module, planner: WaypointDecoder, runner: full.PlannerRunne
         if resume["cuda_rng_state"]:
             torch.cuda.set_rng_state_all(resume["cuda_rng_state"])
         provenance["initial_run_provenance"] = resume["provenance"]
-    write_json(output / ("extension_metadata.json" if resume else "run_metadata.json"), provenance)
-    end = 5 if resume is not None else config.num_train_epochs
+        provenance["historical_epoch1_reproduction_passed"] = reproduction_gate(epochs[0]["metrics"], config)["passed"]
+        provenance["continuation_after_failed_historical_reproduction"] = (
+            continue_after_epoch1_reproduction_fail
+            or resume["provenance"].get("continuation_after_failed_historical_reproduction", False))
+    end = 5 if start == 3 else config.num_train_epochs
+    provenance["convergence_evidence_scope"] = f"within_run_epoch1_to_epoch{end}"
+    metadata = ("continuation_metadata.json" if continue_after_epoch1_reproduction_fail
+                else "extension_metadata.json" if resume else "run_metadata.json")
+    write_json(output / metadata, provenance)
     with (output / "training_history.jsonl").open("a" if resume else "w") as history:
         for epoch in range(start, end):
             epoch_loss, consumed = 0., 0
@@ -210,12 +274,21 @@ def fit(*, model: nn.Module, planner: WaypointDecoder, runner: full.PlannerRunne
                 key: (entry["minus_epoch1"][key] < 0 and subset["minus_epoch1"][key] > 0)
                 if entry["minus_epoch1"][key] is not None and subset["minus_epoch1"][key] is not None else None
                 for key in config.motion_planner_reference}
+            if epochs:
+                keys = (*config.epoch1_reference, "ade_m", "fde_m", "invalid_prediction_count")
+                entry["minus_epoch1"] = deltas(metrics, {k: epochs[0]["metrics"][k] for k in keys})
+                entry["minus_previous_epoch"] = deltas(metrics, {k: epochs[-1]["metrics"][k] for k in keys})
+                subset["minus_previous_epoch"] = deltas(subset["metrics"], {
+                    k: epochs[-1]["motion_unavailable"]["metrics"][k] for k in config.motion_planner_reference})
+            else:
+                gate = reproduction_gate(metrics, config)
+                provenance["historical_epoch1_reproduction_passed"] = gate["passed"]
+                provenance["continuation_after_failed_historical_reproduction"] = False
             epochs.append(entry)
             save_checkpoint(output / f"{name}.pt", planner, optimizer, config, provenance, epoch + 1, step, epochs)
             write_json(output / "epoch_comparison.json", epochs)
             print(json.dumps(entry, allow_nan=False), flush=True)
             if epoch == 0:
-                gate = reproduction_gate(metrics, config)
                 write_json(output / "epoch1_reproduction.json", gate)
                 if not gate["passed"]:
                     raise ValueError("epoch-1 reproduction failed; STOP before epoch 2")
@@ -237,29 +310,38 @@ def fit(*, model: nn.Module, planner: WaypointDecoder, runner: full.PlannerRunne
     result = {"status": "convergence_training_completed", "epochs": epochs, "best_epoch": best["epoch"],
               "extension_gate": extension_gate(epochs, config), "optimizer_steps": step,
               "Direct multi-epoch control": "NOT RUN", "test_isolation": provenance["data"],
-              "reload_consistency": consistency, "provenance": provenance}
+              "reload_consistency": consistency, "provenance": provenance,
+              **{key: provenance[key] for key in (
+                  "historical_epoch1_reproduction_passed", "continuation_after_failed_historical_reproduction",
+                  "convergence_evidence_scope")}}
     write_json(output / "training_summary.json", result)
     return result
 
 
 def run(*, repository: Path, dataset_root: Path, derived_root: Path, config: ConvergenceConfig,
         git_provenance: GitProvenance, extend_to_five: bool = False,
+        continue_after_epoch1_reproduction_fail: bool = False,
         train_split: str = "train", validation_split: str = "validation") -> dict:
     if train_split != "train" or validation_split != "validation":
         raise ValueError("convergence requires train/validation only")
+    if extend_to_five and continue_after_epoch1_reproduction_fail:
+        raise ValueError("failed-epoch1 continuation and extend-to-five are mutually exclusive")
     git = validate_git_provenance(git_provenance)
     output = resolve_derived_path(derived_root, config.output_relative_dir)
     if output.is_relative_to(repository.resolve()):
         raise ValueError("planner artifacts must be outside repository")
-    if output.exists() and not extend_to_five:
+    if output.exists() and not (extend_to_five or continue_after_epoch1_reproduction_fail):
         raise FileExistsError(f"convergence output already exists: {output}")
     resume = load_resume(output, config) if extend_to_five else None
+    if continue_after_epoch1_reproduction_fail:
+        resume = load_failed_epoch1(output, config)
     inputs = prepare_run(repository, dataset_root, derived_root, config, git)
-    if not extend_to_five:
+    if resume is None:
         output.mkdir(parents=True)
         write_json(output / "resolved_config.json", asdict(config))
         write_json(output / "data_summary.json", inputs["provenance"]["data"])
-    return fit(**inputs, config=config, output=output, resume=resume)
+    return fit(**inputs, config=config, output=output, resume=resume,
+               continue_after_epoch1_reproduction_fail=continue_after_epoch1_reproduction_fail)
 
 
 def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,

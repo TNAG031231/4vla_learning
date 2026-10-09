@@ -23,8 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dataset-root", type=Path, default=os.environ.get("NUSCENES_ROOT"))
     parser.add_argument("--derived-root", type=Path, default=os.environ.get("VLA_DERIVED_ROOT"))
     parser.add_argument("--dry-run", action="store_true", help="validate config without data/model access")
-    parser.add_argument("--extend-to-five", action="store_true",
-                        help="resume epoch_3 with optimizer/RNG state after the extension gate passes")
+    continuation = parser.add_mutually_exclusive_group()
+    continuation.add_argument("--continue-after-epoch1-reproduction-fail", action="store_true",
+                              help="resume failed historical reproduction from epoch_1 for epochs 2–3")
+    continuation.add_argument("--extend-to-five", action="store_true",
+                              help="resume epoch_3 with optimizer/RNG state after the extension gate passes")
     args = parser.parse_args(argv)
     config = load_config(args.config)
     if args.dry_run:
@@ -35,7 +38,8 @@ def main(argv: list[str] | None = None) -> int:
     result = run(repository=ROOT, dataset_root=args.dataset_root, derived_root=args.derived_root,
                  config=config, git_provenance=collect_git_provenance(ROOT),
                  train_split=args.train_split, validation_split=args.validation_split,
-                 extend_to_five=args.extend_to_five)
+                 extend_to_five=args.extend_to_five,
+                 continue_after_epoch1_reproduction_fail=args.continue_after_epoch1_reproduction_fail)
     print(json.dumps(result, indent=2, allow_nan=False))
     return 0
 

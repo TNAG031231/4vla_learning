@@ -67,6 +67,7 @@ def test_protocol_rejects_changes(config, tmp_path, key, value):
 
 
 def test_production_protocol(config):
+    assert convergence.EPOCH1_OPTIMIZER_STEP == 3564
     assert config.num_train_epochs == 3
     assert config.validation_schedule == "epoch_end"
     assert config.reproduction_rtol == config.extension_min_relative_improvement == .01
@@ -306,3 +307,148 @@ def test_local_preparation_matches_historical_initialization(config, data, tmp_p
     assert_state_equal(historical["model"].state_dict(), local["model"].state_dict())
     assert not any(p.requires_grad for p in local["model"].parameters())
     assert local["runner"].generation_kwargs == historical["runner"].generation_kwargs
+
+
+@pytest.fixture
+def failed_run(synthetic, data, tmp_path, monkeypatch):
+    config, _ = synthetic
+    config = replace(config, epoch1_reference={k: v * 2 for k, v in config.epoch1_reference.items()})
+    kwargs = dict(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path,
+                  config=config, git_provenance=None)
+    monkeypatch.setattr(convergence, "validate_git_provenance", lambda p: SimpleNamespace(commit="synthetic"))
+    monkeypatch.setattr(convergence, "prepare_run", lambda *a: inputs(config, data))
+    with pytest.raises(ValueError, match="STOP before epoch 2"):
+        convergence.run(**kwargs)
+    output = tmp_path / config.output_relative_dir
+    # Scale the fixed step boundary only for the four-sample synthetic producer.
+    monkeypatch.setattr(convergence, "EPOCH1_OPTIMIZER_STEP", 2)
+    return config, output, kwargs
+
+
+def snapshot(output):
+    return {path.name: path.read_bytes() for path in output.iterdir() if path.is_file()}
+
+
+def test_failed_continuation_exact_state_and_immutable_epoch1(failed_run, data, tmp_path, monkeypatch):
+    config, output, kwargs = failed_run
+    before = snapshot(output)
+    oracle = tmp_path / "uninterrupted"
+    oracle.mkdir()
+    original_gate = convergence.reproduction_gate
+    # The oracle bypasses only the STOP decision so the identical failed-reference run can reach epoch 3.
+    with monkeypatch.context() as control:
+        control.setattr(convergence, "reproduction_gate", lambda *a: {**original_gate(*a), "passed": True})
+        convergence.fit(**inputs(config, data), config=config, output=oracle)
+    prepared = inputs(config, data)
+    monkeypatch.setattr(convergence, "prepare_run", lambda *a: prepared)
+    result = convergence.run(**kwargs, continue_after_epoch1_reproduction_fail=True)
+    assert len([c for c in prepared["runner"].calls if c[0] == "train"]) == 2 * len(data[0])
+    for name in ("epoch_1.pt", "epoch_1_metrics.json", "epoch_1_predictions.jsonl",
+                 "epoch1_reproduction.json", "resolved_config.json", "run_metadata.json"):
+        assert (output / name).read_bytes() == before[name]
+    assert (output / "training_history.jsonl").read_bytes().startswith(before["training_history.jsonl"])
+    assert (output / "training_history.jsonl").read_bytes() == (oracle / "training_history.jsonl").read_bytes()
+    for epoch in (2, 3):
+        actual = torch.load(output / f"epoch_{epoch}.pt", weights_only=True)
+        expected = torch.load(oracle / f"epoch_{epoch}.pt", weights_only=True)
+        for key in ("planner_state_dict", "optimizer_state_dict", "torch_rng_state", "cuda_rng_state",
+                    "optimizer_step", "epoch", "epochs"):
+            assert_state_equal(actual[key], expected[key])
+        for suffix in ("metrics.json", "predictions.jsonl"):
+            assert (output / f"epoch_{epoch}_{suffix}").read_bytes() == (oracle / f"epoch_{epoch}_{suffix}").read_bytes()
+    assert result["historical_epoch1_reproduction_passed"] is False
+    assert result["continuation_after_failed_historical_reproduction"] is True
+    assert result["convergence_evidence_scope"] == "within_run_epoch1_to_epoch3"
+    assert result["Direct multi-epoch control"] == "NOT RUN"
+    assert result["test_isolation"]["test_records_read"] == 0
+    first, second, third = result["epochs"]
+    assert third["minus_previous_epoch"]["ade_3s_m"] == third["metrics"]["ade_3s_m"] - second["metrics"]["ade_3s_m"]
+    assert third["minus_epoch1"]["ade_m"] == third["metrics"]["ade_m"] - first["metrics"]["ade_m"]
+    assert not (output / "epoch_4.pt").exists()
+    with pytest.raises(ValueError, match="partial"):
+        convergence.run(**kwargs, continue_after_epoch1_reproduction_fail=True)
+
+
+@pytest.mark.parametrize("failure", [
+    "optimizer_state_dict", "empty_optimizer", "planner_state_dict", "torch_rng_state", "cuda_rng_state",
+    "epoch", "optimizer_step", "config", "sample_count", "valid_prediction_count", "invalid_prediction_count",
+    "passed", "epoch_2.pt", "epoch_3.pt", "epoch_2_metrics.json", "epoch_3_predictions.jsonl",
+    "training_summary.json", "continuation_metadata.json", "missing_file", "data_provenance",
+])
+def test_failed_continuation_rejects_before_mutation(failed_run, data, monkeypatch, failure):
+    config, output, kwargs = failed_run
+    path = output / "epoch_1.pt"
+    saved = torch.load(path, weights_only=True)
+    if failure in ("optimizer_state_dict", "planner_state_dict", "torch_rng_state", "cuda_rng_state"):
+        del saved[failure]
+    elif failure == "empty_optimizer":
+        saved["optimizer_state_dict"]["state"] = {}
+    elif failure in ("epoch", "optimizer_step"):
+        saved[failure] += 1
+    elif failure == "config":
+        saved["training_config"]["seed"] += 1
+    elif failure in ("sample_count", "valid_prediction_count", "invalid_prediction_count"):
+        saved["epochs"][0]["metrics"][failure] += 1
+        convergence.write_json(output / "epoch_1_metrics.json", saved["epochs"][0]["metrics"])
+    elif failure == "passed":
+        convergence.write_json(output / "epoch1_reproduction.json", {"passed": True})
+    elif failure == "missing_file":
+        (output / "epoch_1_metrics.json").unlink()
+    elif failure == "data_provenance":
+        saved["provenance"]["data"]["train"]["eligible_records"] += 1
+    else:
+        (output / failure).write_text("{}")
+    torch.save(saved, path)
+    before = snapshot(output)
+    if failure == "data_provenance":
+        monkeypatch.setattr(convergence, "prepare_run", lambda *a: inputs(config, data))
+    else:
+        monkeypatch.setattr(convergence, "prepare_run", lambda *a: pytest.fail("data/model accessed"))
+    with pytest.raises(ValueError):
+        convergence.run(**kwargs, continue_after_epoch1_reproduction_fail=True)
+    assert snapshot(output) == before
+
+
+def test_continuation_cli_conflict_and_missing_run(config, tmp_path, monkeypatch):
+    with pytest.raises(SystemExit):
+        cli.main(["--continue-after-epoch1-reproduction-fail", "--extend-to-five", "--dry-run"])
+    for option in ("--train-split", "--validation-split"):
+        with pytest.raises(SystemExit):
+            cli.main(["--continue-after-epoch1-reproduction-fail", option, "test"])
+    monkeypatch.setattr(convergence, "prepare_run", lambda *a: pytest.fail("data/model accessed"))
+    monkeypatch.setattr(convergence, "validate_git_provenance", lambda p: SimpleNamespace(commit="synthetic"))
+    kwargs = dict(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path,
+                  config=config, git_provenance=None, continue_after_epoch1_reproduction_fail=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        convergence.run(**kwargs, extend_to_five=True)
+    with pytest.raises(ValueError, match="requires epoch_1.pt"):
+        convergence.run(**kwargs)
+    with pytest.raises(ValueError, match="train/validation only"):
+        convergence.run(**kwargs, validation_split="test")
+    assert not (tmp_path / config.output_relative_dir).exists()
+
+
+def test_failed_continuation_can_extend_without_erasing_failure(failed_run):
+    config, output, kwargs = failed_run
+    convergence.run(**kwargs, continue_after_epoch1_reproduction_fail=True)
+    path = output / "epoch_3.pt"
+    saved = torch.load(path, weights_only=True)
+    # Isolate the extension gate with controlled validation metrics on producer-generated state.
+    for epoch, factor in zip(saved["epochs"][1:], (1., .98)):
+        for key in ("ade_3s_m", "fde_3s_m"):
+            epoch["metrics"][key] = config.epoch1_reference[key] * factor
+    torch.save(saved, path)
+    assert convergence.load_resume(output, config)["epoch"] == 3
+    unapproved = deepcopy(saved)
+    unapproved["provenance"].pop("continuation_after_failed_historical_reproduction")
+    torch.save(unapproved, path)
+    with pytest.raises(ValueError, match="explicit continuation evidence"):
+        convergence.load_resume(output, config)
+    torch.save(saved, path)
+    before = (output / "epoch1_reproduction.json").read_bytes()
+    result = convergence.run(**kwargs, extend_to_five=True)
+    assert result["epochs"][-1]["epoch"] == 5
+    assert result["historical_epoch1_reproduction_passed"] is False
+    assert result["continuation_after_failed_historical_reproduction"] is True
+    assert result["provenance"]["historical_epoch1_reproduction_passed"] is False
+    assert (output / "epoch1_reproduction.json").read_bytes() == before
