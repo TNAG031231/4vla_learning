@@ -395,6 +395,53 @@ CV 比较使用 **3500** 个共同有效样本；不能将此分母下的数值�
 - `stop` cannot be treated as evidence of multimodal visual benefit because Constant Velocity is especially strong on this subset.
 - Phase 0.4c-5 does not justify an architecture change by itself.
 
+## Phase 0.4c-6A Action-Conditioned Planner Convergence Audit
+
+- 真实 AutoDL Epoch 1–3 与 Epoch 2/3 GT-action diagnostic 均已完成；以下指标及运行核验来自用户提供的真实执行结果，本次 factual closeout 未重新训练、运行诊断或独立重算外部 artifacts。实现对应 PR #52（OPEN / Draft / NOT MERGED），诊断实现 commit 为 `27a9bd067ea6e2c36aa14b135ff8903ebdbb5dae`；不将该 commit 冒充未经独立核验的远端 runtime commit。
+- 配置：`configs/phase0_4c_convergence.yaml`；protocol 为 `phase0.4c-action-conditioned-convergence-v0.1`，冻结 Qwen/LoRA、WaypointDecoder architecture、LR 与数据协议。训练 conditioning 为 `gt_action_teacher_forced_train`，正式 validation 为 `predicted_action`，oracle 诊断为 `gt_action_diagnostic`。
+- Artifact 目录：`$VLA_DERIVED_ROOT/phase_0_4/action_conditioned_convergence_v0_1/`；已有 `epoch_1.pt`、`epoch_2.pt`、`epoch_3.pt`、对应 `epoch_{1,2,3}_metrics.json` / `epoch_{1,2,3}_predictions.jsonl`、`training_summary.json`，以及 `epoch_{2,3}_gt_action_metrics.json` / `epoch_{2,3}_gt_action_predictions.jsonl` 和 `gt_action_diagnostic_comparison.json`；全部保留在 derived output，不提交 Git。
+- Historical reference ADE/FDE@3s 为 `1.1878918724 / 2.3371623162`；本轮 Epoch 1 为 `1.248157 / 2.425711`，1% historical reproduction gate **FAILED**：`historical_epoch1_reproduction_passed=false`、`continuation_after_failed_historical_reproduction=true`。用户已确认 validation coverage、sample order、optimizer-step protocol、config / dataset protocol 一致；BF16 / GPU numerical nondeterminism、dropout、SDPA、AdamW 等引起数值路径分叉是当前合理解释，具体归因仍未验证。本次保留阈值和失败事实，科学证据范围为 **within-run Epoch 1 → 2 → 3**，不继续追求 bitwise reproduction。
+
+正式 predicted-action validation：**3594 / 3594 valid，invalid = 0**；误差单位 m。
+
+| Epoch | Train loss | ADE@3s | FDE@3s |
+| --- | --- | --- | --- |
+| 1 | 0.792669 | 1.248157 | 2.425711 |
+| 2 | 0.343750 | 0.992346 | 2.035392 |
+| 3 | 0.282169 | 1.078463 | 2.142418 |
+
+- Epoch 1 → 2：ADE/FDE@3s 分别改善约 **20.5% / 16.1%**，支持当前 run 的 one-epoch trajectory decoder 训练不足；`best_epoch=2`，selected checkpoint 为 `epoch_2.pt`。
+- Epoch 2 → 3：train loss 继续下降，但 ADE/FDE@3s 分别恶化约 **8.68% / 5.26%**；`extension_gate.allowed=false`，Epoch 4–5 **NOT RUN，当前协议下禁止执行**。
+- Sample-level：Epoch 3 的 ADE@3s 改善 **1312 / 3594（约 36.5%）**，FDE@3s 改善 **1354 / 3594（约 37.7%）**；其余约 62–63% 未改善，支持回退分布广泛，不能仅用少量 outlier 解释。用户提供的 action-mode 分析显示 `keep + straight`、`stop + straight` 明显回退，部分 accelerate modes 仍改善，存在 mode 间 trade-off；改善计数本身不区分持平与变差。
+
+GT-action oracle diagnostic 与 MLP reference：
+
+| Track / model | Epoch | ADE@3s | FDE@3s |
+| --- | --- | --- | --- |
+| Qwen Planner, gt_action_diagnostic | 2 | 0.810181 | 1.541940 |
+| Qwen Planner, gt_action_diagnostic | 3 | 0.928545 | 1.748152 |
+| Ego-History MLP reference | — | 0.8145325565 | 1.7724578323 |
+
+- GT-action Epoch 2 → 3：ADE/FDE@3s 同样恶化 **14.61% / 13.37%**；正式诊断为 `diagnostic=case_b`、`teacher_forcing_predicted_action_mismatch_supported=false`、`ordinary_overfitting_or_generalization_regression_supported=true`。当前证据不支持 teacher-forcing / predicted-action mismatch 是 Epoch-3 regression 的主要解释，更支持 Epoch 2 后 planner generalization regression / overfitting；这是诊断支持，不是唯一机制的因果证明。
+- Epoch 2 GT action 相对 predicted action 的 ADE/FDE@3s 改善约 **18.4% / 24.2%**，表明 semantic-action prediction error 是当前正式 inference pipeline 的实际性能瓶颈；该瓶颈与 Epoch-3 regression 的解释须区分。
+- 正式 predicted-action Qwen Planner 总体仍落后于 MLP；GT-action Epoch-2 Planner 的 ADE 约好 **0.5%**、FDE 约好 **13%**，仅支持当前 validation protocol 下 Qwen multimodal representation + correct semantic action + WaypointDecoder 达到近似相同 ADE 和更好 FDE。GT action 属于 oracle diagnostic，不能声称正式 inference 已超过 MLP 或 Qwen representation 普遍优于 ego-history。
+
+固定 `motion_availability=unavailable` 子集 **n=94**：
+
+| Track / model | Epoch | ADE@3s | FDE@3s |
+| --- | --- | --- | --- |
+| Qwen Planner, predicted_action | 1 | 3.2492 | 5.7719 |
+| Qwen Planner, predicted_action | 2 | 3.1951 | 5.3426 |
+| Qwen Planner, predicted_action | 3 | 3.5751 | 6.0392 |
+| Qwen Planner, gt_action_diagnostic | 2 | 3.0173 | 4.9477 |
+| Qwen Planner, gt_action_diagnostic | 3 | 3.4849 | 5.8858 |
+| Ego-History MLP reference | — | 5.4648598499 | 9.4919450641 |
+
+- 子集 Epoch 2 → 3：predicted-action ADE/FDE 恶化约 **11.9% / 13.0%**，GT-action 仍恶化约 **15.5% / 19.0%**，因此 predicted-action error 也不能单独解释子集回退。Epoch-2 Qwen multimodal pathway 在当前 ego-motion information unavailable 时仍显著强于 MLP，体现 complementary capability；不能归因为 vision alone solves planning。
+- 当前证据 **supports the hypothesis** that ego-history dynamics and Qwen multimodal representation may be complementary rather than substitutes；尚非因果结论。
+- 本阶段 `test split access=0`；本次 factual closeout 未新增训练或 GPU 执行。
+- **Next gate：** 先完成 PR #52 review、merge 与 merge 后的 Learning & Capability Closeout comment，再从更新后的 `main` 创建独立任务分支研究 No-action ablation（predicted action / GT action / no action），拆分 representation 与 semantic-action contribution。`No-action ablation: NOT STARTED`；本 PR 不实现该实验，不改 architecture / LR，不重训 Epoch 1–3，不执行 Epoch 4–5，不访问 test。
+
 ## Next Gate
 
 - Phase 0.4c-4 baseline suite gate 已 `PASS`；PR #50 保持 OPEN / Draft / unmerged，等待后续审阅与合并后的 Learning & Capability Closeout；Phase 0.4d 尚未启动。
