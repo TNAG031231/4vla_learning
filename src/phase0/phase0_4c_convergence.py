@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -20,6 +21,10 @@ from src.phase0.qwen3vl_dataset_adapter import (
 )
 from src.phase0.qwen3vl_interface import FIXED_MODEL_ID, FIXED_REVISION
 from src.phase0.qwen3vl_lora_smoke import default_runtime_dependencies
+
+if TYPE_CHECKING:
+    from src.phase0.phase0_4c_direct_waypoint import DirectSample
+    from src.phase0.phase0_4c_no_action import NeutralRunner
 
 
 EPOCH1_OPTIMIZER_STEP = 3564
@@ -188,13 +193,15 @@ def load_failed_epoch1(output: Path, config: ConvergenceConfig) -> dict:
     return saved
 
 
-def train_group(planner: WaypointDecoder, runner: full.PlannerRunner, group: list[SFTSample],
-                records: dict, config: ConvergenceConfig, optimizer: torch.optim.Optimizer) -> float:
+def train_group(planner: WaypointDecoder, runner: full.PlannerRunner | NeutralRunner,
+                group: list[SFTSample] | list[DirectSample],
+                records: dict, config: full.FullConfig, optimizer: torch.optim.Optimizer,
+                conditioning_type: str = "gt_action_teacher_forced_train") -> float:
     planner.train()
     optimizer.zero_grad(set_to_none=True)
     loss_sum = 0.0
     for sample in group:
-        prediction, _ = runner.predict(planner, sample, "gt_action_teacher_forced_train")
+        prediction, _ = runner.predict(planner, sample, conditioning_type)
         row = records[sample.sample_token]
         target = torch.tensor([row["future_waypoints"]], device=runner.device, dtype=torch.float32)
         mask = torch.tensor([row["trajectory_valid_mask"]], device=runner.device, dtype=torch.bool)
@@ -347,8 +354,9 @@ def run(*, repository: Path, dataset_root: Path, derived_root: Path, config: Con
 
 
 def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,
-                config: ConvergenceConfig, git: GitProvenance) -> dict:
-    train, validation, records, data = full.prepare_data(repository, derived_root)
+                config: full.FullConfig, git: GitProvenance, *, prepared_data: tuple | None = None) -> dict:
+    train, validation, records, data = (
+        full.prepare_data(repository, derived_root) if prepared_data is None else prepared_data)
     semantic = load_semantic_config(repository / "configs/phase0_4b_lora_full.yaml")
     runtime = default_runtime_dependencies()
     device = runtime.device_selector("cuda:0")
