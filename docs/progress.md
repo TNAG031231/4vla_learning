@@ -397,7 +397,7 @@ CV 比较使用 **3500** 个共同有效样本；不能将此分母下的数值�
 
 ## Phase 0.4c-6A Action-Conditioned Planner Convergence Audit
 
-- 真实 AutoDL Epoch 1–3 与 Epoch 2/3 GT-action diagnostic 均已完成；以下指标及运行核验来自用户提供的真实执行结果，本次 factual closeout 未重新训练、运行诊断或独立重算外部 artifacts。实现对应 PR #52（OPEN / Draft / NOT MERGED），诊断实现 commit 为 `27a9bd067ea6e2c36aa14b135ff8903ebdbb5dae`；不将该 commit 冒充未经独立核验的远端 runtime commit。
+- 真实 AutoDL Epoch 1–3 与 Epoch 2/3 GT-action diagnostic 均已完成；以下指标及运行核验来自用户提供的真实执行结果，6A factual closeout 未重新训练、运行诊断或独立重算外部 artifacts。实现对应 PR #52，已核实于 2026-10-10 merged，merge commit 为 `cb3d6d073f9565ed419139d4fbe6b3bf9448bcc1`，其 Learning & Capability Closeout 已发布；诊断实现 commit 为 `27a9bd067ea6e2c36aa14b135ff8903ebdbb5dae`，不将该 commit 冒充未经独立核验的远端 runtime commit。
 - 配置：`configs/phase0_4c_convergence.yaml`；protocol 为 `phase0.4c-action-conditioned-convergence-v0.1`，冻结 Qwen/LoRA、WaypointDecoder architecture、LR 与数据协议。训练 conditioning 为 `gt_action_teacher_forced_train`，正式 validation 为 `predicted_action`，oracle 诊断为 `gt_action_diagnostic`。
 - Artifact 目录：`$VLA_DERIVED_ROOT/phase_0_4/action_conditioned_convergence_v0_1/`；已有 `epoch_1.pt`、`epoch_2.pt`、`epoch_3.pt`、对应 `epoch_{1,2,3}_metrics.json` / `epoch_{1,2,3}_predictions.jsonl`、`training_summary.json`，以及 `epoch_{2,3}_gt_action_metrics.json` / `epoch_{2,3}_gt_action_predictions.jsonl` 和 `gt_action_diagnostic_comparison.json`；全部保留在 derived output，不提交 Git。
 - Historical reference ADE/FDE@3s 为 `1.1878918724 / 2.3371623162`；本轮 Epoch 1 为 `1.248157 / 2.425711`，1% historical reproduction gate **FAILED**：`historical_epoch1_reproduction_passed=false`、`continuation_after_failed_historical_reproduction=true`。用户已确认 validation coverage、sample order、optimizer-step protocol、config / dataset protocol 一致；BF16 / GPU numerical nondeterminism、dropout、SDPA、AdamW 等引起数值路径分叉是当前合理解释，具体归因仍未验证。本次保留阈值和失败事实，科学证据范围为 **within-run Epoch 1 → 2 → 3**，不继续追求 bitwise reproduction。
@@ -440,7 +440,63 @@ GT-action oracle diagnostic 与 MLP reference：
 - 子集 Epoch 2 → 3：predicted-action ADE/FDE 恶化约 **11.9% / 13.0%**，GT-action 仍恶化约 **15.5% / 19.0%**，因此 predicted-action error 也不能单独解释子集回退。Epoch-2 Qwen multimodal pathway 在当前 ego-motion information unavailable 时仍显著强于 MLP，体现 complementary capability；不能归因为 vision alone solves planning。
 - 当前证据 **supports the hypothesis** that ego-history dynamics and Qwen multimodal representation may be complementary rather than substitutes；尚非因果结论。
 - 本阶段 `test split access=0`；本次 factual closeout 未新增训练或 GPU 执行。
-- **Next gate：** 先完成 PR #52 review、merge 与 merge 后的 Learning & Capability Closeout comment，再从更新后的 `main` 创建独立任务分支研究 No-action ablation（predicted action / GT action / no action），拆分 representation 与 semantic-action contribution。`No-action ablation: NOT STARTED`；本 PR 不实现该实验，不改 architecture / LR，不重训 Epoch 1–3，不执行 Epoch 4–5，不访问 test。
+- **后续状态：** PR #52 merge 与 [Learning & Capability Closeout](https://github.com/TNAG031231/4vla_learning/pull/52#issuecomment-6093914993) 已完成；独立 No-action ablation 的真实结果见 Phase 0.4c-6B。6A Epoch 4–5 未执行，历史复现失败事实与阈值保持不变。
+
+## Phase 0.4c-6B No-action Neutral-context Ablation
+
+- 状态：真实 AutoDL 两轮 training / validation 已完成，依据用户于 2026-10-11 提供的运行产物；本地在 `codex4vla_env` 中离线核验训练记录、逐样本预测和比较结果，未重新运行 GPU training / inference。PR #53 当前为 OPEN / Draft / NOT MERGED；运行 metadata 记录 `execution_git_commit=94005d9d737358b2279ab6361b1aeed64be8948a`，与本阶段实现 commit 一致。
+- 配置为 `configs/phase0_4c_no_action.yaml`，protocol 为 `phase0.4c-no-action-ablation-v0.1`；train / validation 均固定 `conditioning_type=no_action_neutral_context`、assistant context 为 `structured_action=unavailable`。保留 Observation 与第二轮 planning prompt，以及历史图像和 ego-state 文本；该路径不是 vision-only。使用既有 `adapter_step_3564`，Qwen / LoRA frozen，只训练 2,765,058 参数的 WaypointDecoder；AdamW LR / weight decay 均为 `1e-4`，micro batch 1、accumulation 4、constant scheduler，固定两轮和 `selection_policy=fixed_epoch_2`。
+- 产物位于 `$VLA_DERIVED_ROOT/phase_0_4/no_action_ablation_v0_1/`：每轮 predictions / metrics、training history / summary、config / metadata、input evidence、reload consistency、overall / motion-unavailable comparison。selected checkpoint 为 `epoch_2.pt`；本次导出包含 13 个 JSON / JSONL 文件，不含 checkpoint，未在本地重载真实模型。重载产物记录 `predictions_match=true`、`metrics_match=true`，范围为排序后的 **8 个 validation samples**，`atol=rtol=1e-5`；不表示全量重载验证。
+- 训练记录为连续 **7128 optimizer steps**，每轮 3564 steps；每轮均恰好覆盖 14,253 个唯一 train tokens，无重复或遗漏，按 group size 加权重算 train loss 与 summary 一致。两轮 validation 均为 **3594 samples / 140 scenes / 3594 valid / 0 invalid**，所有六个目标点均有效；两轮 token / scene / target / mask 一致，训练与验证 sample tokens 无交集。从坐标重算两轮汇总指标，最大绝对差异约 `1.4e-9 m`。
+- 本次同时读取用户提供的 6A Epoch-2 predicted / GT-action predictions、MLP validation predictions 和既有 6B predictions；核对四条路径的 exact token / scene / target / mask 后，复用正式 evaluator 重算 overall 与 94-sample comparison，均与保存产物一致（`atol=rtol=1e-6`），包括配对分母和 win / tie / loss counts。未重新读取原始 temporal dataset 或运行真实 artifact intake。
+- 运行 metadata / data summary 记录 `test_records_read=0`、`test_sample_records_read=0`、`test_images_opened=0`、`test_labels_read=0`、`test_evaluation_performed=false`；action generation、action values used for prediction / loss、future information inputs 均为 0。本地核验仅读取 train / validation 导出产物，不访问 test。
+
+No-action 两轮曲线（误差单位 m）：
+
+| Epoch | Train loss | ADE@3s | FDE@3s |
+| --- | --- | --- | --- |
+| 1 | 0.8124324591 | 1.2659729264 | 2.5845260163 |
+| 2 | 0.3971719728 | 0.9546736155 | 1.9473834548 |
+
+- Epoch 1 → 2：ADE / FDE 分别下降 **24.59% / 24.65%**；逐样本改善分别为 **2664 / 3594（74.12%）**和 **2468 / 3594（68.67%）**。Epoch 2 为预先固定选择，不据此声称完全收敛；No-action Epoch 3–5 未执行。
+
+相同 validation population 上的四路径比较（误差单位 m；GT-action 为 oracle diagnostic）：
+
+| 模型 / 条件 | Overall ADE@3s（n=3594） | Overall FDE@3s | Motion-unavailable ADE@3s（n=94） | Motion-unavailable FDE@3s |
+| --- | --- | --- | --- | --- |
+| No-action Epoch 2 | 0.9546736155 | 1.9473834548 | 3.0641864208 | 5.1251898268 |
+| Predicted-action Epoch 2 | 0.9923460145 | 2.0353924832 | 3.1950780949 | 5.3425974005 |
+| GT-action Epoch 2 | 0.8101812848 | 1.5419400823 | 3.0172564289 | 4.9477208177 |
+| Ego-History MLP | 0.8145325565 | 1.7724578323 | 5.4648598499 | 9.4919450641 |
+
+配对差值固定为 `no_action - reference`，负值表示 No-action 更好；相对差值的分母为 reference mean，所有比较 tie count 均为 0、excluded count 均为 0：
+
+| 范围 / reference | ADE delta (m) / relative delta | ADE win / loss | FDE delta (m) / relative delta | FDE win / loss |
+| --- | --- | --- | --- | --- |
+| Overall / predicted-action | -0.037672 / -3.80% | 1974 / 1620 | -0.088009 / -4.32% | 1754 / 1840 |
+| Overall / GT-action | +0.144492 / +17.83% | 1562 / 2032 | +0.405443 / +26.29% | 1300 / 2294 |
+| Overall / MLP | +0.140141 / +17.21% | 1438 / 2156 | +0.174926 / +9.87% | 1713 / 1881 |
+| Motion-unavailable / predicted-action | -0.130892 / -4.10% | 47 / 47 | -0.217408 / -4.07% | 48 / 46 |
+| Motion-unavailable / GT-action | +0.046930 / +1.56% | 41 / 53 | +0.177469 / +3.59% | 43 / 51 |
+| Motion-unavailable / MLP | -2.400673 / -43.93% | 66 / 28 | -4.366755 / -46.00% | 70 / 24 |
+
+- No-action 平均 ADE / FDE 略优于 predicted-action，但 overall FDE win rate 为 **48.80%**，不表示多数样本终点更准确；六项时域指标中五项更好，仅 ADE@1s 比 predicted-action 高约 **0.88%**。GT-action 相对 No-action 的 ADE / FDE 低 **15.14% / 20.82%**。结果符合本轮描述性的 `GT-action < No-action < predicted-action` 误差关系；两个 planner 分别训练，尚无多次运行稳定性或唯一因果归因证据。
+- No-action 在 motion-unavailable 子集相对 MLP 的优势仍然保留，支持显式 sample-specific action 不是该优势存在的必要条件。该路径含 action-trained LoRA、图像及 ego-state 文本，不能据此单独归因为视觉，也不能声称 Fusion 已有效。
+
+### 6B Post-hoc Action / History Diagnostic
+
+- 使用 6A Epoch-2 predicted / GT `action_context`，通过既有 parser 按纵向、横向是否匹配分组；GT context 与 Phase 0.4c-5 `sample_analysis.jsonl` 的 GT action 核对一致。以下为同一 validation population 的 post-hoc 描述性分析，不参与模型选择；每行格式为 ADE@3s / FDE@3s（m）。
+
+| Epoch-2 action correctness | n | No-action | Predicted-action | GT-action |
+| --- | --- | --- | --- | --- |
+| 纵向、横向均正确 | 2326 | 0.784239 / 1.528236 | 0.713807 / 1.324834 | 0.713807 / 1.324834 |
+| 仅纵向错误 | 942 | 1.203873 / 2.583935 | 1.477797 / 3.317474 | 0.907637 / 1.744930 |
+| 仅横向错误 | 185 | 1.241312 / 2.657064 | 1.222362 / 2.574706 | 1.174582 / 2.492763 |
+| 纵向、横向均错误 | 141 | 1.725298 / 3.677982 | 2.042232 / 4.484078 | 1.270817 / 2.519737 |
+
+- 动作全对组中，predicted / GT 两种条件的逐样本 ADE / FDE 完全一致，且均优于 No-action；仅纵向错误与双错组中，No-action 优于 predicted-action；仅横向错误组则仍为 predicted-action 略优。该分组支持分析纵向动作错误与规划退化的关系，不支持“所有 action 错误都应删除 conditioning”的统一规则。
+- 通过 sample token / scene 对齐既有 Phase 0.4c-5 `sample_analysis.jsonl`，确认 94 个 motion-unavailable 样本来自 **94 个不同 scenes**，且 `valid_history_count=1` 的样本为 **94 / 94**。当前导出缺少原始历史记录和 `unavailable_reason`，是否均为 scene-start 缺失仍待 temporal record 核验；不将此子集称为一般传感器失效实验。
+- **Next gate：** PR #53 的最终 diff review、merge 与 merge 后 Learning & Capability Closeout 尚未完成；Fusion / matched dynamics-only 的独立实现与正式执行尚未开始。后续研究目标是检验显式 ego-history 与多模态表征的增量及边界，不改变当前 test isolation、两轮结果或历史失败记录。
 
 ## Next Gate
 
