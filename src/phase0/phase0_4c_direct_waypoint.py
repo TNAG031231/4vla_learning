@@ -80,12 +80,15 @@ class DirectRunner:
         self.model, self.processor, self.runtime = model, processor, runtime
         self.dataset_root, self.device = dataset_root, device
 
+    def messages(self, observation: Observation, images: Sequence[object]) -> list[dict]:
+        return direct_messages(observation, images)
+
     def predict(self, planner: WaypointDecoder, sample: DirectSample) -> tuple[torch.Tensor, dict]:
         if sample.split not in ("train", "validation"):
             raise ValueError("Direct prediction requires train/validation")
         images = [self.runtime.image_loader(resolve_image_path(self.dataset_root, path))
                   for path in sample.observation.image_paths]
-        messages = direct_messages(sample.observation, images)
+        messages = self.messages(sample.observation, images)
         inputs = _move_batch(self.processor.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"), self.device)
         self.model.eval()
@@ -98,7 +101,7 @@ class DirectRunner:
 
 
 def evaluate(planner: WaypointDecoder, runner: DirectRunner, samples: list[DirectSample],
-             records: dict) -> tuple[dict, list[dict]]:
+             records: dict, conditioning_type: str = TRACK) -> tuple[dict, list[dict]]:
     if not samples or any(s.split != "validation" for s in samples):
         raise ValueError("Direct evaluation requires validation only")
     planner.eval()
@@ -110,10 +113,10 @@ def evaluate(planner: WaypointDecoder, runner: DirectRunner, samples: list[Direc
             target = torch.tensor(record["future_waypoints"], dtype=torch.float32)
             mask = torch.tensor(record["trajectory_valid_mask"], dtype=torch.bool)
             rows.append({"sample_token": sample.sample_token, "scene_token": sample.scene_token,
-                         "split": sample.split, "conditioning_type": TRACK, **evidence,
+                         "split": sample.split, "conditioning_type": conditioning_type, **evidence,
                          "target_waypoints": target.tolist(), "trajectory_valid_mask": mask.tolist(),
                          **prediction_metrics(prediction.detach().cpu().squeeze(0), target, mask)})
-    return aggregate_metrics(rows, TRACK), rows
+    return aggregate_metrics(rows, conditioning_type), rows
 
 
 def selection_key(metrics: dict, step: int) -> tuple[int, float, float, int]:
@@ -122,14 +125,15 @@ def selection_key(metrics: dict, step: int) -> tuple[int, float, float, int]:
     return metrics["invalid_prediction_count"], metrics["ade_m"], metrics["fde_m"], step
 
 
-def compare_reload(before: list[dict], after: list[dict]) -> dict:
+def compare_reload(before: list[dict], after: list[dict], conditioning_type: str = TRACK) -> dict:
     matched = [r["sample_token"] for r in before] == [r["sample_token"] for r in after]
     for a, b in zip(before, after):
         matched &= all(a[k] == b[k] for k in ("conditioning_type", "prediction_valid", "invalid_reason"))
         if a["prediction_valid"] and b["prediction_valid"]:
             matched &= torch.allclose(torch.tensor(a["predicted_waypoints"]), torch.tensor(b["predicted_waypoints"]),
                                       atol=1e-5, rtol=1e-5)
-    first, second = aggregate_metrics(before, TRACK), aggregate_metrics(after, TRACK)
+    first = aggregate_metrics(before, conditioning_type)
+    second = aggregate_metrics(after, conditioning_type)
     metrics_match = all(math.isclose(v, second[k], abs_tol=1e-5, rel_tol=1e-5)
                         if isinstance(v, float) and isinstance(second[k], float) else v == second[k]
                         for k, v in first.items())
