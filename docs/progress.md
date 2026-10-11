@@ -444,7 +444,7 @@ GT-action oracle diagnostic 与 MLP reference：
 
 ## Phase 0.4c-6B No-action Neutral-context Ablation
 
-- 状态：真实 AutoDL 两轮 training / validation 已完成，依据用户于 2026-10-11 提供的运行产物；本地在 `codex4vla_env` 中离线核验训练记录、逐样本预测和比较结果，未重新运行 GPU training / inference。PR #53 当前为 OPEN / Draft / NOT MERGED；运行 metadata 记录 `execution_git_commit=94005d9d737358b2279ab6361b1aeed64be8948a`，与本阶段实现 commit 一致。
+- 状态：真实 AutoDL 两轮 training / validation 已完成，依据用户于 2026-10-11 提供的运行产物；本地在 `codex4vla_env` 中离线核验训练记录、逐样本预测和比较结果，未重新运行 GPU training / inference。PR #53 已 merged，merge commit 为 `fd73872840dcd5e2371137adbd3a2e7d583261aa`；运行 metadata 记录 `execution_git_commit=94005d9d737358b2279ab6361b1aeed64be8948a`，与本阶段实现 commit 一致。
 - 配置为 `configs/phase0_4c_no_action.yaml`，protocol 为 `phase0.4c-no-action-ablation-v0.1`；train / validation 均固定 `conditioning_type=no_action_neutral_context`、assistant context 为 `structured_action=unavailable`。保留 Observation 与第二轮 planning prompt，以及历史图像和 ego-state 文本；该路径不是 vision-only。使用既有 `adapter_step_3564`，Qwen / LoRA frozen，只训练 2,765,058 参数的 WaypointDecoder；AdamW LR / weight decay 均为 `1e-4`，micro batch 1、accumulation 4、constant scheduler，固定两轮和 `selection_policy=fixed_epoch_2`。
 - 产物位于 `$VLA_DERIVED_ROOT/phase_0_4/no_action_ablation_v0_1/`：每轮 predictions / metrics、training history / summary、config / metadata、input evidence、reload consistency、overall / motion-unavailable comparison。selected checkpoint 为 `epoch_2.pt`；本次导出包含 13 个 JSON / JSONL 文件，不含 checkpoint，未在本地重载真实模型。重载产物记录 `predictions_match=true`、`metrics_match=true`，范围为排序后的 **8 个 validation samples**，`atol=rtol=1e-5`；不表示全量重载验证。
 - 训练记录为连续 **7128 optimizer steps**，每轮 3564 steps；每轮均恰好覆盖 14,253 个唯一 train tokens，无重复或遗漏，按 group size 加权重算 train loss 与 summary 一致。两轮 validation 均为 **3594 samples / 140 scenes / 3594 valid / 0 invalid**，所有六个目标点均有效；两轮 token / scene / target / mask 一致，训练与验证 sample tokens 无交集。从坐标重算两轮汇总指标，最大绝对差异约 `1.4e-9 m`。
@@ -496,7 +496,17 @@ No-action 两轮曲线（误差单位 m）：
 
 - 动作全对组中，predicted / GT 两种条件的逐样本 ADE / FDE 完全一致，且均优于 No-action；仅纵向错误与双错组中，No-action 优于 predicted-action；仅横向错误组则仍为 predicted-action 略优。该分组支持分析纵向动作错误与规划退化的关系，不支持“所有 action 错误都应删除 conditioning”的统一规则。
 - 通过 sample token / scene 对齐既有 Phase 0.4c-5 `sample_analysis.jsonl`，确认 94 个 motion-unavailable 样本来自 **94 个不同 scenes**，且 `valid_history_count=1` 的样本为 **94 / 94**。当前导出缺少原始历史记录和 `unavailable_reason`，是否均为 scene-start 缺失仍待 temporal record 核验；不将此子集称为一般传感器失效实验。
-- **Next gate：** PR #53 的最终 diff review、merge 与 merge 后 Learning & Capability Closeout 尚未完成；Fusion / matched dynamics-only 的独立实现与正式执行尚未开始。后续研究目标是检验显式 ego-history 与多模态表征的增量及边界，不改变当前 test isolation、两轮结果或历史失败记录。
+- **后续状态：** PR #53 已 merged，merge 后 [Learning & Capability Closeout](https://github.com/TNAG031231/4vla_learning/pull/53#issuecomment-6106784321) 已发布；独立 Fusion 实现见 Phase 0.4c-6C，真实 Fusion training / validation 尚未执行。
+
+## Phase 0.4c-6C Minimal Ego-query Fusion
+
+- 已实现独立入口 `scripts/run_phase0_4c_ego_fusion.py` 与配置 `configs/phase0_4c_ego_fusion.yaml`；这是本地实现与接口验证，不代表真实 AutoDL 训练完成。`--help` 已执行；`--dry-run` 在本地 producer-backed fixtures 上通过，真实数据 intake、GPU training / validation 尚未执行。
+- 模型沿用 frozen Qwen / LoRA 与固定 `structured_action=unavailable` context。过去至当前 3 帧 ego history 复用既有编码：每帧 speed / acceleration / yaw rate 的归一化数值、各自 availability 及 history mask，共 21 维；`Linear(21,128) -> GELU -> Linear(128,256)` 得到 ego embedding，并加到每个 learned waypoint query，再由既有 decoder cross-attend Qwen memory，输出 `[B,6,2]`。
+- Ego encoder 与 planner 共同训练，共 `2,800,898` parameters，比原 planner 增加 `35,840`；Qwen / LoRA 冻结。归一化仅拟合 train history，随 checkpoint 保存并在 reload 时复用；缺失数值沿用既有 zero + availability mask 编码。模型输入不包含 sample-specific action 或 future trajectory。
+- Fresh planner / ego encoder 固定训练 2 epochs、选择 Epoch 2，沿用 batch 1、accumulation 4、AdamW `lr=1e-4` / `weight_decay=1e-4`、constant scheduler 与 masked SmoothL1。独立输出目录为 `phase_0_4/ego_fusion_v0_1`，拒绝覆盖；每轮保存 checkpoint / predictions / metrics，并保存 normalization、history、summary 与 reload consistency。
+- 消费既有 No-action、predicted-action、GT-action diagnostic 与 Ego-History MLP predictions；核对 sample / scene / target / mask，生成 overall 3594 与 motion-unavailable 94 的比较。配对差值为 `fusion-reference`，负值表示误差下降；GT-action 始终为 oracle diagnostic。
+- 本地检查覆盖真实 processor + 随机小型 Qwen 的前向/反向、ego 参数更新、冻结 backbone、输入隔离、train-only normalization、两轮持久化与重载、比较产物和 rerun guard。共享接口保留原调用默认行为；既有 baseline、loss 与 evaluator 保持原实现。
+- 当前范围为最小 Fusion；未新增 matched dynamics-only 训练、多 seed、DiT / Flow Matching 或 test evaluation。Fusion 的 ADE / FDE、推理耗时、GPU 显存与是否改善既有 baseline 均待真实执行验证，不能据本地测试宣称多模态与动力学互补已经得到证明。
 
 ## Next Gate
 

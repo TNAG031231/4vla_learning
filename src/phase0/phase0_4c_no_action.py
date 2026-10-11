@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
@@ -95,16 +95,19 @@ def aligned_metrics(rows: list[dict], track: str, records: dict) -> dict[str, di
     return result
 
 
-def compare(models: dict[str, dict[str, dict]], tokens: list[str]) -> dict:
+def compare(models: dict[str, dict[str, dict]], tokens: list[str], *,
+            primary_track: str = TRACK, primary_name: str = "no_action") -> dict:
     overall = {track: aggregate_metrics([rows[t] for t in tokens], track)
                for track, rows in models.items()}
     pairs = {}
-    for track in REFERENCE_FILES:
+    for track in models:
+        if track == primary_track:
+            continue
         metrics = {}
         for key in ("ade_3s_m", "fde_3s_m"):
-            values = [(models[TRACK][t][key], models[track][t][key]) for t in tokens
-                      if models[TRACK][t]["prediction_valid"] and models[track][t]["prediction_valid"]
-                      and models[TRACK][t][key] is not None and models[track][t][key] is not None]
+            values = [(models[primary_track][t][key], models[track][t][key]) for t in tokens
+                      if models[primary_track][t]["prediction_valid"] and models[track][t]["prediction_valid"]
+                      and models[primary_track][t][key] is not None and models[track][t][key] is not None]
             differences = [a - b for a, b in values]
             count = len(values)
             delta = sum(differences) / count if count else None
@@ -117,9 +120,9 @@ def compare(models: dict[str, dict[str, dict]], tokens: list[str]) -> dict:
                 "win_count": wins, "tie_count": sum(d == 0 for d in differences),
                 "loss_count": sum(d > 0 for d in differences), "win_rate": wins / count if count else None,
             }
-        pairs[f"no_action_minus_{track}"] = metrics
+        pairs[f"{primary_name}_minus_{track}"] = metrics
     return {"sample_count": len(tokens), "sample_tokens": tokens, "models": overall, "pairwise": pairs,
-            "delta_definition": "no_action_minus_reference; negative_is_better",
+            "delta_definition": f"{primary_name}_minus_reference; negative_is_better",
             "relative_delta_definition": "mean_delta / paired_reference_mean; null_if_zero_or_unavailable",
             "tie_definition": "exact_zero_difference", "interpretation": "descriptive_only"}
 
@@ -148,12 +151,14 @@ def intake(repository: Path, derived_root: Path, config: NoActionConfig) -> tupl
 
 def fit(*, model: torch.nn.Module, planner: WaypointDecoder, runner: NeutralRunner,
         train: list[direct.DirectSample], validation: list[direct.DirectSample], records: dict,
-        config: NoActionConfig, output: Path, provenance: dict) -> list[dict]:
+        config: NoActionConfig, output: Path, provenance: dict,
+        reload: Callable[[Path, str], WaypointDecoder] = full.reload_planner) -> list[dict]:
     if not train or any(s.split != "train" for s in train):
         raise ValueError("no-action optimization requires train only")
     if not validation or any(s.split != "validation" for s in validation):
         raise ValueError("no-action evaluation requires validation only")
     optimizer = torch.optim.AdamW(planner.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    track = config.conditioning_type
     provenance = {**provenance, "freeze_policy": full.verify_freeze(model, planner, optimizer)}
     write_json(output / "run_metadata.json", provenance)
     step, epochs = 0, []
@@ -161,16 +166,16 @@ def fit(*, model: torch.nn.Module, planner: WaypointDecoder, runner: NeutralRunn
         for epoch in range(config.num_train_epochs):
             loss_sum = 0.
             for group in epoch_groups(train, config.gradient_accumulation_steps, config.seed + epoch):
-                loss = convergence.train_group(planner, runner, group, records, config, optimizer, TRACK)
+                loss = convergence.train_group(planner, runner, group, records, config, optimizer, track)
                 loss_sum += loss
                 step += 1
                 entry = {"epoch": epoch + 1, "optimizer_step": step, "train_loss": loss / len(group),
-                         "sample_tokens": [s.sample_token for s in group], "conditioning_type": TRACK}
+                         "sample_tokens": [s.sample_token for s in group], "conditioning_type": track}
                 history.write(json.dumps(entry, allow_nan=False) + "\n")
                 history.flush()
                 if step % config.log_every_steps == 0:
                     print(json.dumps(entry), flush=True)
-            metrics, rows = direct.evaluate(planner, runner, validation, records, TRACK)
+            metrics, rows = direct.evaluate(planner, runner, validation, records, track)
             full.write_predictions(output / f"epoch_{epoch + 1}_predictions.jsonl", rows)
             write_json(output / f"epoch_{epoch + 1}_metrics.json", metrics)
             full.save_checkpoint(output / f"epoch_{epoch + 1}.pt", planner, config, provenance, step)
@@ -179,12 +184,12 @@ def fit(*, model: torch.nn.Module, planner: WaypointDecoder, runner: NeutralRunn
             print(json.dumps(epochs[-1], allow_nan=False), flush=True)
     full.verify_freeze(model, planner, optimizer)
     write_json(output / "input_evidence.json", runner.context_evidence)
-    selected = full.reload_planner(output / "epoch_2.pt", runner.device)
-    before = read_predictions(output / "epoch_2_predictions.jsonl", TRACK)
+    selected = reload(output / "epoch_2.pt", runner.device)
+    before = read_predictions(output / "epoch_2_predictions.jsonl", track)
     subset = sorted(validation, key=lambda s: s.sample_token)[:config.reload_subset_size]
-    _, reloaded = direct.evaluate(selected, runner, subset, records, TRACK)
+    _, reloaded = direct.evaluate(selected, runner, subset, records, track)
     by_token = {r["sample_token"]: r for r in before}
-    consistency = direct.compare_reload([by_token[s.sample_token] for s in subset], reloaded, TRACK)
+    consistency = direct.compare_reload([by_token[s.sample_token] for s in subset], reloaded, track)
     consistency["scope"] = "sorted_validation_subset"
     write_json(output / "reload_consistency.json", consistency)
     if not consistency["reload_consistency"]:

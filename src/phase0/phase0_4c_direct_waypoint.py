@@ -83,7 +83,7 @@ class DirectRunner:
     def messages(self, observation: Observation, images: Sequence[object]) -> list[dict]:
         return direct_messages(observation, images)
 
-    def predict(self, planner: WaypointDecoder, sample: DirectSample) -> tuple[torch.Tensor, dict]:
+    def context(self, sample: DirectSample) -> tuple[torch.Tensor, torch.Tensor, dict]:
         if sample.split not in ("train", "validation"):
             raise ValueError("Direct prediction requires train/validation")
         images = [self.runtime.image_loader(resolve_image_path(self.dataset_root, path))
@@ -93,11 +93,16 @@ class DirectRunner:
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"), self.device)
         self.model.eval()
         hidden = contextual_hidden_states(self.model, inputs)
-        prediction = planner(hidden, inputs["attention_mask"])
-        return prediction, {"hidden_state_field": "hidden_states[-1]", "hidden_state_shape": list(hidden.shape),
-                            "hidden_state_dtype": str(hidden.dtype),
-                            "attention_mask_shape": list(inputs["attention_mask"].shape),
-                            "waypoint_output_shape": list(prediction.shape)}
+        return hidden, inputs["attention_mask"], {
+            "hidden_state_field": "hidden_states[-1]", "hidden_state_shape": list(hidden.shape),
+            "hidden_state_dtype": str(hidden.dtype),
+            "attention_mask_shape": list(inputs["attention_mask"].shape),
+        }
+
+    def predict(self, planner: WaypointDecoder, sample: DirectSample) -> tuple[torch.Tensor, dict]:
+        hidden, attention_mask, evidence = self.context(sample)
+        prediction = planner(hidden, attention_mask)
+        return prediction, {**evidence, "waypoint_output_shape": list(prediction.shape)}
 
 
 def evaluate(planner: WaypointDecoder, runner: DirectRunner, samples: list[DirectSample],
