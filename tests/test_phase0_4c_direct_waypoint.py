@@ -276,6 +276,7 @@ def test_test_rejection_and_reference_code_unchanged(config, monkeypatch):
     with pytest.raises(SystemExit):
         cli.main(["--validation-split", "test"])
     assert cli.main(["--dry-run"]) == 0
+    # Phase 6C adds optional query conditioning to the shared decoder.
     subprocess.run(["git", "diff", "--exit-code", "5bc821d", "--", "src/baselines", "src/phase0/phase0_4c_full_train.py",
-                    "src/phase0/phase0_4c_two_turn_planner.py", "src/phase0/phase0_4c_evaluation.py"],
+                    "src/phase0/phase0_4c_evaluation.py"],
                    cwd=ROOT, check=True, capture_output=True)

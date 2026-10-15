@@ -112,10 +112,13 @@ class WaypointDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(layer, config.num_decoder_layers)
         self.waypoint_projection = nn.Linear(dimension, 2)
 
-    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor,
+                query_condition: torch.Tensor | None = None) -> torch.Tensor:
         memory = self.context_projection(hidden_states.to(self.context_projection.weight.dtype))
         memory = self.memory_norm(memory)
         queries = self.waypoint_queries.weight.unsqueeze(0).expand(memory.shape[0], -1, -1)
+        if query_condition is not None:
+            queries = queries + query_condition.unsqueeze(1)
         decoded = self.decoder(queries, memory, memory_key_padding_mask=~attention_mask.bool())
         return self.waypoint_projection(decoded)
 

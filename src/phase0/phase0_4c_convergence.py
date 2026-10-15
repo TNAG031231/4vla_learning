@@ -354,7 +354,8 @@ def run(*, repository: Path, dataset_root: Path, derived_root: Path, config: Con
 
 
 def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,
-                config: full.FullConfig, git: GitProvenance, *, prepared_data: tuple | None = None) -> dict:
+                config: full.FullConfig, git: GitProvenance, *, prepared_data: tuple | None = None,
+                planner_type: type[WaypointDecoder] = WaypointDecoder) -> dict:
     train, validation, records, data = (
         full.prepare_data(repository, derived_root) if prepared_data is None else prepared_data)
     semantic = load_semantic_config(repository / "configs/phase0_4b_lora_full.yaml")
@@ -372,7 +373,7 @@ def prepare_run(repository: Path, dataset_root: Path, derived_root: Path,
     freeze_backbone(model)
     if model.config.text_config.hidden_size != 2560:
         raise ValueError("Qwen planner interface must have hidden size 2560")
-    planner = WaypointDecoder(2560, config).to(device)
+    planner = planner_type(2560, config).to(device)
     runner = full.PlannerRunner(model, processor, runtime, dataset_root,
                                {**semantic.generation_kwargs, "use_cache": True}, device)
     provenance = {
