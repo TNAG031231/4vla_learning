@@ -508,6 +508,16 @@ No-action 两轮曲线（误差单位 m）：
 - 本地检查覆盖真实 processor + 随机小型 Qwen 的前向/反向、ego 参数更新、冻结 backbone、输入隔离、train-only normalization、两轮持久化与重载、比较产物和 rerun guard。共享接口保留原调用默认行为；既有 baseline、loss 与 evaluator 保持原实现。
 - 当前范围为最小 Fusion；未新增 matched dynamics-only 训练、多 seed、DiT / Flow Matching 或 test evaluation。Fusion 的 ADE / FDE、推理耗时、GPU 显存与是否改善既有 baseline 均待真实执行验证，不能据本地测试宣称多模态与动力学互补已经得到证明。
 
+## Phase 0.5 Temporal Geometry and BEV Occupancy
+
+- 已实现 `scripts/build_phase0_5_geometry.py`、`configs/phase0_5_geometry.yaml`、对象几何 / 栅格化模块和独立可视化模块，protocol 为 `phase0.5-temporal-geometry-v0.1`；仅接入既有 train / validation source projection，不修改模型输入或历史标签。
+- 复用冻结的六个 `future_sample_token`，将每步 annotation 从 global frame 转换到当前 CAM_FRONT ego frame；保存真实 sample 时间和 annotation-camera 偏移，不插值或外推缺失对象。`instance_token` 固定对象槽位，`annotation_token` 逐步变化；尺寸从 nuScenes `[width,length,height]` 转为 `[length,width]`，相对朝向采用四元数组合后的 yaw，footprint 为平面矩形。
+- 每个样本以无 pickle 的 NPZ 保存 `agent_numeric_state [6,512,5]`、类别 / 有效性 / motion-source `[6,512]`、JSON metadata、`temporal_occupancy [6,2,120,100]` 和 grid validity `[6,120,100]`；`load_geometry()` 是后续消费者的读取入口。对象超过 512 时显式失败，保留网格外对象，不截断；缺失对象用 mask 标识，motion source 为 unavailable，其余为 observed。
+- 网格为 x 前向 `[-10,50]m`、y 左向 `[-25,25]m`、分辨率 `0.5m`，数组轴为 `[x,y]`，按旋转框与 cell 的正面积交集写入占用。Channel 0 为 vehicle，channel 1 为 pedestrian / bicycle / motorcycle（VRU 优先归类，避免重复）；其余类别不进入这两个通道。Grid validity 表示该时间步存在标注支撑，不表示未占用 cell 是传感器确认的自由空间。
+- 本地真实数据已完成全量 train **14253 samples / 560 scenes**，产物位于 `$VLA_DERIVED_ROOT/phase_0_5/temporal_geometry_train_v0_1/`，最大跨步实例数 130，最大 annotation-camera 偏移 `0.042542s`；全量 validation **3594 samples / 140 scenes** 位于 `$VLA_DERIVED_ROOT/phase_0_5/temporal_geometry_v0_1/`，最大跨步实例数 110，最大偏移 `0.041720s`。另有 12 train / 12 validation、各覆盖 12 scenes 的样例产物位于 `phase_0_5/geometry_examples_v0_1/`，已抽查车辆、VRU、旋转框与 ego 轨迹叠加图。
+- 读取沿用 nuScenes SDK 元数据预载和既有 development-scene guard；本次 summary 的 combined manifest parse、test scene traversal、test sample / image / label access 计数均为 0。GT 几何仅供 evaluator / 可视化，未进入 VLA 推理；SDK 元数据预载不等于逐样本 test evaluation。
+- 基础验证覆盖 producer 生成的 source fixture、固定坐标锚点、尺寸 / 类别 / 身份 / 时间、缺失对象、独立 polygon intersection 栅格对照及 NPZ 往返读取；`--help` 与真实构建入口均已执行。几何评分器、模型风险比较、reranking、预测式 occupancy、Flow Matching / DiT 尚未实现；下一项工作可直接消费上述几何产物。
+
 ## Next Gate
 
 - Phase 0.4c-4 baseline suite gate 已 `PASS`；PR #50 保持 OPEN / Draft / unmerged，等待后续审阅与合并后的 Learning & Capability Closeout；Phase 0.4d 尚未启动。
