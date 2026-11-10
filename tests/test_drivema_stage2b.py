@@ -37,6 +37,25 @@ def test_fixed_subset_action_scene_coverage_and_split(samples):
         training.select_subset([], 1, 7, 'test')
 
 
+def test_full_config_schedule_and_cli(samples, capsys):
+    path = ROOT / 'configs/drivema_stage2b_full.yaml'
+    config = training.load_config(path)
+    pilot = training.load_config(ROOT / 'configs/drivema_stage2b_pilot.yaml')
+    assert config == replace(pilot, train_samples=None, checkpoint_interval=891,
+                             validation_interval=891, output_relative_dir='drivema/stage2b_full_run01')
+    population = [replace(samples['train'][0], sample_token=f'train-{i}') for i in range(14253)]
+    selected = training.select_subset(population, config.train_samples, config.seed, 'train')
+    groups = training.epoch_batches(selected, config, 0)
+    assert len(selected) == len({s.sample_token for group in groups for s in group}) == 14253
+    assert len(groups) * config.epochs == 3564
+    assert len(groups[-1]) == 1
+    assert list(range(config.validation_interval, len(groups) + 1, config.validation_interval)) == [891, 1782, 2673, 3564]
+    assert cli.main(['--config', str(path), '--mode', 'full', '--epochs', '1', '--learning-rate', '0.0001',
+                     '--output-relative-dir', config.output_relative_dir, '--baseline-predictions',
+                     'waypoint.jsonl', 'no-action.jsonl', 'mlp.jsonl', '--dry-run']) == 0
+    assert training.TrainingConfig(**json.loads(capsys.readouterr().out)) == config
+
+
 def test_selection_and_action_regression():
     def metrics(invalid, ade):
         return {'trajectory': {'invalid_prediction_count': invalid, 'ade_3s_m': ade, 'fde_3s_m': ade}}
