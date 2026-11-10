@@ -1,5 +1,29 @@
 # Project Progress
 
+## 独立 DriveMA-style Stage 2：Two-Turn Trajectory Token SFT
+
+- 已新增 `scripts/run_drivema_stage2_sft.py`、`configs/drivema_stage2_smoke.yaml`、`src/phase0/drivema_stage2_protocol.py`、`src/phase0/drivema_stage2_sft.py` 和 `tests/test_drivema_stage2_sft.py`；protocol 为 `drivema-stage2-two-turn-v0.1`。入口仅支持 tiny train/validation smoke，正式训练配置尚未决定；本路线范围及官方实现依据见 `project_mvp_plan.md` §2.6。
+- 初始化入口固定加载 Phase 0.4b `adapter_step_3564` 并开放已有 LoRA 更新，base 保持冻结；复用原 processor revision、历史观测序列化、动作 prompt/parser、冻结 temporal intake 和 ADE/FDE evaluator。训练为两轮 assistant 内容及 EOS 的 token CE，GT action 用于 teacher forcing；验证使用模型自己生成的 action tokens，再生成六个两位小数的 waypoint。输入/输出坐标、3 秒 horizon、0.5 秒 interval 保持原合同。
+- 本地 CPU 已执行 `codex4vla_env` 下 **83 passed**（新增 Stage 2 21 项及相关既有测试），环境为 PyTorch `2.9.1`、Transformers `4.57.6`、PEFT `0.17.1`。证据包含真实 pinned processor、真实 producer helper 生成的 synthetic fixtures、随机小型 Qwen 前向/反向、LoRA-only 参数更新、causal log-prob 与标准 masked CE 数值一致、保存重载，以及 sample-level 持久化；合法 rollout 链路使用受控生成，随机 Qwen 真实生成被记录为 invalid。该结果不代表真实 4B checkpoint 已学习合法轨迹。PEFT 对随机模型缺少预训练 config 及 unload 后残留 `peft_config` 给出两条 warning；reload token、概率和预测比较通过。
+- 已执行 CLI `--help`、`--dry-run`、`git diff --check` 及 workspace cleanup dry-run。本机 CUDA unavailable，用户确认暂时没有可用 GPU 机器；真实 step-3564 checkpoint intake、冻结实数据 intake、GPU smoke、真实 tiny overfit 和全量 validation **NOT RUN**。本轮未读取 test 数据，未改变历史模型/checkpoint/冻结数据/实验结果；Stage 3 GRPO、安全 scorer 均未实现。
+- GPU 入口会在全量 train/validation intake 后确定 tiny 子集，仅训练 2 个 train samples、评估 2 个 validation samples；默认 100 optimizer steps。`summary.json` 只有在参数更新、真实生成合法性、tiny-overfit 和保存重载条件全部满足时才标为 `smoke_passed`；失败返回非零退出码并保留结果，不能直接作为正式训练通过证据。
+- 产物写入 `$VLA_DERIVED_ROOT/drivema/stage2_smoke_v0_1/`：`metadata.json`、`training_history.jsonl`、`train_predictions.jsonl`、`validation_predictions.jsonl`、`validation_metrics.json`、`reload_consistency.json`、`summary.json` 和 `adapter/`。目录已存在时拒绝覆盖。逐样本包含预测动作、原始轨迹文本、parser 状态、原始 GT 数值及 mask、ADE/FDE、完整 token IDs、两轮 assistant span（半开区间、含 EOS）及原始策略 token log-probability；invalid 保留在总分母，ADE/FDE 明确仅统计合法预测。
+- 后续 GRPO 的实现位置为 `AssistantSpan`、`assistant_log_probs`、`generate_two_turn`、`parse_trajectory` 和 `trajectory_to_meta_action`。当前 log-prob 为未做 temperature/top-p 变换的策略概率，可微重算接口与离线保存值分开；当前生成是 greedy，尚未实现 group sampling、old/reference policy、turn-level advantage 或 RL objective。轨迹 projection 复用冻结动作阈值，在名义采样网格上计算；它与原始实际 timestamp 标签的边界差异仍需真实数据验证。
+
+已执行的本地命令：
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q tests/test_drivema_stage2_sft.py tests/test_phase0_4b_protocol.py tests/test_phase0_4c_two_turn_planner.py tests/test_phase0_4c_full_train.py
+conda run -n codex4vla_env python scripts/run_drivema_stage2_sft.py --help
+conda run -n codex4vla_env python scripts/run_drivema_stage2_sft.py --dry-run
+```
+
+真实 GPU 待执行命令（本轮未运行；需先提供 BF16 CUDA 机器、pinned base cache、原 step-3564 adapter 和冻结数据）：
+
+```bash
+conda run -n codex4vla_env python scripts/run_drivema_stage2_sft.py --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+```
+
 ## Current Phase
 
 - 当前阶段：Phase -1、Phase 0.1 与 Phase 0.1b gate 均已完成；Phase 0.2d sealed one-shot evaluation 已调用一次，但因 validation artifact schema adapter 缺失而在正式输出写盘前失败。test split 已永久消费，没有形成可发布的正式 test metrics。Phase 0.3 overall 状态为 `completed`。

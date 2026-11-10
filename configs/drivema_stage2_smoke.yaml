@@ -1,0 +1,11 @@
+seed: 20260812
+train_subset_size: 2
+validation_subset_size: 2
+max_steps: 100
+learning_rate: 0.0001
+gradient_accumulation_steps: 2
+trajectory_max_new_tokens: 192
+tiny_loss_ratio: 0.2
+tiny_ade_threshold_m: 0.25
+selected_adapter_relative_path: phase_0_4/structured_action_lora_full_v0_1/adapter_step_3564
+output_relative_dir: drivema/stage2_smoke_v0_1
