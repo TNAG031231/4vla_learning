@@ -198,6 +198,8 @@ Legacy coarse action schema（旧版粗粒度动作模式）继续作为 Phase 0
 
 ### 2.5 Trajectory-to-action verifier（轨迹到动作验证器）
 
+2026-11-10 新增的独立 DriveMA-style token SFT 路线见第 2.6 节；以下连续 decoder 路线及其历史实验保持原协议。
+
 本项目借鉴 DriveMA（可验证元动作驾驶视觉-语言-动作模型）的可迁移接口思想，但不把项目写成 DriveMA（可验证元动作驾驶视觉-语言-动作模型）复现：
 
 ```text
@@ -211,6 +213,20 @@ input x
 trajectory-to-action verifier（轨迹到动作验证器）后续根据预测轨迹的纵向位移、速度趋势和横向运动，反推出 trajectory-implied action（轨迹隐含动作），再与模型预测的 `longitudinal_action` 和 `lateral_action` 比较，输出 action-trajectory consistency（动作—轨迹一致性）及明确冲突原因。它能够识别“高层输出减速，但轨迹仍持续加速”或“高层输出向左，但轨迹终点明显向右”等错误，并把结果用于 failure case analysis（失败案例分析）、candidate trajectory reranking（候选轨迹重排序）和 optional preference learning（可选偏好学习）。
 
 Verifier（验证器）第一版是版本化、可单元测试的规则检查工具，不承诺 DriveMA（可验证元动作驾驶视觉-语言-动作模型）的 GRPO（组相对策略优化）、turn-level credit assignment（轮次级信用分配）、全参数训练或海量数据方案，也不需要论文规模的 reinforcement learning（强化学习）。第一版先以 supervised training（监督训练）、规则验证和候选重排序展示语言—动作对齐能力；阈值、投影规则和失败原因必须通过 train / validation（训练集 / 验证集）及人工构造案例核验，不能读取已消费 test（测试集）来选择。
+
+### 2.6 独立 DriveMA-style Two-Turn SFT → Turn-Level GRPO 路线
+
+本路线按用户于 2026-11-10 指定的范围独立实现，仅启动 **Stage 2：Two-Turn Action-Conditioned Trajectory SFT**；Stage 3 Turn-Level GRPO 为 `planned`，安全 scorer 不在本轮范围。历史 Phase 0.4c 的 frozen Qwen/LoRA + continuous WaypointDecoder、checkpoint、数据协议和实验结果保持原状；本路线使用单独入口和输出目录。此前关于 continuous decoder 缺少 trajectory token likelihood 的判断继续适用于历史模型。
+
+- **来源核验：** [DriveMA 论文 §3.1–3.4](https://arxiv.org/html/2605.31271v2) 将坐标交给原生 tokenizer，Stage 2 监督完整 `observation → GT meta-action → GT trajectory` 对话。官方代码核对版本为 `de20e6c64878bc3413d26d69362c3be9b3a91533`：[数据转换器](https://github.com/Tsinghua-MARS-Lab/DriveMA/blob/de20e6c64878bc3413d26d69362c3be9b3a91533/tools/build_data/convert_traj_jsonl_to_mllm_vision_mutil_turn_random_mask.py) 实际生成逗号分隔的 `[x, y]`、两位小数，函数注释中的 `<answer>` 标签并未写入返回值；[推理入口](https://github.com/Tsinghua-MARS-Lab/DriveMA/blob/de20e6c64878bc3413d26d69362c3be9b3a91533/tools/infer_scripts/run_vllm_infer_mutil_turn.py) 将第一轮生成文本作为第二轮 assistant context；[loss scale](https://github.com/Tsinghua-MARS-Lab/DriveMA/blob/de20e6c64878bc3413d26d69362c3be9b3a91533/swift/loss_scale/base.py) 默认监督 assistant response/suffix。
+- **官方差异：** [Pipeline 文档](https://github.com/Tsinghua-MARS-Lab/DriveMA/blob/de20e6c64878bc3413d26d69362c3be9b3a91533/README_DriveMA_Pipeline.md) 要求 Stage 1 checkpoint 和单个 Stage 2 JSONL，而同版本 [Stage 2 shell](https://github.com/Tsinghua-MARS-Lab/DriveMA/blob/de20e6c64878bc3413d26d69362c3be9b3a91533/examples/train/full/5s/posttrained_SFT.sh) 仍指向 Qwen3.5-2B 和数据目录，采用 full tuning。这里迁移两轮机制，使用本项目 Qwen3-VL + LoRA；官方 5 秒 / 5 点和输入随机遮挡不迁入冻结的 nuScenes 协议，不声称完整复现论文。
+- **初始化与数据：** 复用固定 Qwen3-VL-4B revision 和 `phase_0_4/structured_action_lora_full_v0_1/adapter_step_3564`，以 `is_trainable=True` 加载已有 adapter，base frozen；Stage 1 Action SFT 不重新运行。复用 `prepare_data`、`load_temporal_records` 和真实 producer validator，只读原有 train/validation projection；训练仅纳入 joint-valid action，验证保留既有 eligibility，不读取 test。
+- **两轮合同：** Turn 1 保留 Phase 0.4b task prompt、`longitudinal=<value>; lateral=<value>`、strict parser 和生成参数。历史 CAM_FRONT 与 current/past ego state 按原顺序输入，missing history 保持原 mask；Turn 2 使用相同观测和第一轮 assistant tokens，以 Qwen LM head 自回归生成六个坐标对，固定 current CAM_FRONT ego frame、x-forward/y-left、米、0.5–3 秒。序列化到 0.01 m，每轴最大量化误差 0.005 m；评测 target 保留原始浮点数。
+- **训练目标：** processor 实测两个 assistant 内容及 EOS 的 token span；两轮内容和 EOS 参与 token-mean cross entropy，user prompt、图像 token、role header、分隔换行均不监督。GT action 只用于训练 teacher forcing；第二轮真实预测路径只接收 `Observation` 和模型生成的第一轮 token，不接收 target。无 WaypointDecoder、坐标回归 loss、GRPO 或安全 reward。
+- **先验收后定正式配置：** 保留 2 train / 2 validation、100 steps 的 Tiny Overfit 配置；CLI `--mode gpu-smoke` 仅将步数改为 2 并使用独立输出目录。GPU smoke 要求真实模型/step-3564 adapter、有限 loss/梯度、LoRA 更新和 checkpoint 保存重载一致；Tiny Overfit 独立要求 trajectory CE ≤初始值 20%、完整合法 train 预测及 ADE@3s ≤0.25 m；validation_status 独立报告动作/轨迹合法率、invalid reason 和 ADE/FDE，不要求 validation 全合法才能通过 GPU smoke。已有目录拒绝覆盖，失败保留已写产物，使用 `--output-relative-dir` 指定新目录重跑。真实 GPU 未运行，正式训练配置待真实执行后决定。
+- **GRPO 接入点：** `drivema_stage2_protocol.AssistantSpan` 与 sample-level `assistant_spans` 保存每轮 `[start,end)`（含 EOS）、实际 token IDs 和 log-probs；`assistant_log_probs` 按 causal shift 重算可微原始策略概率，图像与 user tokens 不参与 policy loss。`generate_two_turn` 保留实际采样 token 的历史，不用 decode/re-encode 替换第一轮 IDs；当前 rollout 为 greedy，后续 group sampling、old/reference policy、turn-level advantage、PPO/GRPO objective 和 reward contract 均为 `planned`。
+- **Parser / verifier 接入点：** `parse_trajectory` 严格解析完整六点数值文本，错误输出不自动修补；`trajectory_to_meta_action` 在名义 0.5 秒网格上加当前原点，复用 `derive_feature_targets` 的冻结阈值。该 projection 是一致性验证的基础接口；原标签使用真实 producer timestamps，名义网格及厘米量化可能影响边界样本，正式 consistency reward 尚待 train/validation 核验，不据此重写 GT 标签。
+- **当前边界：** CPU 使用真实 processor、producer-backed synthetic fixtures 和随机小型 Qwen 验证接口；真实 GPU、原始 step-3564 checkpoint intake、真实数据 tiny overfit、全量 validation 和 Stage 3 均待执行。正式命令与当前证据见 `docs/progress.md` 的独立 Stage 2 记录。
 
 ## 3. BEV（鸟瞰图）/ occupancy（占用表征）与 geometric safety scorer（几何安全评分器）
 
