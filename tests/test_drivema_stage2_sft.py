@@ -197,8 +197,9 @@ def test_invalid_outputs_remain_in_evaluation_denominator(lora_model, runner, pr
     assert metrics["trajectory"]["ade_3s_m"] is None
 
 
+@pytest.mark.parametrize("invalid_validation", [False, True])
 def test_fit_real_cpu_lora_save_reload_with_scripted_rollout(lora_model, runner, processor, samples,
-                                                           records, tmp_path, monkeypatch):
+                                                           records, tmp_path, monkeypatch, invalid_validation):
     from transformers import Qwen3VLForConditionalGeneration
     config = replace(training.load_config(ROOT / "configs/drivema_stage2_smoke.yaml"),
                      max_steps=2, gradient_accumulation_steps=1, learning_rate=0.01)
@@ -207,6 +208,14 @@ def test_fit_real_cpu_lora_save_reload_with_scripted_rollout(lora_model, runner,
                     serialize_trajectory(records["train"][0]["future_waypoints"])], [],
     ))
     targets = {r["sample_token"]: r for rows in records.values() for r in rows}
+    if invalid_validation:
+        original = runner.predict
+        def predict(model, sample):
+            result = original(model, sample)
+            if sample.split == "validation":
+                result.update(waypoints=None, invalid_reason="invalid_trajectory_text")
+            return result
+        monkeypatch.setattr(runner, "predict", predict)
     output = tmp_path / "cpu-fit"
     result = training.fit(model=lora_model, runner=runner, train=samples["train"][:1],
                           validation=samples["validation"][:1], records=targets, config=config,
@@ -217,7 +226,12 @@ def test_fit_real_cpu_lora_save_reload_with_scripted_rollout(lora_model, runner,
     assert reload["token_ids_match"] and reload["log_probs_match"]
     assert (output / "adapter/adapter_model.safetensors").is_file()
     assert len((output / "validation_predictions.jsonl").read_text().splitlines()) == 1
-    assert result["status"] == "smoke_failed"  # Two CPU updates do not establish tiny overfit.
+    assert result["status"] == "execution_passed"
+    assert result["gpu_smoke_passed"] is False
+    assert result["tiny_overfit_passed"] is False
+    assert result["validation_status"]["trajectory"]["sample_count"] == 1
+    assert result["validation_status"]["trajectory"]["invalid_prediction_count"] == int(invalid_validation)
+    assert (output / "summary.json").exists()
 
 
 def test_split_and_invalid_teacher_forcing_rejected(runner, samples, records, processor):
@@ -238,3 +252,37 @@ def test_cli_config_and_rerun_guard(tmp_path, capsys):
     (tmp_path / config.output_relative_dir).mkdir(parents=True)
     with pytest.raises(FileExistsError, match="already exists"):
         training.run(repository=ROOT, dataset_root=tmp_path, derived_root=tmp_path, config=config)
+
+
+@pytest.mark.parametrize("mode,tiny,exit_code", [("gpu-smoke", False, 0), ("tiny-overfit", False, 1), ("tiny-overfit", True, 0)])
+def test_cli_independent_gates(mode, tiny, exit_code, monkeypatch, tmp_path):
+    from scripts import run_drivema_stage2_sft as cli
+    def run(**kwargs):
+        config = kwargs["config"]
+        assert config.max_steps == (2 if mode == "gpu-smoke" else 100)
+        assert config.train_subset_size == config.validation_subset_size == 2
+        assert config.output_relative_dir == "drivema/new-run"
+        return {"gpu_smoke_passed": True, "tiny_overfit_passed": tiny,
+                "validation_status": {"invalid_prediction_count": 2}}
+    monkeypatch.setattr(cli, "run", run)
+    assert cli.main(["--mode", mode, "--output-relative-dir", "drivema/new-run",
+                     "--dataset-root", str(tmp_path), "--derived-root", str(tmp_path)]) == exit_code
+
+
+def test_training_failure_retains_artifacts_and_new_directory_can_run(lora_model, runner, samples, records,
+                                                                    tmp_path, monkeypatch):
+    config = replace(training.load_config(ROOT / "configs/drivema_stage2_smoke.yaml"), max_steps=1)
+    targets = {r["sample_token"]: r for rows in records.values() for r in rows}
+    monkeypatch.setattr(training, "teacher_forced_losses", lambda *args: {"trajectory_ce": 1.0})
+    def fail(*args):
+        raise RuntimeError("forward failure")
+    monkeypatch.setattr(training, "assistant_log_probs", fail)
+    for name in ("failed-run", "new-run"):
+        output = tmp_path / name
+        with pytest.raises(RuntimeError, match="forward failure"):
+            training.fit(model=lora_model, runner=runner, train=samples["train"][:1],
+                         validation=samples["validation"][:1], records=targets, config=config,
+                         output=output, metadata={})
+        assert (output / "metadata.json").exists()
+        assert (output / "training_history.jsonl").exists()
+    assert (tmp_path / "failed-run/metadata.json").exists()

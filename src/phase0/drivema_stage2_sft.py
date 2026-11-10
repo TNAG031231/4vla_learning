@@ -173,15 +173,15 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample],
     final = teacher_forced_losses(model, runner, train, records)
     delta = sum(float((parameter.detach().cpu() - before[name]).square().sum())
                 for name, parameter in trainable.items()) ** 0.5
-    if delta == 0 or nonzero_gradient_steps == 0:
+    if not math.isfinite(delta) or delta == 0 or nonzero_gradient_steps == 0:
         raise ValueError("LoRA did not receive a real parameter update")
-    train_rows, train_metrics = evaluate(model, runner, train, records)
-    validation_rows, validation_metrics = evaluate(model, runner, validation, records)
-    write_predictions(output / "train_predictions.jsonl", train_rows)
-    write_predictions(output / "validation_predictions.jsonl", validation_rows)
-    write_json(output / "validation_metrics.json", validation_metrics)
     model.save_pretrained(output / "adapter")
     runner.processor.save_pretrained(output / "adapter")
+    train_rows, train_metrics = evaluate(model, runner, train, records)
+    write_predictions(output / "train_predictions.jsonl", train_rows)
+    validation_rows, validation_metrics = evaluate(model, runner, validation, records)
+    write_predictions(output / "validation_predictions.jsonl", validation_rows)
+    write_json(output / "validation_metrics.json", validation_metrics)
     # The unchanged base is reused; adapter tensors are loaded from the saved directory.
     restored = PeftModel.from_pretrained(model.unload(), output / "adapter").to(runner.device)
     reloaded_rows, _ = evaluate(restored, runner, validation, records)
@@ -203,15 +203,17 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample],
         and trajectory["invalid_prediction_count"] == 0
         and trajectory["ade_3s_m"] <= config.tiny_ade_threshold_m
     )
-    passed = (tiny_passed and validation_metrics["trajectory"]["invalid_prediction_count"] == 0
-              and reload_report["reload_consistency"] and reload_report["token_ids_match"]
+    passed = (reload_report["reload_consistency"] and reload_report["token_ids_match"]
               and reload_report["log_probs_match"])
     summary = {
-        "status": "smoke_passed" if passed else "smoke_failed",
+        "status": "execution_passed" if passed else "execution_failed",
+        "gpu_smoke_passed": bool(passed and next(restored.parameters()).is_cuda
+                                 and metadata.get("model_id") == FIXED_MODEL_ID
+                                 and metadata.get("initial_adapter") == config.selected_adapter_relative_path),
         "initial_teacher_forced_losses": initial, "final_teacher_forced_losses": final,
         "lora_delta_l2": delta, "nonzero_gradient_steps": nonzero_gradient_steps,
         "tiny_overfit_passed": tiny_passed, "train_predicted_action_metrics": train_metrics,
-        "validation_predicted_action_metrics": validation_metrics,
+        "validation_status": validation_metrics,
         "reload_consistency": reload_report["reload_consistency"],
         "formal_training_config": "pending_real_GPU_smoke_review",
     }
