@@ -1,5 +1,25 @@
 # Project Progress
 
+## Stage 2B：正式 SFT 接口与固定 Pilot
+
+- 用户于 2026-11-10 报告真实 AutoDL Tiny Overfit：`gpu_smoke_passed=true`、`tiny_overfit_passed=true`、100 nonzero gradient steps、LoRA delta L2 `3.0511568`、train ADE/FDE@3s `0.001937 / 0.002751 m`、validation `7.172948 / 12.474631 m`、reload consistency true。本轮未取得原始 artifact 独立重算；该证据支持训练链路和小样本拟合，尚不证明泛化。PR #57 已核实 merged，用户明确豁免其 Closeout。
+- 独立新增 `src/phase0/drivema_stage2b.py`、`scripts/run_drivema_stage2b.py`、`configs/drivema_stage2b_pilot.yaml`、`tests/test_drivema_stage2b.py`；复用 Stage 2 的 runner、mask、生成、parser、action metrics、ADE/FDE 和冻结数据 intake，历史 smoke/tiny 入口与配置保持原状。
+- Pilot 固定 seed `20261110`、512 train / 128 validation、1 epoch、batch size 1、accumulation 4、AdamW LR `1e-4`、weight decay 0、gradient clip 1；每 64 optimizer steps 保存与监控，末步必保存和监控，共 128 steps。初始化只在这 128 条 validation 上建立 step-3564 参考；中间不生成完整 validation。采样先按动作轮转，再优先当前全局采样数较少的 scene；组内固定 seed 打乱，每个 split 独立选择，保存 token 清单、scene 数和动作分布。
+- 初始监督沿用 PR #57：每个样本内两轮 assistant tokens（含 EOS）权重均为 1，按 token 数平均，再在 effective batch 上按样本平均；并非两轮 CE 各占 50%。分别记录 action/trajectory token CE 和 token 数、实际优化 loss、梯度范数、step 参数变化 L2、峰值 allocated/reserved 显存、训练耗时、samples/s 和 supervised tokens/s；吞吐范围不含监控和 checkpoint IO。batch_size 使用独立单样本 forward 累积多个计算图后统一 backward，保留原 processor/两轮接口；不是 padded vectorized batch，显存应先由 Pilot 确认。
+- 预固定模型选择：monitor invalid 数量最少 → ADE@3s 最低 → FDE@3s 最低 → 更早 step；只在实际监控过的 checkpoints 中选择。每次监控保存完整逐样本输出及既有 action/trajectory metrics，并记录相对初始化的纵向/横向 macro-F1、joint accuracy 差值和任一下降标志；该标志为描述性退化检查，不临时改变 checkpoint 排名规则。
+- checkpoint 保存 adapter/processor、AdamW state、完成的 step、下一 epoch/batch、CPU/CUDA RNG、subset/config 和已有 best checkpoint。`--resume` 从完整 checkpoint 恢复，配置与 token 身份必须相同（仅输出目录可变）；恢复写入新目录，保留原目录及其 best checkpoint 引用。失败直接报错并保留已写产物；缺少 `training_state.pt` 的部分 checkpoint 不能用于恢复。
+- Full 入口支持完整 train 和同一固定 monitor 子集，要求显式输入 Pilot 后确定的 epochs/LR、新输出目录及三条历史预测文件。训练结束重载 monitor 选出的 checkpoint，仅进行一次完整 3594 条 validation；复用原 `aligned_metrics`/`compare`，核对 exact sample tokens、scene、GT target（float32 口径）、mask 和轨迹有效性，重算与 WaypointDecoder predicted-action、No-action、Ego-History MLP 的指标及共同合法样本配对差值。用户必须提供准确 checkpoint 对应的预测文件，不混入 GT-action oracle。历史 baselines 的实际 artifact 可比性仍需 AutoDL 执行确认。
+- CPU 验证：`OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q tests/test_drivema_stage2b.py tests/test_drivema_stage2_sft.py` 得到 **32 passed**，包含 producer-backed fixtures、真实 processor/随机 tiny Qwen/LoRA 参数更新与保存重载、中断 checkpoint 恢复后与不中断训练参数逐元素一致、采样隔离、模型选择和 baseline 对齐拒绝；不代表真实 4B Pilot 已运行。本轮没有 GPU、正式训练、GRPO 或 BEV 实验；Full 超参数尚未确定。
+
+AutoDL 待执行命令（先设置已有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT`，所有输出目录必须尚不存在）：
+
+```bash
+conda run -n codex4vla_env python scripts/run_drivema_stage2b.py --mode pilot
+conda run -n codex4vla_env python scripts/run_drivema_stage2b.py --mode pilot --resume "$VLA_DERIVED_ROOT/drivema/stage2b_pilot_run01/checkpoint_64" --output-relative-dir drivema/stage2b_pilot_resume01
+# 以下变量在真实 Pilot 后确定；不是已批准的 Full 超参数
+conda run -n codex4vla_env python scripts/run_drivema_stage2b.py --mode full --epochs "$FULL_EPOCHS" --learning-rate "$FULL_LR" --output-relative-dir drivema/stage2b_full_run01 --baseline-predictions "$WAYPOINT_PREDICTIONS" "$NO_ACTION_PREDICTIONS" "$MLP_PREDICTIONS"
+```
+
 ## 独立 DriveMA-style Stage 2：Two-Turn Trajectory Token SFT
 
 - 已新增 `scripts/run_drivema_stage2_sft.py`、`configs/drivema_stage2_smoke.yaml`、`src/phase0/drivema_stage2_protocol.py`、`src/phase0/drivema_stage2_sft.py` 和 `tests/test_drivema_stage2_sft.py`；protocol 为 `drivema-stage2-two-turn-v0.1`。入口仅支持 tiny train/validation smoke，正式训练配置尚未决定；本路线范围及官方实现依据见 `project_mvp_plan.md` §2.6。
