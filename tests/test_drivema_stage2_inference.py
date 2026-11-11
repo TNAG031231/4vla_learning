@@ -186,3 +186,92 @@ def test_benchmark_summary_and_mismatch_gate(processor, runner, samples, records
         changed[0][field] = "changed"
         result = compare_predictions(rows, changed, metrics, metrics)
         assert not result["passed"] and field in result["mismatches"][0]["fields"]
+
+
+@pytest.mark.parametrize('longitudinal', ['keep', 'stop', 'accelerate', 'decelerate'])
+@pytest.mark.parametrize('lateral', ['straight', 'left', 'right'])
+@pytest.mark.parametrize('index', [0, 3])
+def test_suffix_matches_original_processor_for_all_actions(processor, runner, samples, records,
+                                                            lora_model, monkeypatch, longitudinal, lateral, index):
+    from transformers import Qwen3VLForConditionalGeneration
+    action = f'longitudinal={longitudinal}; lateral={lateral}'
+    monkeypatch.setattr(Qwen3VLForConditionalGeneration, 'generate', scripted_generate(
+        processor, [action, serialize_trajectory([[0., 0.]] * 6)], []))
+    selected = samples['validation'][index:index + 1]
+    targets = {r['sample_token']: r for r in records['validation']}
+    runner.compute_log_probs = False
+    serial, _ = evaluate(lora_model, runner, selected, targets)
+    runner.optimized = True
+    batch, _ = evaluate(lora_model, runner, selected, targets)
+    assert serial == batch
+
+
+def test_saved_diagnostic_separates_action_suffix_and_generation():
+    from copy import deepcopy
+    from scripts.diagnose_drivema_stage2c import analyze_saved, first_difference
+    row = {'sample_token': 'a', 'action_context': 'keep', 'input_ids': [1, 2, 3, 4],
+           'assistant_spans': [{'turn': 1, 'start': 1, 'end': 2, 'token_ids': [2]},
+                               {'turn': 2, 'start': 3, 'end': 4, 'token_ids': [4]}]}
+    other = deepcopy(row)
+    other['assistant_spans'][0]['token_ids'] = [8]
+    other['input_ids'][1] = 8
+    report = analyze_saved([row], [other])['samples'][0]
+    assert report['category'] == 'TURN1_MISMATCH' and report['suffix_equal']
+    other = deepcopy(row)
+    other['input_ids'][2] = 9
+    assert analyze_saved([row], [other])['samples'][0]['category'] == 'TURN2_PREFIX_MISMATCH'
+    other = deepcopy(row)
+    other['assistant_spans'][1]['token_ids'] = [5]
+    assert analyze_saved([row], [other])['samples'][0]['category'] == 'TURN2_GENERATION_MISMATCH'
+    assert first_difference([1], [1, 2]) == 1
+
+
+def test_diagnostic_capture_real_qwen(runner, samples, records, lora_model, tmp_path, monkeypatch):
+    from scripts.diagnose_drivema_stage2c import capture, compare_traces
+    selected = [samples['validation'][0], samples['validation'][3]]
+    targets = {r['sample_token']: r for r in records['validation']}
+    runner.compute_log_probs = False
+    from transformers import LogitsProcessorList
+    base = lora_model.get_base_model()
+    base.generation_config.eos_token_id = runner.processor.tokenizer.eos_token_id
+    original = base.generate
+    def generate(**kwargs):
+        text = ('longitudinal=keep; lateral=straight' if kwargs['max_new_tokens'] == 24 else '[0.00, 0.00]')
+        ids = runner.processor.tokenizer(text, add_special_tokens=False)['input_ids']
+        ids.append(runner.processor.tokenizer.eos_token_id)
+        width = kwargs['input_ids'].shape[1]
+        def force(input_ids, scores):
+            values = torch.full_like(scores, -torch.inf)
+            values[:, ids[input_ids.shape[1] - width]] = 0
+            return values
+        return original(**kwargs, logits_processor=LogitsProcessorList([force]))
+    monkeypatch.setattr(base, 'generate', generate)
+    reference, calls = [], []
+    for sample in selected:
+        with capture(lora_model, [sample.sample_token], runner.processor.tokenizer) as captured:
+            rows, _ = evaluate(lora_model, runner, [sample], targets)
+        for turn, call in enumerate(captured, 1):
+            call['turn'] = turn
+        calls.extend(captured)
+        reference.extend(rows)
+    runner.optimized, runner.inference_batch_size = True, 2
+    with capture(lora_model, [s.sample_token for s in selected], runner.processor.tokenizer) as batch_calls:
+        rows, _ = evaluate(lora_model, runner, selected, targets)
+    for turn, call in enumerate(batch_calls, 1):
+        call['turn'] = turn
+    report = compare_traces(calls, batch_calls, reference, rows, tmp_path, 'batch')
+    for row in report:
+        if row['turn'] in (1, 2):
+            assert all(row['inputs_equal'].values())
+            assert row['generation_kwargs_equal']
+            assert row['position_ids_equal_through_comparison']
+
+    from copy import deepcopy
+    changed = deepcopy(rows)
+    changed[0]['assistant_spans'][0]['token_ids'][0] += 1
+    evidence = compare_traces(calls, batch_calls, reference, changed, tmp_path, 'difference')[0]
+    assert evidence['first_different_token_zero_based'] == 0
+    assert 'margin' in evidence['serial'] and 'margin' in evidence['candidate']
+    tensor_file = next(tmp_path.glob('difference_*_turn1_first_difference.pt'))
+    saved = torch.load(tensor_file, weights_only=True)
+    assert saved['serial_logits'].shape == saved['candidate_logits'].shape

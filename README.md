@@ -127,3 +127,21 @@ conda run --no-capture-output -n codex4vla_env python scripts/benchmark_drivema_
 ## Data
 
 nuScenes 数据受其原始许可约束，不随本仓库分发；原始/派生数据、模型权重、日志、缓存和 secrets 不进入 Git。
+
+### Stage 2C 小样本差异诊断
+
+用户报告首次 64 样本 GPU 验收失败（48 个 Turn 2 generation mismatch、15 match、1 prefix mismatch）；当前不能宣称精确一致或加速验收通过。已提供的 prefix 样本 `03894f5a6a294cc6876d2fe3fa9229e7` 在 Turn 1 已从 baseline `decelerate` 变为 optimized `keep`，前缀差异不能据此归因于 suffix。CPU 上 12 种动作 × 1/3 帧历史的串行/批量完整 token 对照一致；真实 GPU 原因仍待下面的诊断，BF16 数值差异仅为待验证假设。
+
+以下命令先离线分析原有两个 JSONL，再仅对该失败样本所在的原 batch 四条样本依次运行 Serial、Optimized Batch 1、Optimized Batch 4（各一次、无训练）；保留原同伴及顺序，不运行 64 条生成。使用原 metadata 记录的 checkpoint / 生成设置和现有缓存，输出目录须全新：
+
+```bash
+conda run --no-capture-output -n codex4vla_env python scripts/diagnose_drivema_stage2c.py \
+  --benchmark-dir "$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01" \
+  --sample-token 03894f5a6a294cc6876d2fe3fa9229e7 --gpu \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT" \
+  --output "$VLA_DERIVED_ROOT/drivema/stage2c_diagnostic_run01"
+```
+
+去掉 `--gpu` 可仅分析已有预测，不加载模型或数据。`saved_analysis.json` 区分 Turn 1 动作变化、suffix/prefix 变化及相同前缀下的 Turn 2 生成变化；`diagnosis.json` 检查 Serial 复现、Batch 1/4 严格输出/指标一致性，并逐样本比较原始 pixels/grid、有效 attention mask、实际 position IDs、归一化 padding 后的 cache position / rope_deltas 和 generation 配置。首处分歧保存原始全词表 logits 与位置张量到 `*_first_difference.pt`，JSON 报告 argmax、top-2 margin、最大 logit 差值；仅在输入、位置及此前生成 token 一致时才可讨论数值原因。诊断 hook 会复制 CPU 张量，耗时不用于性能结论。
+
+小样本任何检查失败均退出 1，原验收阈值保持不变；若 Batch 1 通过而 Batch 4 失败，先审阅证据，再选择 Batch 1 + 跳过概率 forward 的候选回退路径，不能把它报告为 Batch 4 通过。只有确认选定路径的小样本通过后，才手动重跑一次 64 样本对照；脚本不会自动触发。当前未修改生产推理、SFT 训练或跨轮 cache。
