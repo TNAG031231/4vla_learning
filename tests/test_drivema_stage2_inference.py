@@ -275,3 +275,60 @@ def test_diagnostic_capture_real_qwen(runner, samples, records, lora_model, tmp_
     tensor_file = next(tmp_path.glob('difference_*_turn1_first_difference.pt'))
     saved = torch.load(tensor_file, weights_only=True)
     assert saved['serial_logits'].shape == saved['candidate_logits'].shape
+
+
+def test_diagnostic_argmax_is_not_topk_tie_order():
+    from scripts.diagnose_drivema_stage2c import top2
+    values = torch.zeros(151936)
+    values[450] = values[13096] = 1
+    assert top2(values)['argmax'] == 450
+
+
+def test_greedy_hook_steps_align_with_actual_selection(runner, samples, records, lora_model):
+    from scripts.diagnose_drivema_stage2c import capture
+    selected = samples['validation'][:1]
+    runner.action_generation = {'do_sample': False, 'num_beams': 1, 'max_new_tokens': 3}
+    runner.compute_log_probs = False
+    with capture(lora_model, [selected[0].sample_token], runner.processor.tokenizer) as calls:
+        rows, _ = evaluate(lora_model, runner, selected, {r['sample_token']: r for r in records['validation']})
+    span = rows[0]['assistant_spans'][0]
+    for step, token in zip(calls[0]['steps'], span['token_ids'], strict=True):
+        assert step['selection'][0]['generated_token'] == token
+        assert step['selection'][0]['argmax'] == token
+        assert int(step['logits'][0].argmax()) == token
+
+
+def test_offline_tied_logit_audit_and_token_rates(tmp_path):
+    import json
+    from scripts.report_drivema_stage2c import audit_logits, token_agreement
+    serial = {'sample_token': 'a', 'assistant_spans': [{'turn': 1, 'token_ids': [450]}]}
+    batch = {'sample_token': 'a', 'assistant_spans': [{'turn': 1, 'token_ids': [13096]}]}
+    for name, row in (('serial', serial), ('batch1', serial), ('batch4', batch)):
+        (tmp_path / f'{name}_predictions.jsonl').write_text(json.dumps(row) + '\n')
+    x = torch.zeros(151936)
+    x[450] = x[13096] = 1
+    y = x.clone()
+    y[13096] += .125
+    torch.save({'serial_logits': x, 'candidate_logits': y}, tmp_path / 'batch4_a_turn1_first_difference.pt')
+    diagnosis = {'batch1': {'trace_comparison': []}, 'batch4': {'trace_comparison': [
+        {'sample_token': 'a', 'turn': 1, 'first_different_token_zero_based': 0,
+         'serial': {'argmax': 13096}, 'candidate': {'argmax': 13096}, 'same_prefix': True}]}}
+    report = audit_logits(tmp_path, diagnosis)[0]
+    assert report['status'] == 'RAW_SELECTION_ALIGNED'
+    assert report['serial']['argmax'] == 450
+    assert report['candidate']['argmax'] == 13096
+    assert token_agreement([serial], [batch])['token_rate'] == 0
+
+
+def test_report_keeps_strict_failure_separate_from_quality():
+    from scripts.report_drivema_stage2c import build_report, markdown
+    metrics = {'trajectory': {'ade_3s_m': 1., 'fde_3s_m': 2., 'invalid_prediction_rate': 0., 'invalid_prediction_count': 0},
+               'action': {'longitudinal_macro_f1': .7, 'lateral_macro_f1': .8, 'joint_accuracy': .6}}
+    track = {'metrics': metrics, 'total_inference_seconds': 10., 'samples_per_second': 1.,
+             'p50_latency_seconds': 1., 'p95_latency_seconds': 2., 'peak_allocated_bytes': 100}
+    original = {'passed': False, 'metrics_exact_match': False}
+    report = build_report({'baseline': track, 'optimized': track, 'consistency': original, 'throughput_speedup': 2.13},
+                          {'batch4': {'trace_comparison': []}}, {'exact_sample_rate': 15/64, 'token_rate': .9}, [])
+    assert report['strict_consistency_original'] == original
+    assert report['quality']['trajectory_quality_passed']
+    assert '2.13' in markdown(report)

@@ -1,5 +1,12 @@
 # Project Progress
 
+## Stage 2C：分项验收（2026-11-11）
+
+- 用户提供的真实 AutoDL 结果：四样本 Serial vs Saved / Batch 1 PASS，Batch 4 strict FAIL；相关输入、图像/grid、attention、position/RoPE/cache 对照通过。64 样本原报告为 48 个 Turn 2 generation mismatch、15 match、1 个由 Turn 1 动作变化引起的 prefix mismatch；严格失败保持原值。15/64 是样本级完整生成一致率（23.4375%），不是逐 token 一致率。
+- 用户报告同批 64 样本吞吐量 2.13×、ADE/FDE 无退化、两侧 invalid count 0（invalid rate 0）；多数分歧位置 top-2 margin 0 或 0.125，logit 差值约 0.125–0.227。Action 具体数值、ADE/FDE 绝对值、耗时/P50/P95/显存及逐 token 一致率尚未提供，本机未访问远端产物，不能补写猜测值；离线 report 入口从原始 benchmark 和 predictions 导出这些字段。
+- 已在 CPU 复现诊断错误：topk 在 tie 时的首索引不等于 argmax；450/13096 并列时旧报告可能错误地标出 argmax=13096。修正采用真正 argmax，保留 top-2 margin，并增加实际 processed-score argmax / generated-token 对齐采集；生产模型、prompt、训练和采样策略不变。
+- 新增 `scripts/report_drivema_stage2c.py` 仅读取已有 JSON/JSONL/PT 生成新目录分项报告，原 strict gate 不变；结构只声明诊断样本范围，轨迹质量独立按同批 ADE/FDE/invalid 不退化判定，Action 和性能单列。后续先核验离线 raw-selection 审计，不预先追加 GPU；PR #59 尚待审阅和合并，正式 Learning & Capability Closeout 及 Stage 3 未执行。
+
 ## Stage 2B：正式 SFT 接口与固定 Pilot
 
 - 用户于 2026-11-10 报告真实 AutoDL Tiny Overfit：`gpu_smoke_passed=true`、`tiny_overfit_passed=true`、100 nonzero gradient steps、LoRA delta L2 `3.0511568`、train ADE/FDE@3s `0.001937 / 0.002751 m`、validation `7.172948 / 12.474631 m`、reload consistency true。本轮未取得原始 artifact 独立重算；该证据支持训练链路和小样本拟合，尚不证明泛化。PR #57 已核实 merged，用户明确豁免其 Closeout。

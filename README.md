@@ -107,7 +107,7 @@ Stage 2B 新启动进程的 Monitor / Full Validation 默认使用 batch 2，可
 
 批量生成使用左侧文本 padding，视觉 patches 与 grids 按样本/图像顺序拼接；第一轮提前结束后的 padding 不属于生成 token，第二轮仅处理有效且含 EOS 的动作，并保留原始动作 IDs。图像每条样本预处理一次，第二轮使用同一视觉输入及文本模板 suffix；Qwen3-VL 自行计算多模态位置编码。两轮各自显式启用 Transformers KV cache，**跨轮 KV cache 复用未实现**：不同动作长度、EOS 后 padding、有效子批次与 Qwen 的 `rope_deltas` / cache position 需要进一步独立验证，本阶段保留标准 prefill。
 
-以下为 AutoDL **待执行**命令；本地已验证 CLI 和 CPU 接口，真实 4B BF16 GPU 一致性、吞吐量与显存尚待验收。先将 `STAGE2B_CHECKPOINT` 设置为已完成的 SFT checkpoint 目录（其中包含 `adapter/`），保留现有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT` 和模型缓存；等待正在运行的 Full SFT 完成，不热更新其代码，在独立 checkout / 新进程运行：
+以下为 AutoDL **待执行**命令；本地已验证 CLI 和 CPU 接口，首次真实 4B BF16 GPU 结果及当前分项验收状态见下文。先将 `STAGE2B_CHECKPOINT` 设置为已完成的 SFT checkpoint 目录（其中包含 `adapter/`），保留现有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT` 和模型缓存；等待正在运行的 Full SFT 完成，不热更新其代码，在独立 checkout / 新进程运行：
 
 ```bash
 conda run --no-capture-output -n codex4vla_env python scripts/benchmark_drivema_stage2c.py \
@@ -144,4 +144,21 @@ conda run --no-capture-output -n codex4vla_env python scripts/diagnose_drivema_s
 
 去掉 `--gpu` 可仅分析已有预测，不加载模型或数据。`saved_analysis.json` 区分 Turn 1 动作变化、suffix/prefix 变化及相同前缀下的 Turn 2 生成变化；`diagnosis.json` 检查 Serial 复现、Batch 1/4 严格输出/指标一致性，并逐样本比较原始 pixels/grid、有效 attention mask、实际 position IDs、归一化 padding 后的 cache position / rope_deltas 和 generation 配置。首处分歧保存原始全词表 logits 与位置张量到 `*_first_difference.pt`，JSON 报告 argmax、top-2 margin、最大 logit 差值；仅在输入、位置及此前生成 token 一致时才可讨论数值原因。诊断 hook 会复制 CPU 张量，耗时不用于性能结论。
 
-小样本任何检查失败均退出 1，原验收阈值保持不变；若 Batch 1 通过而 Batch 4 失败，先审阅证据，再选择 Batch 1 + 跳过概率 forward 的候选回退路径，不能把它报告为 Batch 4 通过。只有确认选定路径的小样本通过后，才手动重跑一次 64 样本对照；脚本不会自动触发。当前未修改生产推理、SFT 训练或跨轮 cache。
+小样本严格检查失败仍退出 1，失败记录保留；Batch 1 + 跳过概率 forward 是已报告通过精确对照的回退路径。当前已有四样本诊断与 64 样本 GPU 结果，按下节分别审阅结构、数值一致性、质量和性能，不重复运行完整 Benchmark；未修改生产推理、SFT 训练或跨轮 cache。
+
+### Stage 2C 分项验收与离线 logits 审计
+
+2026-11-11 用户报告：Serial vs Saved / Batch 1 通过，Batch 4 严格一致性失败；可比上下文的输入/位置/cache 对照通过，64 条样本吞吐量提升 2.13×、ADE/FDE 无退化、两侧 invalid 均为 0。这些为用户提供的 GPU 结果，本机未独立读取原始产物。严格失败继续保留；结构、数值一致性、质量、性能分别记录，不再将它们混为一个 gate。
+
+已复现并修正诊断 `top2()` 将 `topk.indices[0]` 当作 argmax 的错误：并列最大值时 top-k 排序可与 greedy 使用的 `torch.argmax` 不同，例如 450/13096 并列时，旧报告可写成 13096，而真正 argmax 为 450。该修复只影响诊断报告。实际采样使用 processed scores；新增诊断采集会记录每步 processed argmax 与生成 token，CPU real-greedy 对齐测试通过。先使用已有原始 logits 离线重算，无需重新生成：
+
+```bash
+conda run --no-capture-output -n codex4vla_env python scripts/report_drivema_stage2c.py \
+  --benchmark-dir "$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01" \
+  --diagnostic-dir "$VLA_DERIVED_ROOT/drivema/stage2c_diagnostic_run01" \
+  --output "$VLA_DERIVED_ROOT/drivema/stage2c_acceptance_run01"
+```
+
+新目录输出 `acceptance.json` / `summary.md`，保留原 `strict_consistency_original`，统计完整生成序列一致率与每轮逐位置 token 一致率（含 EOS，缺失计错），列出完整 Action 指标、ADE/FDE/invalid、总时间/吞吐/P50/P95/峰值显存，并修正已保存分歧处的 raw argmax。轨迹质量 gate 独立定义为同一批样本 ADE@3s、FDE@3s、invalid rate 均不高于 baseline，属于本次明确新增的描述性标准，不是对原严格 gate 的追溯替换；Action 质量单列，不擅自添加容忍阈值。报告程序退出 0 仅表示报告生成完成，不表示验收通过。
+
+若保存的分歧处 raw argmax 与实际 token 均对齐，则此处的矛盾由旧诊断 tie-order 错误解释；这不证明 logits processor 全部关闭，只说明这些位置没有改变最终选择。若仍不对齐，先查看 runtime 中 generation 配置，再用已有四样本诊断入口记录 processed scores，不运行完整 Benchmark。仅在上下文、位置和生成协议对齐的比较中，微小 logit 差异与小 margin 才支持批量数值扰动解释；不声称排除了全部硬件/内核因素。报告和 PR 审阅完成后再正式 Closeout，Stage 3 尚未启动。

@@ -71,7 +71,12 @@ def capture(model, sample_tokens: list[str], tokenizer):
                 'vision_start_token_id': model.config.vision_start_token_id,
                 'steps': []}
         calls.append(call)
-        result = original(**kwargs)
+        generated = original(**kwargs, return_dict_in_generate=True, output_scores=True)
+        result = generated.sequences
+        width = kwargs['input_ids'].shape[1]
+        for index, (step, scores) in enumerate(zip(call['steps'], generated.scores, strict=True)):
+            step['selection'] = [{**top2(score.cpu()), 'generated_token': int(result[row, width + index])}
+                                 for row, score in enumerate(scores)]
         if len(calls) == 1:
             width = kwargs['input_ids'].shape[1]
             for token, sequence in zip(tokens, result, strict=True):
@@ -122,12 +127,13 @@ def sample_trace(call: dict, token: str) -> dict:
                        'attention_mask': step['attention_mask'][index, int((~mask).sum()):],
                        'cache_position': step['cache_position'],
                        'rope_deltas': step['rope_deltas'][index],
+                       'selection': step['selection'][index],
                        'logits': step['logits'][index]} for i, step in enumerate(call['steps'])]}
 
 
 def top2(logits: torch.Tensor) -> dict:
     values, ids = logits.float().topk(2)
-    return {'argmax': int(ids[0]), 'top2_ids': ids.tolist(), 'top2_logits': values.tolist(),
+    return {'argmax': int(logits.float().argmax()), 'top2_ids': ids.tolist(), 'top2_logits': values.tolist(),
             'margin': float(values[0] - values[1])}
 
 
@@ -171,6 +177,7 @@ def compare_traces(reference: list[dict], candidate: list[dict], rows: list[dict
             if difference is not None and difference < steps:
                 x, y = ta['steps'][difference]['logits'], tb['steps'][difference]['logits']
                 entry.update(serial=top2(x), candidate=top2(y),
+                             processed_selection=[trace['steps'][difference]['selection'] for trace in (ta, tb)],
                              max_abs_logit_delta=float((x.float() - y.float()).abs().max()),
                              same_prefix=bool(entry['inputs_equal']['input_ids']))
                 torch.save({'serial_logits': x, 'candidate_logits': y,
