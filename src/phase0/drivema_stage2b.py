@@ -113,6 +113,7 @@ def fit(*, model: torch.nn.Module, runner: Stage2Runner, train: list[SFTSample],
         resume: Path | None = None) -> dict:
     if any(s.split != 'train' for s in train) or any(s.split != 'validation' for s in monitor):
         raise ValueError('training/monitor split mismatch')
+    runner.compute_log_probs = False
     parameters = {n: p for n, p in model.named_parameters() if p.requires_grad}
     if not parameters or any('lora_' not in n for n in parameters):
         raise ValueError('only existing LoRA may be trained')
@@ -131,10 +132,12 @@ def fit(*, model: torch.nn.Module, runner: Stage2Runner, train: list[SFTSample],
                                   'actions': dict(Counter(s.target.training_text() for s in items))}
                                    for name, items in (('train', train), ('monitor', monitor))},
                'resume': str(resume) if resume else None,
+               'inference': {'batch_size': runner.inference_batch_size, 'optimized': runner.optimized,
+                             'compute_log_probs': runner.compute_log_probs},
                'loss_reduction': 'mean_of_sample_assistant_token_mean_CE; both_turns_weight_1',
                'batch_execution': 'independent_single_sample_forwards; batch_size_graphs_per_backward'})
     if state is None:
-        rows, initial = evaluate(model, runner, monitor, records)
+        rows, initial = evaluate(model, runner, monitor, records, progress_interval=16)
         write_predictions(output / 'initial_monitor_predictions.jsonl', rows)
         best = None
         step, next_epoch, next_batch = 0, 0, 0
@@ -203,7 +206,7 @@ def fit(*, model: torch.nn.Module, runner: Stage2Runner, train: list[SFTSample],
                     model.save_pretrained(checkpoint / 'adapter')
                     runner.processor.save_pretrained(checkpoint / 'adapter')
                     if validate:
-                        rows, metrics = evaluate(model, runner, monitor, records)
+                        rows, metrics = evaluate(model, runner, monitor, records, progress_interval=16)
                         metrics['action_regression'] = action_change(initial['action'], metrics['action'])
                         write_predictions(checkpoint / 'monitor_predictions.jsonl', rows)
                         write_json(checkpoint / 'monitor_metrics.json', metrics)

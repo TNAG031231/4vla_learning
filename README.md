@@ -101,6 +101,29 @@ BEV / occupancy 是场景空间表示，不直接等于安全决策，也不替�
 
 当前可写：基于 nuScenes 完成 `CAM_FRONT`、future ego trajectory 与 nearby 3D agents 对齐，派生 6 类可审计 meta-action，并完成 108 样本人工审核。BEV/OCC-aware safety evaluator、reranker、DPO、trajectory head 与 occupancy prediction 均为 planned，直至有真实代码、配置和可核查结果。
 
+## Stage 2C：Two-Turn Inference Benchmark
+
+Stage 2B 新启动进程的 Monitor / Full Validation 默认使用 batch 2，可用 `--inference-batch-size 1|2|4` 设置；该参数独立于训练配置，原训练 checkpoint / optimizer / RNG resume 合同保持不变。SFT validation 默认跳过概率 forward，概率字段保存为 `null` / `not_computed`；Stage 2A 默认继续计算真实 log-probability，`assistant_log_probs` 保持可微接口。
+
+批量生成使用左侧文本 padding，视觉 patches 与 grids 按样本/图像顺序拼接；第一轮提前结束后的 padding 不属于生成 token，第二轮仅处理有效且含 EOS 的动作，并保留原始动作 IDs。图像每条样本预处理一次，第二轮使用同一视觉输入及文本模板 suffix；Qwen3-VL 自行计算多模态位置编码。两轮各自显式启用 Transformers KV cache，**跨轮 KV cache 复用未实现**：不同动作长度、EOS 后 padding、有效子批次与 Qwen 的 `rope_deltas` / cache position 需要进一步独立验证，本阶段保留标准 prefill。
+
+以下为 AutoDL **待执行**命令；本地已验证 CLI 和 CPU 接口，真实 4B BF16 GPU 一致性、吞吐量与显存尚待验收。先将 `STAGE2B_CHECKPOINT` 设置为已完成的 SFT checkpoint 目录（其中包含 `adapter/`），保留现有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT` 和模型缓存；等待正在运行的 Full SFT 完成，不热更新其代码，在独立 checkout / 新进程运行：
+
+```bash
+conda run --no-capture-output -n codex4vla_env python scripts/benchmark_drivema_stage2c.py \
+  --checkpoint "${STAGE2B_CHECKPOINT:?Set an existing completed Stage 2B checkpoint directory}" \
+  --config configs/drivema_stage2b_full.yaml \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT" \
+  --batch-size 4 --samples 64 --warmup-samples 4 \
+  --output "$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01"
+```
+
+一次任务固定按 sample token 排序的前 64 条 validation，使用同一个模型实例 / checkpoint、BF16、SDPA 与原 greedy 参数，分别 warmup 后对比原串行含概率 forward 与批量跳过概率 forward。完整时间包含图像读取、预处理、两轮生成、可选概率和评测，排除模型/数据 intake、warmup 和产物写盘；分轮计时仅在边界同步 CUDA。P50/P95 为样本所在 batch 的完成延迟，不除以 batch size；总耗时减少比例与吞吐加速比另列。显存为 measured track 内 peak allocated（含模型）。每 16 条输出进度、elapsed、samples/s 和 ETA。
+
+输出目录必须尚不存在，包含 `metadata.json`、两条路径的 `*_predictions.jsonl` / `*_metrics.json`、`benchmark.json` 和 `summary.md`；均留在 derived root。JSON 保存分轮耗时、实际生成 token 数、完整 action metrics 及逐样本 token/span/文本/指标一致性检查。任何差异使退出码为 1，保留两侧产物供定位；一致性失败时不得引用加速数字为通过验收的性能结果。没有额外 GPU 消融或 Full Validation。
+
+后续 Turn-Level GRPO 可复用 observation 列表批量入口、每条原始 token/span 和显式可选的真实概率重算；group sampling、共享前缀 cache 管理及 GRPO loss 均未实现。
+
 ## Data
 
 nuScenes 数据受其原始许可约束，不随本仓库分发；原始/派生数据、模型权重、日志、缓存和 secrets 不进入 Git。

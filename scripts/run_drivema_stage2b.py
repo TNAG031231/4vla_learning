@@ -47,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--derived-root', type=Path, default=os.environ.get('VLA_DERIVED_ROOT'))
     parser.add_argument('--baseline-predictions', nargs=3, type=Path,
                         metavar=('WAYPOINT', 'NO_ACTION', 'MLP'), help='required for full final paired comparison')
+    parser.add_argument('--inference-batch-size', type=int, choices=(1, 2, 4), default=2)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -90,7 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
     semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
     runner = Stage2Runner(processor, StructuredCollator(processor, runtime.image_loader, args.dataset_root),
-                          device, semantic.generation_kwargs, config.trajectory_max_new_tokens)
+                          device, semantic.generation_kwargs, config.trajectory_max_new_tokens,
+                          inference_batch_size=args.inference_batch_size, optimized=True, compute_log_probs=False)
     result = fit(model=model, runner=runner, train=train, monitor=monitor, records=records, config=config,
                  output=output, resume=args.resume, provenance={'data': data_summary,
                  'model_id': FIXED_MODEL_ID, 'revision': FIXED_REVISION,
@@ -98,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == 'full':
         selected = Path(result['best']['checkpoint']) / 'adapter'
         restored = PeftModel.from_pretrained(model.unload(), selected).to(device)
-        rows, metrics = evaluate(restored, runner, validation, records)
+        rows, metrics = evaluate(restored, runner, validation, records, progress_interval=16)
         write_predictions(output / 'final_validation_predictions.jsonl', rows)
         write_json(output / 'final_validation_metrics.json', metrics)
         validation_records = {s.sample_token: records[s.sample_token] for s in validation}
