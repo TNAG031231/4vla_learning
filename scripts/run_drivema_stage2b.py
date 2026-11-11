@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--derived-root', type=Path, default=os.environ.get('VLA_DERIVED_ROOT'))
     parser.add_argument('--baseline-predictions', nargs=3, type=Path,
                         metavar=('WAYPOINT', 'NO_ACTION', 'MLP'), help='required for full final paired comparison')
-    parser.add_argument('--inference-batch-size', type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument('--inference-batch-size', type=int, choices=(1, 2, 4), default=1)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
     config = load_config(args.config)

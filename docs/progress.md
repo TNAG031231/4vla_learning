@@ -1,11 +1,14 @@
 # Project Progress
 
-## Stage 2C：分项验收（2026-11-11）
+## Stage 2C：离线吞吐优化收尾（2026-11-11）
 
-- 用户提供的真实 AutoDL 结果：四样本 Serial vs Saved / Batch 1 PASS，Batch 4 strict FAIL；相关输入、图像/grid、attention、position/RoPE/cache 对照通过。64 样本原报告为 48 个 Turn 2 generation mismatch、15 match、1 个由 Turn 1 动作变化引起的 prefix mismatch；严格失败保持原值。15/64 是样本级完整生成一致率（23.4375%），不是逐 token 一致率。
-- 用户报告同批 64 样本吞吐量 2.13×、ADE/FDE 无退化、两侧 invalid count 0（invalid rate 0）；多数分歧位置 top-2 margin 0 或 0.125，logit 差值约 0.125–0.227。Action 具体数值、ADE/FDE 绝对值、耗时/P50/P95/显存及逐 token 一致率尚未提供，本机未访问远端产物，不能补写猜测值；离线 report 入口从原始 benchmark 和 predictions 导出这些字段。
-- 已在 CPU 复现诊断错误：topk 在 tie 时的首索引不等于 argmax；450/13096 并列时旧报告可能错误地标出 argmax=13096。修正采用真正 argmax，保留 top-2 margin，并增加实际 processed-score argmax / generated-token 对齐采集；生产模型、prompt、训练和采样策略不变。
-- 新增 `scripts/report_drivema_stage2c.py` 仅读取已有 JSON/JSONL/PT 生成新目录分项报告，原 strict gate 不变；结构只声明诊断样本范围，轨迹质量独立按同批 ADE/FDE/invalid 不退化判定，Action 和性能单列。后续先核验离线 raw-selection 审计，不预先追加 GPU；PR #59 尚待审阅和合并，正式 Learning & Capability Closeout 及 Stage 3 未执行。
+- 已实现真实 batch 1/2/4 两轮生成、单轮 KV cache、视觉预处理复用、可选跳过概率 forward、低频进度、性能统计和分项验收；Stage 2B 生产 CLI 默认 inference batch **1**，Batch 2/4 显式指定。训练 loss、optimizer、resume、checkpoint selection、数据 split 和生成协议保持不变；跨轮 cache 未实现。
+- 用户确认同一批 **64 条 validation** 的 Batch 4 实验：吞吐量 **2.1346×**、总时间减少 **53.15%**；ADE@3s **0.8213 → 0.8122 m**，FDE@3s **1.7685 → 1.7484 m**，两侧 invalid count/rate **0/0%**。Longitudinal macro-F1 略降，joint accuracy 下降 **1/64（1.5625 个百分点）**，lateral macro-F1 不变；P50/P95 延迟和峰值 allocated 显存均增加。这是用户确认的 AutoDL 结果，本机未独立读取远端 artifact；完整绝对耗时/吞吐/P50/P95/显存及 Action 数值见原分项报告，未提供的数值不填估计值。
+- 原严格一致性 **FAIL** 保留：序列一致率 **23.44%**，token 一致率 **89.88%**；原分类为 48 个 Turn 2 generation mismatch、15 match、1 个 Turn 1 动作变化传递到 Turn 2 的 prefix mismatch。不能将样本一致率当作逐 token 一致率。
+- 用户确认四样本 Serial vs Saved / Batch 1 PASS，Batch 4 strict FAIL；相关 token、pixel/grid、attention、position/RoPE/cache 对照通过，范围仅限诊断四样本的可比上下文。五处已保存 raw-logits 选择审计通过；批量计算数值差异是合理解释，不能声称已证明 BF16 为唯一原因。诊断 topk tie-order 误报 argmax 已修复；真实 greedy 逐步对齐经 CPU 验证。
+- 原产物保留在 `$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01/`、`stage2c_diagnostic_run01/` 和 `stage2c_acceptance_run01/`。分项报告单列结构、数值一致性、Action/轨迹质量与性能；独立描述性轨迹质量 gate 不替换严格 FAIL，也不抹去 Action 回退及延迟/显存代价。
+- 收尾 CPU 验证：`codex4vla_env` 下 Stage 2B / Stage 2 SFT / Stage 2C inference 三个测试文件 **76 passed**，六条既有 tiny-model PEFT warning；新增默认 batch 1 与显式 2/4 CLI 测试，未改变训练配置 identity。
+- 定位为离线吞吐优化，不声称实车低延迟、实时/闭环、跨轮 KV cache 或严格预测等价；不追加 GPU 实验。PR #59 Closeout 内容已准备，正式 merge 后的评论仍按仓库流程发布；Stage 3 尚未实现，将使用独立 PR。
 
 ## Stage 2B：正式 SFT 接口与固定 Pilot
 
