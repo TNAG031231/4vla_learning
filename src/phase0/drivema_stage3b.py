@@ -84,16 +84,49 @@ def activate_policy(model: nn.Module, adapter: str, *, backward: bool = False) -
             module.attention_dropout = 0.0
 
 
+def probability_diagnostics(current: torch.Tensor, old_tf: torch.Tensor, generation: torch.Tensor,
+                            reference: torch.Tensor, turns: torch.Tensor) -> dict:
+    comparisons = {'old_tf_vs_current_tf': (old_tf, current),
+                   'generation_vs_old_tf': (generation, old_tf),
+                   'current_tf_vs_reference_tf': (current, reference),
+                   'raw_vs_aligned_ratio': ((current - generation).exp(), (current - old_tf).exp())}
+    result = {}
+    for name, (left, right) in comparisons.items():
+        difference = (left.detach().float() - right.detach().float()).abs().cpu()
+        result[name] = {}
+        for label, mask in (('all', torch.ones_like(turns, dtype=torch.bool)),
+                            ('turn_1', turns.eq(1)), ('turn_2', turns.eq(2))):
+            values = difference[mask.cpu()]
+            result[name][label] = {
+                'token_count': values.numel(),
+                'mean_abs_diff': float(values.mean()) if values.numel() else None,
+                'max_abs_diff': float(values.max()) if values.numel() else None,
+                'p95_abs_diff': float(torch.quantile(values, .95)) if values.numel() else None,
+                'diff_gt_0_05_count': int(values.gt(.05).sum()),
+            }
+    return result
+
+
 def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, images: list, group: dict,
                  optimizer: torch.optim.Optimizer, config: GRPOConfig) -> dict:
     activate_policy(model, 'default')
     parameters = [p for p in model.parameters() if p.requires_grad]
     before = [p.detach().float().cpu().clone() for p in parameters]
     optimizer.zero_grad(set_to_none=True)
+    # Snapshot every old TF probability before any backward or optimizer step.
+    activate_policy(model, 'default', backward=True)
+    old_tf_log_probs = []
+    with torch.no_grad():
+        for candidate in group['candidates']:
+            inputs, spans = replay_inputs(runner.processor, sample.observation, images, candidate, runner.device)
+            old_tf_log_probs.append(torch.cat(assistant_log_probs(model, inputs, spans)).detach().cpu())
+            del inputs
     diagnostics = []
-    for candidate in group['candidates']:
+    for candidate, old_tf in zip(group['candidates'], old_tf_log_probs, strict=True):
         inputs, spans = replay_inputs(runner.processor, sample.observation, images, candidate, runner.device)
         targets = policy_targets(candidate, runner.device)
+        generation = targets['old_log_probs']
+        targets['old_log_probs'] = old_tf.to(runner.device)
         activate_policy(model, 'reference')
         with torch.no_grad():
             reference = torch.cat(assistant_log_probs(model, inputs, spans))
@@ -106,8 +139,12 @@ def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, imag
         metrics.update(
             candidate_index=candidate['candidate_index'],
             current_log_probs=detached.cpu().tolist(), reference_log_probs=reference.cpu().tolist(),
-            old_log_probs=old.cpu().tolist(), ratios=ratios.cpu().tolist(),
-            current_old_abs_max=float((detached - old).abs().max()),
+            old_log_probs=generation.cpu().tolist(),
+            old_generation_log_probs=generation.cpu().tolist(), old_tf_log_probs=old.cpu().tolist(),
+            ratios=ratios.cpu().tolist(), raw_ratios=(detached - generation).exp().cpu().tolist(),
+            turn_ids=targets['turn_ids'].cpu().tolist(),
+            probability_diagnostics=probability_diagnostics(detached, old, generation, reference, targets['turn_ids']),
+            current_old_abs_max=float((detached - generation).abs().max()),
             current_reference_abs_max=float((detached - reference).abs().max()),
             ratio_quantiles=torch.quantile(ratios.float(), ratios.new_tensor([0., .05, .5, .95, 1.])).tolist(),
             attention_mask=inputs['attention_mask'][0].cpu().tolist(),
@@ -124,7 +161,13 @@ def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, imag
         raise FloatingPointError('nonfinite LoRA parameter update')
     activate_policy(model, 'default')
     ratios = torch.tensor([r for d in diagnostics for r in d['ratios']])
-    return {'clip_fraction': sum(sum(t['clip_fraction'] for t in d['turns']) / len(d['turns'])
+    combined = {key: torch.tensor([v for d in diagnostics for v in d[key]]) for key in
+                ('current_log_probs', 'old_tf_log_probs', 'old_generation_log_probs', 'reference_log_probs', 'turn_ids')}
+    return {'probability_diagnostics': probability_diagnostics(*combined.values()),
+            'raw_ratio_quantiles': torch.quantile(
+                torch.tensor([r for d in diagnostics for r in d['raw_ratios']]),
+                torch.tensor([0., .05, .5, .95, 1.])).tolist(),
+            'clip_fraction': sum(sum(t['clip_fraction'] for t in d['turns']) / len(d['turns'])
                                  for d in diagnostics) / len(diagnostics),
             'ratio_quantiles': torch.quantile(ratios, torch.tensor([0., .05, .5, .95, 1.])).tolist(),
             'turn_token_counts': [sum(t['tokens'] for d in diagnostics for t in d['turns']
@@ -178,7 +221,13 @@ def fit(*, model: nn.Module, runner: Stage2Runner, samples: list[SFTSample], rec
                                         'resume': str(resume) if resume else None,
                                         'reduction': 'token mean per present turn; turn mean per candidate; candidate mean',
                                         'kl_estimator': 'expm1(logp_ref-logp_current)-(logp_ref-logp_current)',
-                                        'old_policy': 'fresh rollout per optimizer step; sampled token probabilities fixed'})
+                                        'old_policy': 'independent pre-update teacher-forced default adapter; no_grad; '
+                                                      'train mode with dropout disabled; use_cache=False; '
+                                                      'FP32 selected logit minus logsumexp; detached and fixed for group',
+                                        'sampling_probability_source': 'Stage 3A generate output.scores; eval; use_cache=True; '
+                                                                       'FP32 log_softmax; original rollout spans unchanged',
+                                        'loss_ratio': 'exp(current_tf-old_tf); generation probabilities retained for audit; '
+                                                      'numerical equivalence to sampling distribution is not assumed'})
     cuda = torch.device(runner.device).type == 'cuda'
     groups, updates = [], []
     for step in range(start + 1, config.max_steps + 1):

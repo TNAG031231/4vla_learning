@@ -170,6 +170,11 @@ def test_real_sampling_fresh_online_loop_save_reload(dual_model, runner, samples
     assert first['candidates'][0]['input_ids'] != second['candidates'][0]['input_ids']
     diagnostic = json.loads((output / 'update_1.json').read_text())
     assert max(c['current_old_abs_max'] for c in diagnostic['candidates']) < 1e-4
+    assert diagnostic['ratio_quantiles'] == pytest.approx([1.] * 5, abs=1e-5)
+    assert diagnostic['probability_diagnostics']['old_tf_vs_current_tf']['all']['max_abs_diff'] < 1e-5
+    for c, d in zip(first['candidates'], diagnostic['candidates'], strict=True):
+        assert d['old_generation_log_probs'] == policy_targets(c, 'cpu')['old_log_probs'].tolist()
+        assert len(d['old_tf_log_probs']) == len(d['old_generation_log_probs'])
     assert diagnostic['kl'] == pytest.approx(0., abs=1e-7)
     assert (output / 'checkpoint_2/adapter/reference/adapter_model.safetensors').exists()
 
@@ -244,3 +249,57 @@ def test_cli_loads_sft_twice_and_persists_training(dual_model, controlled_rollou
     assert set(update['reward_means']) == {'action', 'trajectory', 'consistency'}
     with pytest.raises(ValueError, match='new directory'):
         cli.main(arguments)
+
+
+def test_generation_drift_does_not_enter_tf_ratio(dual_model, controlled_rollout, runner,
+                                                samples, records, monkeypatch):
+    config = training.load_config(ROOT / 'configs/drivema_stage3b_smoke.yaml')
+    rollout = load_config(ROOT / 'configs/drivema_stage3a.yaml')
+    sample = samples['train'][0]
+    images = runner.images(sample)
+    group = controlled_rollout[0](model=dual_model, processor=runner.processor, sample=sample,
+                                 images=images, record=records['train'][0], config=rollout, device='cpu')
+    # Reproduce the observed execution-path discrepancy, not a model parameter change.
+    for c in group['candidates']:
+        for span in c['assistant_spans']:
+            span['old_token_log_probs'] = [p + .11 for p in span['old_token_log_probs']]
+    saved = deepcopy(group)
+    calls = []
+    original_probs = training.assistant_log_probs
+    original_loss = training.grpo_loss
+
+    def record_probs(model, inputs, spans):
+        calls.append((torch.is_grad_enabled(), model.training, model.active_adapter))
+        return original_probs(model, inputs, spans)
+
+    def check_detached(current, reference, target, epsilon, beta):
+        assert current.requires_grad
+        assert not reference.requires_grad
+        assert not target['old_log_probs'].requires_grad
+        assert not target['advantages'].requires_grad
+        return original_loss(current, reference, target, epsilon, beta)
+
+    monkeypatch.setattr(training, 'assistant_log_probs', record_probs)
+    monkeypatch.setattr(training, 'grpo_loss', check_detached)
+    optimizer = torch.optim.AdamW([p for p in dual_model.parameters() if p.requires_grad], lr=1e-4)
+    result = training.update_group(dual_model, runner, sample, images, group, optimizer, config)
+    assert result['ratio_quantiles'] == pytest.approx([1.] * 5, abs=1e-5)
+    assert calls[:4] == [(False, True, 'default')] * 4
+    assert calls[4:] == [(False, False, 'reference'), (True, True, 'default')] * 4
+    assert group == saved
+    for candidate, diagnostic in zip(group['candidates'], result['candidates'], strict=True):
+        old_generation = policy_targets(candidate, 'cpu')['old_log_probs'].tolist()
+        assert diagnostic['old_generation_log_probs'] == old_generation
+        torch.testing.assert_close(torch.tensor(diagnostic['old_tf_log_probs']),
+                                   torch.tensor(diagnostic['current_log_probs']), atol=1e-5, rtol=0)
+        audit = diagnostic['probability_diagnostics']
+        assert audit['generation_vs_old_tf']['all']['mean_abs_diff'] == pytest.approx(.11, abs=1e-5)
+        assert audit['generation_vs_old_tf']['all']['diff_gt_0_05_count'] == len(old_generation)
+        assert audit['old_tf_vs_current_tf']['all']['max_abs_diff'] < 1e-5
+        assert diagnostic['assistant_spans'] == candidate['assistant_spans']
+        for span in candidate['assistant_spans']:
+            assert span['token_ids'] == candidate['input_ids'][span['start']:span['end']]
+            assert span['token_ids'][-1] == runner.processor.tokenizer.eos_token_id
+        assert len(diagnostic['turns']) == sum(candidate['turn_mask'])
+    assert result['candidates'][-1]['probability_diagnostics']['old_tf_vs_current_tf']['turn_2']['token_count'] == 0
+    assert result['lora_parameter_delta_l2'] > 0
