@@ -1,5 +1,14 @@
 # Project Progress
 
+## Stage 3B：Turn-Level GRPO Policy Update
+
+- 新增 `src/phase0/drivema_stage3b.py`、`scripts/run_drivema_stage3b.py`、`configs/drivema_stage3b_smoke.yaml`、`tests/test_drivema_stage3b.py`；从已合并 Stage 3A 的 main 开发，#61 [Learning & Capability Closeout](https://github.com/TNAG031231/4vla_learning/pull/61#issuecomment-6821954332) 已发布。
+- 实现逐 token clipped ratio（epsilon=0.2）与非负 KL estimator `expm1(ref-current)-(ref-current)`（beta=0.01），按 token → present turn → candidate 归一化；保留 invalid 实际 token，缺失第二轮不产生 loss，Old / Advantage / Reference detach。
+- 一个共享 Qwen3-VL base、两套 Full SFT adapter；Current LoRA-only AdamW 更新，Reference 固定，Old 来自每步 fresh G=4 rollout。逐候选 forward/backward 累积，non-reentrant checkpointing、BF16 base、关闭 dropout；最多 1–2 optimizer steps，未进入 Pilot / Full。
+- Checkpoint 保存 current/reference adapters、AdamW、step、CPU/CUDA RNG 与 identity；CPU 保存恢复与连续执行参数及概率诊断完全一致。输出包括逐 token old/current/reference、ratio 分布、span/EOS/mask、loss/KL/clip、gradient norm、LoRA delta、时间与 GPU allocated/reserved 峰值，以及分项 reward、A1/A2、valid-only ADE/FDE/count、invalid 和零方差统计。
+- `codex4vla_env` 联合回归：Stage 3B / 3A / Stage 2B / SFT / inference **108 passed，10 条既有类别 PEFT warnings**；Stage 3B 13 项包含真实 Tiny-Qwen 随机采样与明确标注的受控候选更新、梯度累积等价、Reference 冻结、非零 LoRA 更新及生产 CLI 的 CPU 替代运行；`--help` / `--dry-run` 已执行。
+- 本次未运行真实 GPU。用户报告 Stage 3A RTX 4080 4 场景 / 16 候选 invalid 和 missing-turn rate 均为 0，Turn 1 / 2 零方差比例分别 50% / 0%；原始 GPU artifacts 未独立复算。Stage 3B 真实 4B 概率对齐、有限梯度、非零更新、16 GB 显存适配仍待用户执行 README 的 AutoDL CLI；Consistency 上升与 ADE 未改善的相邻 group 标记只作诊断，不能据 1–2 steps 声称质量提升。
+
 ## Stage 3A：Verifiable Reward / Group Rollout / Turn-Level Advantage
 
 - Stage 3A 已实现并通过 CPU 验证，开发分支依赖 Stage 2C 集成 [PR #60](https://github.com/TNAG031231/4vla_learning/pull/60)；集成与 Stage 3A PR 均待用户审阅，尚未将未合并功能记为 main 已具备。#58 post-merge Closeout 已发布，#59 用户 Closeout 已存在。

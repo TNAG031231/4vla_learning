@@ -1,0 +1,9 @@
+rollout_config: configs/drivema_stage3a.yaml
+output_relative_dir: drivema/stage3b_smoke_run01
+max_steps: 2
+epsilon: 0.2
+beta: 0.01
+learning_rate: 0.000001
+weight_decay: 0.0
+max_grad_norm: 1.0
+gradient_checkpointing: true

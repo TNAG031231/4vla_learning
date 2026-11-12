@@ -124,6 +124,48 @@ conda run --no-capture-output -n codex4vla_env python scripts/benchmark_drivema_
 
 后续 Turn-Level GRPO 可复用 observation 列表批量入口、每条原始 token/span 和显式可选的真实概率重算；group sampling、共享前缀 cache 管理及 GRPO loss 均未实现。
 
+## Stage 3B：Turn-Level GRPO GPU Smoke
+
+Stage 3A PR #61 已合并并发布 Closeout；用户报告 RTX 4080 的 4 场景 / 16 候选验收通过，原始 GPU artifacts 本次未独立复算。Stage 3B 新增可训练入口，复用 Stage 3A 的 train intake、采样、Reward、Advantage 和 token replay，保持 SFT 与数据协议不变。
+
+Current 与 Reference 均加载 Stage 2B Full `checkpoint_3564/adapter`，共享一个 Qwen3-VL-4B base；仅 `default` LoRA 更新，`reference` LoRA 冻结。Old 是该次 fresh rollout 保存的逐 token 概率，每步采样后只更新一次；下一步用更新后的 Current 重新采样，不读取 Stage 3A 历史候选文件。默认在 Stage 3A 配置选出的 4 个 train observations 中用已保存 RNG 抽取 observation，每步 G=4，最多 2 steps。
+
+Loss 为 `-min(exp(current-old)*A, clip(exp(current-old), 0.8, 1.2)*A)` 加 `0.01 * (expm1(ref-current)-(ref-current))`；epsilon、beta、LR、gradient norm 和 checkpointing 由 `configs/drivema_stage3b_smoke.yaml` 配置。先对每轮真实 assistant tokens（含 EOS）取均值，再对该候选存在的轮次取均值，最后对四候选取均值；Turn 1 用 A1，Turn 2 用 A2，invalid 生成 token 保留，缺失轮次没有 loss。Old、Reference、Advantage 均 detach；零 advantage 的 policy 项为零，KL 仍按实际概率计算。
+
+显存管理：采样 no-grad + KV cache，Reference 顺序 no-grad forward，Current 逐候选 forward/backward 后释放计算图；四次 backward 累积后一次 AdamW step。Base 使用 BF16，PEFT 默认将 LoRA 保持 FP32，避免同时加载三份 4B；Current 使用 non-reentrant gradient checkpointing 的 train 模式，LoRA dropout 与 attention dropout 均设为零，采样和 Reference 使用 eval 模式。16 GB 峰值和真实 BF16 概率偏差仍待 GPU 验证。
+
+AutoDL 命令（CLI 参数与 CPU 替代运行已验证；以下真实 GPU 执行由用户完成）：
+
+```bash
+conda run -n codex4vla_env python scripts/run_drivema_stage3b.py --help
+conda run -n codex4vla_env python scripts/run_drivema_stage3b.py --dry-run
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_stage3b.py \
+  --config configs/drivema_stage3b_smoke.yaml \
+  --dataset-root "${NUSCENES_ROOT:?Set existing nuScenes root}" \
+  --derived-root "${VLA_DERIVED_ROOT:?Set existing derived root}"
+```
+
+前提与 Stage 3A 相同：已准备 train temporal artifacts、固定模型/processor 缓存和上述 SFT adapter；输出 `$VLA_DERIVED_ROOT/drivema/stage3b_smoke_run01` 必须不存在且位于仓库外。重复运行先在新配置中指定独立 `output_relative_dir`；不会覆盖已有结果，也不会自动进入 Pilot / Full。将 `max_steps` 改为 1 可只执行一步；入口拒绝大于 2。
+
+保存结构：
+
+```text
+metadata.json                 # config、模型 revision、数据 intake、Git、loss reduction
+rollout_1.json / rollout_2.json # 对应更新的完整 fresh group、old token probabilities、reward/advantage
+update_1.json / update_2.json   # loss/KL/clip、逐 token current/ref/old、ratio 分位数、mask/span/EOS
+                              # gradient norm、LoRA delta、时间、allocated/reserved 峰值
+                              # 分项 reward、ADE/FDE（valid-only + count）、invalid/zero-variance
+checkpoint_1/                 # checkpoint_2/ 同结构
+  adapter/                    # current LoRA weights/config
+    reference/                # 固定 SFT Reference weights/config
+  training_state.pt           # AdamW state、step、CPU/CUDA RNG、training/model/data identity
+summary.json                  # 本次 steps 与 group 统计；不作质量改善结论
+```
+
+恢复时使用相同训练配置与数据，仅修改输出目录，并传 `--resume "$VLA_DERIVED_ROOT/drivema/stage3b_smoke_run01/checkpoint_1"`；最多推进到总 step 2。恢复重新加载固定 base 和两套 adapter，恢复 optimizer/RNG 后重新采样；checkpoint 不保存 base、图像或数据集。CPU 已验证恢复后的参数和逐 token 诊断与连续运行完全一致。
+
+GPU 验收检查 `update_1.json` 的 `current_old_abs_max`、`current_reference_abs_max`、ratio 的 min/p05/median/p95/max 与逐 token 概率，以及两轮 token 数、EOS/attention mask、有限 loss/KL/gradient 和 LoRA delta；CPU 的 ratio 对齐不能替代 4B 实测。若全部 advantage 为零且初始 KL=0，零 gradient/delta 是合理结果，需要另外取得有学习信号的 fresh group 才能证明 GPU 更新生效。每步同时记录 Action / Trajectory / Consistency reward、A1/A2、ADE/FDE、invalid 和零方差比例；`consistency_up_without_error_improvement` 仅标记相邻随机 groups 中 consistency 上升而 ADE 未下降的迹象，跨 observation / 候选不可直接作因果比较，1–2 steps 不能证明轨迹质量改善。
+
 ## Stage 3A：Verifiable Reward 与四候选 Rollout
 
 Stage 3A 的开发分支依赖 [Stage 2C main 集成 PR #60](https://github.com/TNAG031231/4vla_learning/pull/60)，两者均待审阅合并；Stage 3A 固定读取 `$VLA_DERIVED_ROOT/drivema/stage2b_full_run01/checkpoint_3564/adapter`，只生成 train 候选并计算 reward/advantage，optimizer updates 为 0。
