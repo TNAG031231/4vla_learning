@@ -107,7 +107,7 @@ Stage 2B 新启动进程的 Monitor / Full Validation 默认使用 batch 1，可
 
 批量生成使用左侧文本 padding，视觉 patches 与 grids 按样本/图像顺序拼接；第一轮提前结束后的 padding 不属于生成 token，第二轮仅处理有效且含 EOS 的动作，并保留原始动作 IDs。图像每条样本预处理一次，第二轮使用同一视觉输入及文本模板 suffix；Qwen3-VL 自行计算多模态位置编码。两轮各自显式启用 Transformers KV cache，**跨轮 KV cache 复用未实现**：不同动作长度、EOS 后 padding、有效子批次与 Qwen 的 `rope_deltas` / cache position 需要进一步独立验证，本阶段保留标准 prefill。
 
-以下保留已执行实验的复现入口，当前收尾不再安排 GPU 执行；本地已验证 CLI 和 CPU 接口，首次真实 4B BF16 GPU 结果及当前分项验收状态见下文。先将 `STAGE2B_CHECKPOINT` 设置为已完成的 SFT checkpoint 目录（其中包含 `adapter/`），保留现有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT` 和模型缓存；等待正在运行的 Full SFT 完成，不热更新其代码，在独立 checkout / 新进程运行：
+以下保留已执行实验的复现入口，当前收尾不再安排 GPU 执行；本地已验证 CLI 和 CPU 接口，首次真实 4B BF16 GPU 结果及当前分项验收状态见下文。先将 `STAGE2B_CHECKPOINT` 设置为已完成的 SFT checkpoint 目录（其中包含 `adapter/`），保留现有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT` 和模型缓存；Full SFT 已由用户确认完成，在独立 checkout / 新进程运行：
 
 ```bash
 conda run --no-capture-output -n codex4vla_env python scripts/benchmark_drivema_stage2c.py \

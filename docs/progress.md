@@ -2,6 +2,8 @@
 
 ## Stage 2C：离线吞吐优化收尾（2026-11-11）
 
+- 集成核验（2026-11-12）：#58 squash commit `078f997` 已进入 main；#59 squash commit `a41223a` 合入旧 Stage 2B 分支，未进入 main。独立集成分支从最新 main 仅 cherry-pick #59 增量，保留 Stage 2B 学习总结及 Full 结果；集成 PR 合并前不将 Stage 2C 记为 main 已具备。集成 CPU 回归 **76 passed / 6 既有 PEFT warnings**，无新 GPU 实验。
+
 - 已实现真实 batch 1/2/4 两轮生成、单轮 KV cache、视觉预处理复用、可选跳过概率 forward、低频进度、性能统计和分项验收；Stage 2B 生产 CLI 默认 inference batch **1**，Batch 2/4 显式指定。训练 loss、optimizer、resume、checkpoint selection、数据 split 和生成协议保持不变；跨轮 cache 未实现。
 - 用户确认同一批 **64 条 validation** 的 Batch 4 实验：吞吐量 **2.1346×**、总时间减少 **53.15%**；ADE@3s **0.8213 → 0.8122 m**，FDE@3s **1.7685 → 1.7484 m**，两侧 invalid count/rate **0/0%**。Longitudinal macro-F1 略降，joint accuracy 下降 **1/64（1.5625 个百分点）**，lateral macro-F1 不变；P50/P95 延迟和峰值 allocated 显存均增加。这是用户确认的 AutoDL 结果，本机未独立读取远端 artifact；精确数值由用户于 2026-11-12 提供的 summary.md 补齐，见下表。
 - 原严格一致性 **FAIL** 保留：序列一致率 **23.44%**，token 一致率 **89.88%**；原分类为 48 个 Turn 2 generation mismatch、15 match、1 个 Turn 1 动作变化传递到 Turn 2 的 prefix mismatch。不能将样本一致率当作逐 token 一致率。
@@ -53,7 +55,7 @@
 - 历史最强 Ego-History MLP 为 `0.814533 / 1.772458 m`，Full 的 ADE/FDE 分别减少 `0.063853 / 0.130764 m`，相对下降 **7.84% / 7.38%**；这是完整 validation 汇总比较，不替代逐样本 win rate 或显著性分析。
 - 本次 CPU 验证：`OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q tests/test_drivema_stage2b.py tests/test_drivema_stage2_sft.py tests/test_phase0_4b_protocol.py tests/test_phase0_4c_two_turn_planner.py tests/test_phase0_4c_full_train.py`：**95 passed，6 warnings**（既有 tiny-model PEFT 提示）。覆盖真实 processor/随机 tiny Qwen 的 causal CE、LoRA 更新与重载、CPU exact resume、split 隔离、checkpoint 选择、baseline 对齐拒绝及 Full 3564 steps/末组一个样本。
 - 验收：实现及 CPU 回归通过，用户确认真实 Full training / validation 完成；本轮代码审阅未发现合并阻塞问题。AutoDL monitor 排名、完整 per-class/confusion matrix、action regression 和 baseline comparison 原始产物未独立核验，保留为证据补充项，不编造其数值或通过状态。
-- PR #58 尚未合并，正式 merge 后 Learning & Capability Closeout 评论待发布；完整待发布内容保存在 #58 PR 描述。#59 以 #58 为 base，顺序为先合并 #58，再将 #59 retarget 到 main 并审阅其独立 diff。本次不引入 Stage 2C，不实现 Stage 3；Stage 3 复用两轮 token/span/log-prob 接口，reward、group sampling 和 turn-level objective 另行定义及验证。
+- PR #58 已合并到 main，正式 [Learning & Capability Closeout](https://github.com/TNAG031231/4vla_learning/pull/58#issuecomment-6814311480) 已发布；#59 已合并到旧 Stage 2B 分支，进入 main 的集成工作见上方记录。Stage 3 复用两轮 token/span/log-prob 接口，reward、group sampling 和 turn-level objective 独立实现与验收。
 - 学习总结：[Stage 2B：Two-Turn SFT](stage2b_learning_summary.md)。本轮更新本文件与项目计划，新增该学习总结；AGENTS.md、README.md 和历史实验结果保持原状。
 
 ## 独立 DriveMA-style Stage 2：Two-Turn Trajectory Token SFT
