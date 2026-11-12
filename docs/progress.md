@@ -1,5 +1,17 @@
 # Project Progress
 
+## Stage 3A：Verifiable Reward / Group Rollout / Turn-Level Advantage
+
+- Stage 3A 已实现并通过 CPU 验证，开发分支依赖 Stage 2C 集成 [PR #60](https://github.com/TNAG031231/4vla_learning/pull/60)；集成与 Stage 3A PR 均待用户审阅，尚未将未合并功能记为 main 已具备。#58 post-merge Closeout 已发布，#59 用户 Closeout 已存在。
+- 新增独立 `src/phase0/drivema_stage3_rewards.py`、`src/phase0/drivema_stage3a.py`、`scripts/run_drivema_stage3a.py`、`configs/drivema_stage3a.yaml` 和 `tests/test_drivema_stage3a.py`；既有 Stage 2B/2C 源码、checkpoint、评测协议保持原状。
+- 固定初始化 `drivema/stage2b_full_run01/checkpoint_3564/adapter`，train-only intake，部分有效动作 GT 按有效维度平均；无动作监督或无有效轨迹点的样本排除并计数。默认前 4 个合格 train observations，每组 G=4、micro-batch=1、seed=20261112，两轮 temperature=1 / top_p=1 / top_k=0 随机生成。
+- 奖励：`R_action=mean(valid_axis_correct)`；`R_traj=exp(-(0.7*ADE3+0.3*FDE3)/1m)`；`R_cons=mean(predicted_action==trajectory_projection)`。3 秒终点缺失采用明确记录的有效点 ADE-only；冻结 temporal v0.1 仍要求六点有效，此分支仅以合成 reward 输入验证。Projection 复用冻结动作阈值，名义网格/量化对真实边界样本的影响仍待用户 GPU rollout 后审阅。
+- 两轮分别计算 `r1=R_action`、`r2=R_traj+0.5*R_cons`，组内使用 sample std（correction=1）、eps=1e-4；零方差 advantage=0。四候选全部保留，缺失 Turn 2 的零奖励参与统计，但没有该轮 token/span，policy targets 只包含实际生成 tokens。统计 reward mean/std、zero-variance group rate、invalid/missing-turn rate。
+- 已复现并修复 Stage 3A 初始采样实现中的 Transformers model-default 继承问题：仅传新 GenerationConfig 仍会注入模型默认 repetition penalty；改为显式 `use_model_defaults=False`。真实 Tiny-Qwen 检查实际 processor/warper 列表为空，采样 old token log-prob 与 causal teacher-forced 重算概率对齐；真实随机输出原样保留 invalid，受控示例单独标注。
+- Artifact contract `drivema-stage3a-group-v0.1`：输出 metadata、groups JSONL、summary 与可读 example；记录 checkpoint、seed、完整 generation config、Observation、每个候选原始 IDs、完整 prefix、assistant span/EOS、parser status、waypoints、三项 reward、分轮 advantage/mask。`replay_inputs` + 既有 `assistant_log_probs` + `policy_targets` 支持 Stage 3B old/current/reference 同位置概率输入，尚未实现 clipped loss、KL 或 optimizer update。
+- CPU 命令：`OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q tests/test_drivema_stage3a.py tests/test_drivema_stage2b.py tests/test_drivema_stage2_sft.py tests/test_drivema_stage2_inference.py`：**95 passed（Stage 3A 19 项），6 条既有 PEFT warnings**；CLI `--help`、`--dry-run`、`git diff --check` 通过。测试覆盖 producer-backed intake、真实 processor/tiny-model sampling、完整组持久化、生成输入隔离、1/3 历史图像、缺失/invalid turns、per-token ratio 输入和零参数更新。
+- 本机未运行真实 4B GPU rollout/GRPO，RTX 4080 训练显存、真实随机采样 invalid rate 与 reward 分布待用户执行。四候选受控 synthetic 示例、概率合同和 Stage 3B GPU 工作入口见 README Stage 3A；正式参数更新另立 Stage 3B 任务。
+
 ## Stage 2C：离线吞吐优化收尾（2026-11-11）
 
 - 集成核验（2026-11-12）：#58 squash commit `078f997` 已进入 main；#59 squash commit `a41223a` 合入旧 Stage 2B 分支，未进入 main。独立集成分支从最新 main 仅 cherry-pick #59 增量，保留 Stage 2B 学习总结及 Full 结果；集成 PR 合并前不将 Stage 2C 记为 main 已具备。集成 CPU 回归 **76 passed / 6 既有 PEFT warnings**，无新 GPU 实验。

@@ -1,0 +1,18 @@
+seed: 20261112
+group_size: 4
+rollout_micro_batch: 1
+train_samples: 4
+checkpoint_relative_path: drivema/stage2b_full_run01/checkpoint_3564
+output_relative_dir: drivema/stage3a_rollout_run01
+action_max_new_tokens: 24
+trajectory_max_new_tokens: 192
+do_sample: true
+temperature: 1.0
+top_p: 1.0
+top_k: 0
+reward:
+  ade_weight: 0.7
+  fde_weight: 0.3
+  distance_scale_m: 1.0
+  consistency_weight: 0.5
+  advantage_eps: 0.0001

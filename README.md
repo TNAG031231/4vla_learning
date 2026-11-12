@@ -124,6 +124,47 @@ conda run --no-capture-output -n codex4vla_env python scripts/benchmark_drivema_
 
 后续 Turn-Level GRPO 可复用 observation 列表批量入口、每条原始 token/span 和显式可选的真实概率重算；group sampling、共享前缀 cache 管理及 GRPO loss 均未实现。
 
+## Stage 3A：Verifiable Reward 与四候选 Rollout
+
+Stage 3A 的开发分支依赖 [Stage 2C main 集成 PR #60](https://github.com/TNAG031231/4vla_learning/pull/60)，两者均待审阅合并；Stage 3A 固定读取 `$VLA_DERIVED_ROOT/drivema/stage2b_full_run01/checkpoint_3564/adapter`，只生成 train 候选并计算 reward/advantage，optimizer updates 为 0。
+
+`configs/drivema_stage3a.yaml` 默认选择按 sample token 排序的前 4 个合格 train observations，每个生成 G=4 个候选，micro-batch=1；保留部分有效动作标签，排除两轴都无监督或无有效轨迹点的样本。输入复用历史 CAM_FRONT/ego state，GT 只在生成完成后的 reward 计算使用。SFT 的 joint-valid eligibility 和 validation evaluator 保持原定义。
+
+- Action reward：有效 GT 维度上的正确率，两轴有效时各占 0.5；无效/未结束动作得 0。
+- Trajectory reward：`exp(-(0.7*ADE@3s + 0.3*FDE@3s)/1m)`，复用原 evaluator 和 mask；3 秒终点缺失时记录 `masked_ADE_only_missing_3s_endpoint`，只用有效点 ADE。冻结 temporal v0.1 intake 仍要求六点有效，缺终点规则在 reward 单元测试中验证。
+- Consistency reward：复用 `trajectory_to_meta_action` 和冻结阈值，与第一轮动作逐轴比较并平均；无效轨迹得 0。
+- `r1=R_action`，`r2=R_traj+0.5*R_cons`；每轮独立按四个候选计算 `(r-mean)/(std+1e-4)`，`std` 使用 sample standard deviation（correction=1），完全零方差时 advantage=0。无效和缺失候选的零奖励保留在四候选统计中，不重采样。
+
+两轮均使用 categorical sampling：`do_sample=True, temperature=1, top_p=1, top_k=0`。显式 `use_model_defaults=False` 禁止 Transformers 将模型默认 repetition penalty 等注入采样；保存完整 GenerationConfig。CPU 测试核对实际 logits processor/warper 列表为空，并比较生成 scores 提取的 old log-prob 与相同 token 的 teacher-forced raw log-prob。第二轮 prefix 保留当前候选第一轮实际 IDs，EOS/长度截断单独记录。
+
+已执行的本地检查：
+
+```bash
+conda run -n codex4vla_env python scripts/run_drivema_stage3a.py --help
+conda run -n codex4vla_env python scripts/run_drivema_stage3a.py --dry-run
+```
+
+真实 GPU rollout 由用户执行（本机未运行）：从 clean checkout 设置已有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT`，使用上述入口去掉 `--dry-run`；默认参数在 YAML 中，`--config` 可指定配置副本和新的 output_relative_dir。已有输出目录拒绝覆盖，原 SFT checkpoint 只读。
+
+输出位于配置指定的 derived 目录：`metadata.json`（checkpoint/版本/seed/实际 generation config）、`groups.jsonl`、`summary.json`、`example.md`。每组保存 Observation 与四个 candidate；每个 candidate 保存 sample token、candidate index、完整 input IDs、各轮 prefix IDs、assistant `[start,end)`、实际生成 IDs、EOS、parser status、waypoints、reward、advantage 和 turn mask。缺失第二轮没有 span/假 token；已生成但无效或达到长度上限的 tokens 保留，用低奖励学习。
+
+Stage 3B 接口：`replay_inputs` 以原 Observation 重建视觉输入并恢复完整 IDs；`assistant_log_probs` 可分别对 current/reference 模型重算同一组 span；`policy_targets` 返回对应 old log-probs、目标位置、`t-1` logits 位置、逐 token turn ID/advantage/loss mask。只包含真实生成 tokens，prompt/图像/user suffix 不进入 loss；old probabilities 和 advantage 已 detach。Stage 3B 重算时应保持 eval 模式关闭 dropout，同时为 current policy 保留梯度，冻结 old/reference；当前阶段没有 GRPO loss、KL 或 optimizer loop。
+
+四候选可读示例（**受控 synthetic 测试，非真实 4B 随机采样结果**）：观测为一帧合成 CAM_FRONT 与 unavailable ego state，GT action 为 keep/straight，GT 轨迹 `P=[(1,0),…,(6,0)]`，停止轨迹 `Z=[(0,0)]×6`。
+
+| 候选 | 预测动作 | 预测轨迹 | R_action / R_traj / R_cons | A1 / A2 | Turn mask |
+| --- | --- | --- | --- | --- | --- |
+| 0 | keep / straight | P | 1 / 1 / 1 | 1.224445 / 0.996376 | true / true |
+| 1 | stop / straight | Z | 0.5 / 0.014264 / 1 | 0 / -0.439674 | true / true |
+| 2 | keep / left | P | 0.5 / 1 / 0.5 | 0 / 0.632168 | true / true |
+| 3 | invalid | 缺失 | 0 / 0 / 0 | -1.224445 / -1.188870 | true / false |
+
+最后一行的 A2 参与统计记录，但没有第二轮训练 token。随机 Tiny-Qwen 的真实候选按原样记录 invalid；不会用上表示例替换随机输出。
+
+参考 [DriveMA 官方 per-turn reward / advantage 实现](https://github.com/Tsinghua-MARS-Lab/DriveMA/blob/de20e6c64878bc3413d26d69362c3be9b3a91533/swift/rlhf_trainers/grpo_trainer.py)：分别构造两轮标量奖励、按组归一化，再映射到该轮 token。本项目采用本次指定的 3 秒六点、三项 reward 权重和 LoRA 初始化，不迁移官方额外 reward 或训练框架。
+
+RTX 4080 上的下一步是 Stage 3B：实现逐 token clipped ratio objective 与 reference KL；冻结行为策略概率和 SFT reference、只更新 current LoRA，按 observation/group 组织 accumulation 与 mask；先测无更新时 ratio≈1 和有限梯度，再验证少量更新、保存重载、峰值显存与 GPU smoke。G=4 micro-batch=1 控制 rollout 峰值，reference 顺序计算/CPU offload 或 adapter 切换的显存方案仍需真实测量；本阶段没有 4080 训练显存结论。
+
 ## Data
 
 nuScenes 数据受其原始许可约束，不随本仓库分发；原始/派生数据、模型权重、日志、缓存和 secrets 不进入 Git。

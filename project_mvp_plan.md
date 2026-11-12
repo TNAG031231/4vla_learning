@@ -216,6 +216,8 @@ Verifier（验证器）第一版是版本化、可单元测试的规则检查工
 
 ### 2.6 独立 DriveMA-style Two-Turn SFT → Turn-Level GRPO 路线
 
+**Stage 3A 独立扩展（2026-11-12）：** 用户授权在 Stage 2C 集成分支上启动 train-only reward / rollout / advantage，依赖尚待合并的集成 PR #60。固定以 Stage 2B Full `checkpoint_3564` 为行为策略；G=4、micro-batch=1、两轮无截断 categorical sampling。Action 正确性、`exp(-(0.7*ADE3+0.3*FDE3)/1m)` 与冻结规则的动作—轨迹一致性分别构成 reward，Turn 1 使用 Action，Turn 2 使用 Trajectory + 0.5 Consistency，各自按组归一化并映射至真实生成 tokens。缺终点时仅计算有效点 ADE；不修改冻结数据 validator。工程验收和产物合同见 docs/progress.md / README Stage 3A；Stage 3B 的 clipped policy loss、reference KL、LoRA 更新和真实 GPU smoke 仍为 planned。本扩展复用已有模型和评测定义，不引入 Critic 或其他轨迹架构。
+
 **Stage 2B 已完成（2026-11-12，用户确认 AutoDL 结果）：** 固定 512 train / 128 monitor Pilot 后，Full 使用 `configs/drivema_stage2b_full.yaml`：14,253 train、1 epoch、batch 1 / accumulation 4、LR 1e-4、3564 optimizer steps，每 891 steps 在固定 128 条 monitor 上验证。checkpoint 按 invalid count → ADE@3s → FDE@3s → earliest step 选择，用户报告选中 `stage2b_full_run01/checkpoint_3564`；重载选中模型后完整 3594 条 validation 的 ADE/FDE 为 **0.750680 / 1.641694 m**、invalid **0/3594**。CPU 验证、动作指标及历史 baseline 比较见 `docs/progress.md`，机制解释见 `docs/stage2b_learning_summary.md`；GPU 结果由用户提供，本次未独立重算。PR #58 合并后完成 Closeout，再按依赖顺序处理 #59；Stage 3 Turn-Level GRPO 继续为 planned。
 
 本路线按用户于 2026-11-10 指定的范围独立实现，仅启动 **Stage 2：Two-Turn Action-Conditioned Trajectory SFT**；Stage 3 Turn-Level GRPO 为 `planned`，安全 scorer 不在本轮范围。历史 Phase 0.4c 的 frozen Qwen/LoRA + continuous WaypointDecoder、checkpoint、数据协议和实验结果保持原状；本路线使用单独入口和输出目录。此前关于 continuous decoder 缺少 trajectory token likelihood 的判断继续适用于历史模型。
