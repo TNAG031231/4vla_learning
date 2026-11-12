@@ -1,11 +1,38 @@
 # Project Progress
 
+## Stage 2B：正式 SFT 接口与固定 Pilot
+
+- 用户于 2026-11-10 报告真实 AutoDL Tiny Overfit：`gpu_smoke_passed=true`、`tiny_overfit_passed=true`、100 nonzero gradient steps、LoRA delta L2 `3.0511568`、train ADE/FDE@3s `0.001937 / 0.002751 m`、validation `7.172948 / 12.474631 m`、reload consistency true。本轮未取得原始 artifact 独立重算；该证据支持训练链路和小样本拟合，尚不证明泛化。PR #57 已核实 merged，用户明确豁免其 Closeout。
+- 独立新增 `src/phase0/drivema_stage2b.py`、`scripts/run_drivema_stage2b.py`、`configs/drivema_stage2b_pilot.yaml`、`tests/test_drivema_stage2b.py`；复用 Stage 2 的 runner、mask、生成、parser、action metrics、ADE/FDE 和冻结数据 intake，历史 smoke/tiny 入口与配置保持原状。
+- Pilot 固定 seed `20261110`、512 train / 128 validation、1 epoch、batch size 1、accumulation 4、AdamW LR `1e-4`、weight decay 0、gradient clip 1；每 64 optimizer steps 保存与监控，末步必保存和监控，共 128 steps。初始化只在这 128 条 validation 上建立 step-3564 参考；中间不生成完整 validation。采样先按动作轮转，再优先当前全局采样数较少的 scene；组内固定 seed 打乱，每个 split 独立选择，保存 token 清单、scene 数和动作分布。
+- 初始监督沿用 PR #57：每个样本内两轮 assistant tokens（含 EOS）权重均为 1，按 token 数平均，再在 effective batch 上按样本平均；并非两轮 CE 各占 50%。分别记录 action/trajectory token CE 和 token 数、实际优化 loss、梯度范数、step 参数变化 L2、峰值 allocated/reserved 显存、训练耗时、samples/s 和 supervised tokens/s；吞吐范围不含监控和 checkpoint IO。batch_size 使用独立单样本 forward 累积多个计算图后统一 backward，保留原 processor/两轮接口；不是 padded vectorized batch，显存应先由 Pilot 确认。
+- 预固定模型选择：monitor invalid 数量最少 → ADE@3s 最低 → FDE@3s 最低 → 更早 step；只在实际监控过的 checkpoints 中选择。每次监控保存完整逐样本输出及既有 action/trajectory metrics，并记录相对初始化的纵向/横向 macro-F1、joint accuracy 差值和任一下降标志；该标志为描述性退化检查，不临时改变 checkpoint 排名规则。
+- checkpoint 保存 adapter/processor、AdamW state、完成的 step、下一 epoch/batch、CPU/CUDA RNG、subset/config 和已有 best checkpoint。`--resume` 从完整 checkpoint 恢复，配置与 token 身份必须相同（仅输出目录可变）；恢复写入新目录，保留原目录及其 best checkpoint 引用。失败直接报错并保留已写产物；缺少 `training_state.pt` 的部分 checkpoint 不能用于恢复。
+- Full 入口支持完整 train 和同一固定 monitor 子集，要求显式输入 Pilot 后确定的 epochs/LR、新输出目录及三条历史预测文件。训练结束重载 monitor 选出的 checkpoint，仅进行一次完整 3594 条 validation；复用原 `aligned_metrics`/`compare`，核对 exact sample tokens、scene、GT target（float32 口径）、mask 和轨迹有效性，重算与 WaypointDecoder predicted-action、No-action、Ego-History MLP 的指标及共同合法样本配对差值。用户必须提供准确 checkpoint 对应的预测文件，不混入 GT-action oracle。历史参考固定为 predicted-action Epoch 2、No-action Epoch 2、Ego-History MLP best Epoch 16；本次未取得 AutoDL 的 baseline_comparison.json，以下提升为用户提供汇总值的算术比较，逐样本配对结果待该产物核验。
+- Pilot 已完成（用户提供的 AutoDL 结果）：512 train / 128 monitor、128 optimizer steps；初始 114/128 合法，ADE/FDE `7.079219 / 12.118199 m`；step 64 全合法，`1.231462 / 2.795354 m`；step 128 全合法，`1.237849 / 2.725426 m`。按预固定规则选择 step 64；step 128 的纵向/横向 macro-F1 为 `0.680410 / 0.789265`、joint accuracy `0.53125`，这些动作指标不冒充 best checkpoint 指标。
+- Full 已完成（用户于 2026-11-12 提供的真实 AutoDL 结果）：Qwen3-VL-4B-Instruct、Two-Turn LoRA SFT、14,253 train / 3,594 validation、1 epoch、AdamW LR `1e-4`、batch 1 / accumulation 4，共 **3,564 optimizer steps**。配置 `configs/drivema_stage2b_full.yaml` 固定 seed `20261110`，每 891 steps 保存/监控，monitor 为同一固定 128 条子集；从原动作 `adapter_step_3564` 初始化，Full 不从 Pilot checkpoint 继续训练。
+- 用户报告 selected checkpoint 为 `stage2b_full_run01/checkpoint_3564`，完整 validation 结果如下；AutoDL 日志与逐样本预测未交付本次核验，Codex 未重新训练或独立重算 GPU 指标。
+
+| Full validation 指标 | 结果 |
+| --- | --- |
+| ADE@3s / FDE@3s | **0.750680 / 1.641694 m** |
+| Invalid trajectories | **0 / 3594（0%）** |
+| Longitudinal Macro-F1 | **0.680549** |
+| Lateral Macro-F1 | **0.830635** |
+| Joint Accuracy | **0.651363** |
+
+- 历史最强 Ego-History MLP 为 `0.814533 / 1.772458 m`，Full 的 ADE/FDE 分别减少 `0.063853 / 0.130764 m`，相对下降 **7.84% / 7.38%**；这是完整 validation 汇总比较，不替代逐样本 win rate 或显著性分析。
+- 本次 CPU 验证：`OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q tests/test_drivema_stage2b.py tests/test_drivema_stage2_sft.py tests/test_phase0_4b_protocol.py tests/test_phase0_4c_two_turn_planner.py tests/test_phase0_4c_full_train.py`：**95 passed，6 warnings**（既有 tiny-model PEFT 提示）。覆盖真实 processor/随机 tiny Qwen 的 causal CE、LoRA 更新与重载、CPU exact resume、split 隔离、checkpoint 选择、baseline 对齐拒绝及 Full 3564 steps/末组一个样本。
+- 验收：实现及 CPU 回归通过，用户确认真实 Full training / validation 完成；本轮代码审阅未发现合并阻塞问题。AutoDL monitor 排名、完整 per-class/confusion matrix、action regression 和 baseline comparison 原始产物未独立核验，保留为证据补充项，不编造其数值或通过状态。
+- PR #58 尚未合并，正式 merge 后 Learning & Capability Closeout 评论待发布；完整待发布内容保存在 #58 PR 描述。#59 以 #58 为 base，顺序为先合并 #58，再将 #59 retarget 到 main 并审阅其独立 diff。本次不引入 Stage 2C，不实现 Stage 3；Stage 3 复用两轮 token/span/log-prob 接口，reward、group sampling 和 turn-level objective 另行定义及验证。
+- 学习总结：[Stage 2B：Two-Turn SFT](stage2b_learning_summary.md)。本轮更新本文件与项目计划，新增该学习总结；AGENTS.md、README.md 和历史实验结果保持原状。
+
 ## 独立 DriveMA-style Stage 2：Two-Turn Trajectory Token SFT
 
-- 已新增 `scripts/run_drivema_stage2_sft.py`、`configs/drivema_stage2_smoke.yaml`、`src/phase0/drivema_stage2_protocol.py`、`src/phase0/drivema_stage2_sft.py` 和 `tests/test_drivema_stage2_sft.py`；protocol 为 `drivema-stage2-two-turn-v0.1`。入口仅支持 tiny train/validation smoke，正式训练配置尚未决定；本路线范围及官方实现依据见 `project_mvp_plan.md` §2.6。
+- 已新增 `scripts/run_drivema_stage2_sft.py`、`configs/drivema_stage2_smoke.yaml`、`src/phase0/drivema_stage2_protocol.py`、`src/phase0/drivema_stage2_sft.py` 和 `tests/test_drivema_stage2_sft.py`；protocol 为 `drivema-stage2-two-turn-v0.1`。该历史入口仅支持 tiny train/validation smoke；正式训练已由上方 Stage 2B 独立入口完成；本路线范围及官方实现依据见 `project_mvp_plan.md` §2.6。
 - 初始化入口固定加载 Phase 0.4b `adapter_step_3564` 并开放已有 LoRA 更新，base 保持冻结；复用原 processor revision、历史观测序列化、动作 prompt/parser、冻结 temporal intake 和 ADE/FDE evaluator。训练为两轮 assistant 内容及 EOS 的 token CE，GT action 用于 teacher forcing；验证使用模型自己生成的 action tokens，再生成六个两位小数的 waypoint。输入/输出坐标、3 秒 horizon、0.5 秒 interval 保持原合同。
 - 本地 CPU 已执行 `codex4vla_env` 下 **83 passed**（新增 Stage 2 21 项及相关既有测试），环境为 PyTorch `2.9.1`、Transformers `4.57.6`、PEFT `0.17.1`。证据包含真实 pinned processor、真实 producer helper 生成的 synthetic fixtures、随机小型 Qwen 前向/反向、LoRA-only 参数更新、causal log-prob 与标准 masked CE 数值一致、保存重载，以及 sample-level 持久化；合法 rollout 链路使用受控生成，随机 Qwen 真实生成被记录为 invalid。该结果不代表真实 4B checkpoint 已学习合法轨迹。PEFT 对随机模型缺少预训练 config 及 unload 后残留 `peft_config` 给出两条 warning；reload token、概率和预测比较通过。
-- 已执行 CLI `--help`、`--dry-run`、`git diff --check` 及 workspace cleanup dry-run。本机 CUDA unavailable，用户确认暂时没有可用 GPU 机器；真实 step-3564 checkpoint intake、冻结实数据 intake、GPU smoke、真实 tiny overfit 和全量 validation **NOT RUN**。本轮未读取 test 数据，未改变历史模型/checkpoint/冻结数据/实验结果；Stage 3 GRPO、安全 scorer 均未实现。
+- 历史 CPU 接口验收执行了 CLI `--help`、`--dry-run`、`git diff --check` 及 workspace cleanup dry-run；当时 GPU 尚未运行。后续用户确认 GPU smoke、Tiny Overfit 与 Full SFT 已完成，当前结果见上方 Stage 2B；本次未新增 GPU 执行或 test 读取。Stage 3 GRPO、安全 scorer 均未实现。
 - GPU 入口会在全量 train/validation intake 后确定 tiny 子集，仅训练 2 个 train samples、评估 2 个 validation samples；默认 100 optimizer steps。`summary.json` 分开记录 `gpu_smoke_passed`（真实 CUDA 模型/adapter、有限 loss/梯度、参数更新和重载一致）、`tiny_overfit_passed`（train CE 比例和 ADE，含完整合法轨迹）及 `validation_status`（独立动作/轨迹指标）。validation 合法率不作为 GPU smoke gate。CLI `--mode gpu-smoke` 只运行 2 steps，`--mode tiny-overfit` 保留 100 steps，后者退出码同时要求运行链路及 tiny gate 通过；CPU 接口测试不会将 GPU 字段写为通过。checkpoint 在生成评测前保存，异常直接报错并保留已写产物，`--output-relative-dir` 可指定新目录重跑，已有目录仍拒绝覆盖。
 - 产物写入 `$VLA_DERIVED_ROOT/drivema/stage2_smoke_v0_1/`：`metadata.json`、`training_history.jsonl`、`train_predictions.jsonl`、`validation_predictions.jsonl`、`validation_metrics.json`、`reload_consistency.json`、`summary.json` 和 `adapter/`。目录已存在时拒绝覆盖。逐样本包含预测动作、原始轨迹文本、parser 状态、原始 GT 数值及 mask、ADE/FDE、完整 token IDs、两轮 assistant span（半开区间、含 EOS）及原始策略 token log-probability；invalid 保留在总分母，ADE/FDE 明确仅统计合法预测。
 - 后续 GRPO 的实现位置为 `AssistantSpan`、`assistant_log_probs`、`generate_two_turn`、`parse_trajectory` 和 `trajectory_to_meta_action`。当前 log-prob 为未做 temperature/top-p 变换的策略概率，可微重算接口与离线保存值分开；当前生成是 greedy，尚未实现 group sampling、old/reference policy、turn-level advantage 或 RL objective。轨迹 projection 复用冻结动作阈值，在名义采样网格上计算；它与原始实际 timestamp 标签的边界差异仍需真实数据验证。
@@ -18,7 +45,7 @@ conda run -n codex4vla_env python scripts/run_drivema_stage2_sft.py --help
 conda run -n codex4vla_env python scripts/run_drivema_stage2_sft.py --dry-run
 ```
 
-真实 GPU 待执行命令（本轮未运行；需先提供 BF16 CUDA 机器、pinned base cache、原 step-3564 adapter 和冻结数据）：
+历史 GPU 入口（当前执行结果见上方 Stage 2B；此处保留入口说明）：
 
 ```bash
 conda run -n codex4vla_env python scripts/run_drivema_stage2_sft.py --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"

@@ -1,0 +1,13 @@
+seed: 20261110
+epochs: 1
+batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 0.0001
+max_grad_norm: 1.0
+checkpoint_interval: 64
+validation_interval: 64
+train_samples: 512
+monitor_samples: 128
+trajectory_max_new_tokens: 192
+output_relative_dir: drivema/stage2b_pilot_run01
+selected_adapter_relative_path: phase_0_4/structured_action_lora_full_v0_1/adapter_step_3564
