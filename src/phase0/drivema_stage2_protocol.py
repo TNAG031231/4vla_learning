@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 import re
+import time
 
 import torch
 from torch import nn
@@ -120,9 +122,25 @@ def assistant_log_probs(model: nn.Module, inputs: dict,
     return list(log_probs.split([span.end - span.start for span in spans]))
 
 
+@contextmanager
+def measure(timings: dict | None, name: str, device: str) -> Iterator[None]:
+    if timings is None:
+        yield
+        return
+    cuda = torch.device(device).type == "cuda"
+    if cuda:
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    yield
+    if cuda:
+        torch.cuda.synchronize(device)
+    timings[name] = timings.get(name, 0.0) + time.perf_counter() - started
+
+
 def generate_two_turn(*, model: nn.Module, processor: object, observation: Observation,
                       images: Sequence[object], device: str, action_generation: dict,
-                      trajectory_max_new_tokens: int) -> dict:
+                      trajectory_max_new_tokens: int, compute_log_probs: bool = True,
+                      timings: dict | None = None) -> dict:
     model.eval()
     messages = inference_messages(observation, images)
     first = _move_batch(processor.apply_chat_template(
@@ -131,7 +149,8 @@ def generate_two_turn(*, model: nn.Module, processor: object, observation: Obser
     validate_processor_inputs(first, expected_batch_size=1, expected_image_count=len(images))
     eos = processor.tokenizer.eos_token_id
     with torch.no_grad():
-        action_sequence = model.generate(**first, **action_generation)
+        with measure(timings, "turn1_seconds", device):
+            action_sequence = model.generate(**first, **action_generation)
         action_start = first["input_ids"].shape[1]
         action_ids = action_sequence[0, action_start:].tolist()
         action_text = processor.tokenizer.decode(
@@ -152,8 +171,9 @@ def generate_two_turn(*, model: nn.Module, processor: object, observation: Obser
             suffix = second[:, action_start + len(canonical_action) + 1:]
             context = torch.cat((action_sequence, suffix), dim=1)
             inputs = {**first, "input_ids": context, "attention_mask": torch.ones_like(context)}
-            sequence = model.generate(**inputs, do_sample=False, num_beams=1,
-                                      max_new_tokens=trajectory_max_new_tokens)
+            with measure(timings, "turn2_seconds", device):
+                sequence = model.generate(**inputs, do_sample=False, num_beams=1,
+                                          max_new_tokens=trajectory_max_new_tokens)
             start = context.shape[1]
             trajectory_ids = sequence[0, start:].tolist()
             trajectory_text = processor.tokenizer.decode(
@@ -161,7 +181,10 @@ def generate_two_turn(*, model: nn.Module, processor: object, observation: Obser
             )
             spans.append(AssistantSpan(2, start, sequence.shape[1]))
             inputs = {**first, "input_ids": sequence, "attention_mask": torch.ones_like(sequence)}
-        log_probs = assistant_log_probs(model, inputs, spans)
+        log_probs = [None] * len(spans)
+        if compute_log_probs:
+            with measure(timings, "log_prob_seconds", device):
+                log_probs = assistant_log_probs(model, inputs, spans)
     trajectory_complete = bool(trajectory_ids) and trajectory_ids[-1] == eos
     waypoints = parse_trajectory(trajectory_text) if trajectory_complete else None
     reason = ("invalid_structured_action" if parsed_action is None else
@@ -176,9 +199,11 @@ def generate_two_turn(*, model: nn.Module, processor: object, observation: Obser
         "assistant_spans": [
             {"turn": span.turn, "start": span.start, "end": span.end,
              "token_ids": inputs["input_ids"][0, span.start:span.end].tolist(),
-             "token_log_probs": probs.cpu().tolist(), "log_prob_sum": float(probs.sum())}
+             "token_log_probs": probs.cpu().tolist() if probs is not None else None,
+             "log_prob_sum": float(probs.sum()) if probs is not None else None}
             for span, probs in zip(spans, log_probs, strict=True)
         ],
-        "log_prob_definition": "raw_policy_teacher_forced; EOS_included; not_sampling_distribution",
+        "log_prob_definition": ("raw_policy_teacher_forced; EOS_included; not_sampling_distribution"
+                                if compute_log_probs else "not_computed"),
         "trajectory_projection": trajectory_to_meta_action(waypoints) if waypoints is not None else None,
     }

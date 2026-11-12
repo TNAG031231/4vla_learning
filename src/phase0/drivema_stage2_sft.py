@@ -4,14 +4,16 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import time
 
 import torch
 from torch import nn
 import yaml
 
 from src.phase0.drivema_stage2_protocol import (
-    PROTOCOL_VERSION, AssistantSpan, assistant_log_probs, encode_teacher_forcing, generate_two_turn,
+    PROTOCOL_VERSION, AssistantSpan, assistant_log_probs, encode_teacher_forcing, generate_two_turn, measure,
 )
+from src.phase0.drivema_stage2_inference import generate_two_turn_batch
 from src.phase0.phase0_4b_evaluation import factorized_metrics
 from src.phase0.phase0_4b_lora_full import load_config as load_action_config
 from src.phase0.phase0_4b_lora_smoke import select_tiny
@@ -58,7 +60,15 @@ def load_config(path: Path) -> Stage2Config:
 
 class Stage2Runner:
     def __init__(self, processor: object, collator: StructuredCollator, device: str,
-                 action_generation: dict, trajectory_max_new_tokens: int) -> None:
+                 action_generation: dict, trajectory_max_new_tokens: int, *,
+                 inference_batch_size: int = 1, optimized: bool = False,
+                 compute_log_probs: bool = True) -> None:
+        if inference_batch_size not in (1, 2, 4):
+            raise ValueError("inference batch size must be 1, 2 or 4")
+        self.inference_batch_size = inference_batch_size
+        self.optimized = optimized
+        self.compute_log_probs = compute_log_probs
+        self.timings = None
         self.processor = processor
         self.collator = collator
         self.device = device
@@ -83,28 +93,63 @@ class Stage2Runner:
             model=model, processor=self.processor, observation=sample.observation,
             images=self.images(sample), device=self.device, action_generation=self.action_generation,
             trajectory_max_new_tokens=self.trajectory_max_new_tokens,
+            compute_log_probs=self.compute_log_probs, timings=self.timings,
         )
 
 
 def evaluate(model: nn.Module, runner: Stage2Runner, samples: list[SFTSample],
-             records: dict[str, dict]) -> tuple[list[dict], dict]:
+             records: dict[str, dict], *, performance: list[dict] | None = None,
+             progress_interval: int = 0) -> tuple[list[dict], dict]:
     rows = []
-    for sample in samples:
-        prediction = runner.predict(model, sample)
-        record = records[sample.sample_token]
-        points = prediction.pop("waypoints")
-        metrics = prediction_metrics(
-            torch.tensor(points) if points is not None else None,
-            torch.tensor(record["future_waypoints"]), torch.tensor(record["trajectory_valid_mask"]),
-        )
-        if prediction["invalid_reason"] is not None:
-            metrics["invalid_reason"] = prediction["invalid_reason"]
-        rows.append({
-            "sample_token": sample.sample_token, "scene_token": sample.scene_token,
-            "split": sample.split, "target": asdict(sample.target),
-            "target_waypoints": record["future_waypoints"],
-            "trajectory_valid_mask": record["trajectory_valid_mask"], **prediction, **metrics,
-        })
+    started = time.perf_counter()
+    next_progress = progress_interval
+    size = runner.inference_batch_size if runner.optimized else 1
+    for offset in range(0, len(samples), size):
+        group = samples[offset:offset + size]
+        timings = {} if performance is not None else None
+        runner.timings = timings
+        with measure(timings, "total_seconds", runner.device):
+            if runner.optimized:
+                predictions = generate_two_turn_batch(
+                    model=model, processor=runner.processor,
+                    observations=[sample.observation for sample in group],
+                    images=[runner.images(sample) for sample in group], device=runner.device,
+                    action_generation=runner.action_generation,
+                    trajectory_max_new_tokens=runner.trajectory_max_new_tokens,
+                    compute_log_probs=runner.compute_log_probs, timings=timings,
+                )
+            else:
+                predictions = [runner.predict(model, group[0])]
+        runner.timings = None
+        if performance is not None:
+            performance.append({**timings, "sample_tokens": [sample.sample_token for sample in group],
+                                "generated_tokens": {str(turn): sum(
+                                    len(span["token_ids"]) for prediction in predictions
+                                    for span in prediction["assistant_spans"] if span["turn"] == turn
+                                ) for turn in (1, 2)}})
+        for sample, prediction in zip(group, predictions, strict=True):
+            record = records[sample.sample_token]
+            points = prediction.pop("waypoints")
+            metrics = prediction_metrics(
+                torch.tensor(points) if points is not None else None,
+                torch.tensor(record["future_waypoints"]), torch.tensor(record["trajectory_valid_mask"]),
+            )
+            if prediction["invalid_reason"] is not None:
+                metrics["invalid_reason"] = prediction["invalid_reason"]
+            rows.append({
+                "sample_token": sample.sample_token, "scene_token": sample.scene_token,
+                "split": sample.split, "target": asdict(sample.target),
+                "target_waypoints": record["future_waypoints"],
+                "trajectory_valid_mask": record["trajectory_valid_mask"], **prediction, **metrics,
+            })
+        completed = len(rows)
+        if progress_interval and (completed >= next_progress or completed == len(samples)):
+            elapsed = time.perf_counter() - started
+            rate = completed / elapsed
+            print(json.dumps({"completed": completed, "total": len(samples),
+                              "elapsed_seconds": elapsed, "samples_per_second": rate,
+                              "remaining_seconds": (len(samples) - completed) / rate}), flush=True)
+            next_progress = (completed // progress_interval + 1) * progress_interval
     return rows, {"trajectory": aggregate_metrics(rows, "predicted_action"),
                   "action": factorized_metrics(rows)}
 
