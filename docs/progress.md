@@ -1,5 +1,34 @@
 # Project Progress
 
+## Stage 2C：离线吞吐优化收尾（2026-11-11）
+
+- 已实现真实 batch 1/2/4 两轮生成、单轮 KV cache、视觉预处理复用、可选跳过概率 forward、低频进度、性能统计和分项验收；Stage 2B 生产 CLI 默认 inference batch **1**，Batch 2/4 显式指定。训练 loss、optimizer、resume、checkpoint selection、数据 split 和生成协议保持不变；跨轮 cache 未实现。
+- 用户确认同一批 **64 条 validation** 的 Batch 4 实验：吞吐量 **2.1346×**、总时间减少 **53.15%**；ADE@3s **0.8213 → 0.8122 m**，FDE@3s **1.7685 → 1.7484 m**，两侧 invalid count/rate **0/0%**。Longitudinal macro-F1 略降，joint accuracy 下降 **1/64（1.5625 个百分点）**，lateral macro-F1 不变；P50/P95 延迟和峰值 allocated 显存均增加。这是用户确认的 AutoDL 结果，本机未独立读取远端 artifact；精确数值由用户于 2026-11-12 提供的 summary.md 补齐，见下表。
+- 原严格一致性 **FAIL** 保留：序列一致率 **23.44%**，token 一致率 **89.88%**；原分类为 48 个 Turn 2 generation mismatch、15 match、1 个 Turn 1 动作变化传递到 Turn 2 的 prefix mismatch。不能将样本一致率当作逐 token 一致率。
+- 用户确认四样本 Serial vs Saved / Batch 1 PASS，Batch 4 strict FAIL；相关 token、pixel/grid、attention、position/RoPE/cache 对照通过，范围仅限诊断四样本的可比上下文。五处已保存 raw-logits 选择审计通过；批量计算数值差异是合理解释，不能声称已证明 BF16 为唯一原因。诊断 topk tie-order 误报 argmax 已修复；真实 greedy 逐步对齐经 CPU 验证。
+- 原产物保留在 `$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01/`、`stage2c_diagnostic_run01/` 和 `stage2c_acceptance_run01/`。分项报告单列结构、数值一致性、Action/轨迹质量与性能；独立描述性轨迹质量 gate 不替换严格 FAIL，也不抹去 Action 回退及延迟/显存代价。
+- 收尾 CPU 验证：`codex4vla_env` 下 Stage 2B / Stage 2 SFT / Stage 2C inference 三个测试文件 **76 passed**，六条既有 tiny-model PEFT warning；新增默认 batch 1 与显式 2/4 CLI 测试，未改变训练配置 identity。
+- 定位为离线吞吐优化，不声称实车低延迟、实时/闭环、跨轮 KV cache 或严格预测等价；不追加 GPU 实验。PR #59 Closeout 内容已准备，正式 merge 后的评论仍按仓库流程发布；Stage 3 尚未实现，将使用独立 PR。
+
+64 样本精确性能/质量表（用户提供；无新增实验）：
+
+| Metric | Serial Baseline | Optimized Batch 4 |
+| --- | --- | --- |
+| Total Inference Time (s) | 586.4829458482563 | 274.7468852326274 |
+| Samples/s | 0.10912508275485139 | 0.23294167628437856 |
+| P50 Latency (s) | 9.269887132570148 | 17.193384688347578 |
+| P95 Latency (s) | 10.225461433082819 | 18.401102334074675 |
+| Peak GPU Allocated Memory (bytes) | 10239534080 | 14546409984 |
+| ADE@3s (m) | 0.8212949102707228 | 0.8122441392587518 |
+| FDE@3s (m) | 1.768528585289214 | 1.748422258034889 |
+| Invalid Prediction Count | 0 | 0 |
+| Invalid Prediction Rate | 0.0 | 0.0 |
+| Longitudinal Macro-F1 | 0.7106384994316028 | 0.6942009685230024 |
+| Lateral Macro-F1 | 0.8698619861986199 | 0.8698619861986199 |
+| Joint Accuracy | 0.6875 | 0.671875 |
+
+- 精确吞吐比 **2.134630008095207×**，总时间减少 **53.15%**；轨迹质量独立描述性 gate **PASS**，原严格生成一致性 **FAIL**，序列/逐位置 token 一致率分别 **23.44% / 89.88%**，五处保存的选择审计均为 `RAW_SELECTION_ALIGNED`。
+
 ## Stage 2B：正式 SFT 接口与固定 Pilot
 
 - 用户于 2026-11-10 报告真实 AutoDL Tiny Overfit：`gpu_smoke_passed=true`、`tiny_overfit_passed=true`、100 nonzero gradient steps、LoRA delta L2 `3.0511568`、train ADE/FDE@3s `0.001937 / 0.002751 m`、validation `7.172948 / 12.474631 m`、reload consistency true。本轮未取得原始 artifact 独立重算；该证据支持训练链路和小样本拟合，尚不证明泛化。PR #57 已核实 merged，用户明确豁免其 Closeout。

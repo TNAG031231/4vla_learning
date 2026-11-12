@@ -101,6 +101,72 @@ BEV / occupancy 是场景空间表示，不直接等于安全决策，也不替�
 
 当前可写：基于 nuScenes 完成 `CAM_FRONT`、future ego trajectory 与 nearby 3D agents 对齐，派生 6 类可审计 meta-action，并完成 108 样本人工审核。BEV/OCC-aware safety evaluator、reranker、DPO、trajectory head 与 occupancy prediction 均为 planned，直至有真实代码、配置和可核查结果。
 
+## Stage 2C：Two-Turn Inference Benchmark
+
+Stage 2B 新启动进程的 Monitor / Full Validation 默认使用 batch 1，可用 `--inference-batch-size 1|2|4` 设置；该参数独立于训练配置，原训练 checkpoint / optimizer / RNG resume 合同保持不变。SFT validation 默认跳过概率 forward，概率字段保存为 `null` / `not_computed`；Stage 2A 默认继续计算真实 log-probability，`assistant_log_probs` 保持可微接口。
+
+批量生成使用左侧文本 padding，视觉 patches 与 grids 按样本/图像顺序拼接；第一轮提前结束后的 padding 不属于生成 token，第二轮仅处理有效且含 EOS 的动作，并保留原始动作 IDs。图像每条样本预处理一次，第二轮使用同一视觉输入及文本模板 suffix；Qwen3-VL 自行计算多模态位置编码。两轮各自显式启用 Transformers KV cache，**跨轮 KV cache 复用未实现**：不同动作长度、EOS 后 padding、有效子批次与 Qwen 的 `rope_deltas` / cache position 需要进一步独立验证，本阶段保留标准 prefill。
+
+以下保留已执行实验的复现入口，当前收尾不再安排 GPU 执行；本地已验证 CLI 和 CPU 接口，首次真实 4B BF16 GPU 结果及当前分项验收状态见下文。先将 `STAGE2B_CHECKPOINT` 设置为已完成的 SFT checkpoint 目录（其中包含 `adapter/`），保留现有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT` 和模型缓存；等待正在运行的 Full SFT 完成，不热更新其代码，在独立 checkout / 新进程运行：
+
+```bash
+conda run --no-capture-output -n codex4vla_env python scripts/benchmark_drivema_stage2c.py \
+  --checkpoint "${STAGE2B_CHECKPOINT:?Set an existing completed Stage 2B checkpoint directory}" \
+  --config configs/drivema_stage2b_full.yaml \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT" \
+  --batch-size 4 --samples 64 --warmup-samples 4 \
+  --output "$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01"
+```
+
+一次任务固定按 sample token 排序的前 64 条 validation，使用同一个模型实例 / checkpoint、BF16、SDPA 与原 greedy 参数，分别 warmup 后对比原串行含概率 forward 与批量跳过概率 forward。完整时间包含图像读取、预处理、两轮生成、可选概率和评测，排除模型/数据 intake、warmup 和产物写盘；分轮计时仅在边界同步 CUDA。P50/P95 为样本所在 batch 的完成延迟，不除以 batch size；总耗时减少比例与吞吐加速比另列。显存为 measured track 内 peak allocated（含模型）。每 16 条输出进度、elapsed、samples/s 和 ETA。
+
+输出目录必须尚不存在，包含 `metadata.json`、两条路径的 `*_predictions.jsonl` / `*_metrics.json`、`benchmark.json` 和 `summary.md`；均留在 derived root。JSON 保存分轮耗时、实际生成 token 数、完整 action metrics 及逐样本 token/span/文本/指标一致性检查。任何差异使退出码为 1，保留两侧产物供定位；严格一致性失败保持 FAIL；离线吞吐、质量与结构覆盖分别报告，不能将吞吐收益称为严格等价加速。没有额外 GPU 消融或 Full Validation。
+
+后续 Turn-Level GRPO 可复用 observation 列表批量入口、每条原始 token/span 和显式可选的真实概率重算；group sampling、共享前缀 cache 管理及 GRPO loss 均未实现。
+
 ## Data
 
 nuScenes 数据受其原始许可约束，不随本仓库分发；原始/派生数据、模型权重、日志、缓存和 secrets 不进入 Git。
+
+### Stage 2C 小样本差异诊断
+
+用户报告首次 64 样本 GPU 验收失败（48 个 Turn 2 generation mismatch、15 match、1 prefix mismatch）；严格一致性未通过，离线吞吐收益及代价见最终结论。已提供的 prefix 样本 `03894f5a6a294cc6876d2fe3fa9229e7` 在 Turn 1 已从 baseline `decelerate` 变为 optimized `keep`，前缀差异不能据此归因于 suffix。CPU 上 12 种动作 × 1/3 帧历史的串行/批量完整 token 对照一致；四样本结构检查和五处保存的 raw-logits 选择审计已由用户确认通过；批量数值差异是合理解释，尚不能将 BF16 认定为唯一原因。
+
+以下为已完成诊断的复现入口，本次收尾不再执行：先离线分析原有两个 JSONL，再仅对该失败样本所在的原 batch 四条样本依次运行 Serial、Optimized Batch 1、Optimized Batch 4（各一次、无训练）；保留原同伴及顺序，不运行 64 条生成。使用原 metadata 记录的 checkpoint / 生成设置和现有缓存，输出目录须全新：
+
+```bash
+conda run --no-capture-output -n codex4vla_env python scripts/diagnose_drivema_stage2c.py \
+  --benchmark-dir "$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01" \
+  --sample-token 03894f5a6a294cc6876d2fe3fa9229e7 --gpu \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT" \
+  --output "$VLA_DERIVED_ROOT/drivema/stage2c_diagnostic_run01"
+```
+
+去掉 `--gpu` 可仅分析已有预测，不加载模型或数据。`saved_analysis.json` 区分 Turn 1 动作变化、suffix/prefix 变化及相同前缀下的 Turn 2 生成变化；`diagnosis.json` 检查 Serial 复现、Batch 1/4 严格输出/指标一致性，并逐样本比较原始 pixels/grid、有效 attention mask、实际 position IDs、归一化 padding 后的 cache position / rope_deltas 和 generation 配置。首处分歧保存原始全词表 logits 与位置张量到 `*_first_difference.pt`，JSON 报告 argmax、top-2 margin、最大 logit 差值；仅在输入、位置及此前生成 token 一致时才可讨论数值原因。诊断 hook 会复制 CPU 张量，耗时不用于性能结论。
+
+小样本严格检查失败仍退出 1，失败记录保留；Batch 1 + 跳过概率 forward 是已报告通过精确对照的回退路径。当前已有四样本诊断与 64 样本 GPU 结果，按下节分别审阅结构、数值一致性、质量和性能，不重复运行完整 Benchmark；未修改生产推理、SFT 训练或跨轮 cache。
+
+### Stage 2C 分项验收与离线 logits 审计
+
+2026-11-11 用户报告：Serial vs Saved / Batch 1 通过，Batch 4 严格一致性失败；可比上下文的输入/位置/cache 对照通过，64 条样本吞吐量提升 2.13×、ADE/FDE 无退化、两侧 invalid 均为 0。这些为用户提供的 GPU 结果，本机未独立读取原始产物。严格失败继续保留；结构、数值一致性、质量、性能分别记录，不再将它们混为一个 gate。
+
+已复现并修正诊断 `top2()` 将 `topk.indices[0]` 当作 argmax 的错误：并列最大值时 top-k 排序可与 greedy 使用的 `torch.argmax` 不同，例如 450/13096 并列时，旧报告可写成 13096，而真正 argmax 为 450。该修复只影响诊断报告。实际采样使用 processed scores；新增诊断采集会记录每步 processed argmax 与生成 token，CPU real-greedy 对齐测试通过。以下保留已完成的离线审计复现入口，当前收尾不再安排重复运行：
+
+```bash
+conda run --no-capture-output -n codex4vla_env python scripts/report_drivema_stage2c.py \
+  --benchmark-dir "$VLA_DERIVED_ROOT/drivema/stage2c_benchmark_run01" \
+  --diagnostic-dir "$VLA_DERIVED_ROOT/drivema/stage2c_diagnostic_run01" \
+  --output "$VLA_DERIVED_ROOT/drivema/stage2c_acceptance_run01"
+```
+
+新目录输出 `acceptance.json` / `summary.md`，保留原 `strict_consistency_original`，统计完整生成序列一致率与每轮逐位置 token 一致率（含 EOS，缺失计错），列出完整 Action 指标、ADE/FDE/invalid、总时间/吞吐/P50/P95/峰值显存，并修正已保存分歧处的 raw argmax。轨迹质量 gate 独立定义为同一批样本 ADE@3s、FDE@3s、invalid rate 均不高于 baseline，属于本次明确新增的描述性标准，不是对原严格 gate 的追溯替换；Action 质量单列，不擅自添加容忍阈值。报告程序退出 0 仅表示报告生成完成，不表示验收通过。
+
+用户已确认保存的五处分歧 raw-logits 选择审计通过，旧 argmax 矛盾已由诊断 tie-order 错误解释；这不证明所有 logits processor 均关闭，只说明这些位置的最终选择对齐。可比上下文、位置和生成协议对齐后，微小 logit 差异与小 margin 支持批量数值扰动解释，不声称排除了全部硬件/内核因素。技术结果和学习总结见 PR #59，正式 merge 后评论按仓库流程发布；Stage 3 尚未启动。
+
+### Stage 2C 最终定位与默认入口
+
+Stage 2C 定位为**离线吞吐优化**：生产入口默认 `--inference-batch-size 1` 并跳过冗余概率 forward，Batch 2/4 需显式指定。Batch 1 的精确对照证据覆盖原四样本诊断，不扩展声称全部数据严格等价；Batch 4 是接受已知预测差异的离线吞吐选项，不能替代默认路径并宣称严格等价。
+
+用户确认的同批 64 条 validation：Batch 4 吞吐提升 **2.1346×**、总耗时减少 **53.15%**；ADE@3s **0.8213 → 0.8122 m**，FDE@3s **1.7685 → 1.7484 m**，invalid rate 两侧均 **0**。Longitudinal macro-F1 略降，joint accuracy 下降 **1/64（1.5625 个百分点）**，lateral macro-F1 不变；P50/P95 样本所在 batch 的完成延迟上升，GPU peak allocated memory 增加。严格一致性仍为 **FAIL**，序列一致率 **23.44%**、逐位置 token 一致率 **89.88%**。这些是用户确认的实验数据，本机未重新运行或读取远端原始产物；用户于 2026-11-12 补齐的完整精确表已记录在 [docs/progress.md](docs/progress.md)，原产物保留在 `stage2c_acceptance_run01/acceptance.json` / `summary.md`。总时间为 **586.4829 → 274.7469 s**，P50 **9.2699 → 17.1934 s**，P95 **10.2255 → 18.4011 s**，峰值 allocated 显存 **10,239,534,080 → 14,546,409,984 bytes**；精确吞吐比 **2.134630008095207×**。
+
+结构审计只覆盖四条代表样本的可比上下文，raw-logits 选择审计只覆盖保存的五处分歧；这些证据支持批量计算数值扰动解释，不证明 BF16 是唯一原因，也不构成全量正确性证明。仅可声称同批 validation 上的离线吞吐收益与所述质量取舍，不宣称实车低延迟、实时/闭环部署、跨轮 KV cache 复用或严格预测等价。原 gate、历史产物及训练协议均不变，不追加 GPU 实验；Stage 3 Turn-Level GRPO 将单独建 PR。

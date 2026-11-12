@@ -141,3 +141,18 @@ def test_baseline_alignment_recomputes_metrics_and_rejects_mismatch(lora_model, 
     write_predictions(paths[0], [altered])
     with pytest.raises(ValueError, match='mismatch'):
         cli.compare_baselines(rows, targets, paths)
+
+
+@pytest.mark.parametrize('options,expected', [([], 1), (['--inference-batch-size', '2'], 2),
+                                             (['--inference-batch-size', '4'], 4)])
+def test_cli_inference_default_and_explicit_batches(options, expected, monkeypatch, capsys):
+    parse = cli.argparse.ArgumentParser.parse_args
+    observed = []
+    def capture(parser, *args, **kwargs):
+        namespace = parse(parser, *args, **kwargs)
+        observed.append(namespace.inference_batch_size)
+        return namespace
+    monkeypatch.setattr(cli.argparse.ArgumentParser, 'parse_args', capture)
+    assert cli.main(['--dry-run', *options]) == 0
+    assert observed == [expected]
+    assert 'inference_batch_size' not in json.loads(capsys.readouterr().out)
