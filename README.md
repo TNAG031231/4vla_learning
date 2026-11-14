@@ -197,6 +197,32 @@ conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_stage3
 
 请保留并提供每次的 console log、`metadata.json`、`summary.json`、`rollout_1.json` / `update_1.json`，以及两步运行的 `rollout_2.json` / `update_2.json`；无需上传模型权重或图像。重点比较每步 Old TF/Current TF、第一步 Current/Reference TF、Generation/Old TF 的分轮偏差，以及非零更新、有限梯度和峰值显存；第二步 Current/Reference 偏差在第一次更新后允许出现。
 
+### Stage 3B 固定 Rollout 梯度敏感性诊断
+
+独立入口 `scripts/diagnose_drivema_stage3b_gradients.py` 读取已有 Step 1 `rollout_1.json` 及同目录 `metadata.json`，加载原 Stage 2B Full `checkpoint_3564/adapter` 作为 Current / Reference；从 train intake 匹配相同 Observation，保留四候选原始 IDs、Reward 与 Advantage。A 使用独立 no-grad Old TF，B 使用保存的 Generation log-prob；两者共用同一次可微 Current TF forward、Reference、KL、mask 和生产 `grpo_loss` reduction，逐候选分别 backward 并在 CPU 累积 LoRA 梯度。没有采样、optimizer step、gradient clipping 或权重保存，生产训练默认行为保持不变。
+
+**B 不是严格的无偏 Importance Sampling Correction。** 本实验只测这两个指定 Surrogate 在一个固定 Group 上的梯度敏感性，不能证明采样偏差已消除。结果报告整体 cosine、夹角、A/B norm、`||g_B-g_A|| / ||g_A||`，没有新增通过阈值；零范数时方向或相对差异为 `null`。结合方向、幅度和逐 token 概率差异决定是否继续定位 Cache/BF16，单组结果不能推广到整个数据分布。本入口暂不拆分 Turn 1 / Turn 2 的梯度贡献，保留分轮 token/loss/概率统计。
+
+CPU/Tiny-Qwen 验证命令：
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q tests/test_drivema_stage3b_gradient_diagnostic.py
+conda run -n codex4vla_env python scripts/diagnose_drivema_stage3b_gradients.py --help
+```
+
+AutoDL 执行命令（真实 GPU 待执行；`STAGE3B_STEP1_ROLLOUT` 指向已完成运行的 Step 1，示例采用前述单步对齐输出目录）：
+
+```bash
+export STAGE3B_STEP1_ROLLOUT="$VLA_DERIVED_ROOT/drivema/stage3b_tf_align_1step_run01/rollout_1.json"
+conda run --no-capture-output -n codex4vla_env python scripts/diagnose_drivema_stage3b_gradients.py \
+  --rollout "${STAGE3B_STEP1_ROLLOUT:?Set existing Step 1 rollout path}" \
+  --dataset-root "${NUSCENES_ROOT:?Set existing nuScenes root}" \
+  --derived-root "${VLA_DERIVED_ROOT:?Set existing derived root}" \
+  --output "$VLA_DERIVED_ROOT/drivema/stage3b_gradient_sensitivity_run01.json"
+```
+
+输出 JSON 必须不存在且位于仓库外，包含模型 revision、原始 rollout/metadata 路径与 source metadata、实际 checkpoint、运行环境/配置、参数名、整体梯度对比、两套 loss/KL，以及候选的逐 token 概率、span/EOS、target/logit positions、mask、Reward 和 Advantage。检查梯度有限、base/reference 无梯度、LoRA 值及所有参数版本未变；外部 artifact 的 Step / Observation / span / EOS / mask 不匹配会报错。整个诊断不访问 test split、不重新计算 Reward，也不启动 Stage 3C。
+
 ## Stage 3A：Verifiable Reward 与四候选 Rollout
 
 Stage 3A 的开发分支依赖 [Stage 2C main 集成 PR #60](https://github.com/TNAG031231/4vla_learning/pull/60)，两者均待审阅合并；Stage 3A 固定读取 `$VLA_DERIVED_ROOT/drivema/stage2b_full_run01/checkpoint_3564/adapter`，只生成 train 候选并计算 reward/advantage，optimizer updates 为 0。
