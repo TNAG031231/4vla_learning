@@ -1,0 +1,9 @@
+protocol_version: phase0.5-temporal-geometry-v0.1
+output_relative_dir: phase_0_5/temporal_geometry_v0_1
+max_agents: 512
+annotation_camera_tolerance_sec: 0.075
+grid:
+  x_range_m: [-10, 50]
+  y_range_m: [-25, 25]
+  resolution_m: 0.5
+review_samples_per_split: 3
