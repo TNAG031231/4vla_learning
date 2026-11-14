@@ -310,3 +310,47 @@ Stage 2C 定位为**离线吞吐优化**：生产入口默认 `--inference-batch
 用户确认的同批 64 条 validation：Batch 4 吞吐提升 **2.1346×**、总耗时减少 **53.15%**；ADE@3s **0.8213 → 0.8122 m**，FDE@3s **1.7685 → 1.7484 m**，invalid rate 两侧均 **0**。Longitudinal macro-F1 略降，joint accuracy 下降 **1/64（1.5625 个百分点）**，lateral macro-F1 不变；P50/P95 样本所在 batch 的完成延迟上升，GPU peak allocated memory 增加。严格一致性仍为 **FAIL**，序列一致率 **23.44%**、逐位置 token 一致率 **89.88%**。这些是用户确认的实验数据，本机未重新运行或读取远端原始产物；用户于 2026-11-12 补齐的完整精确表已记录在 [docs/progress.md](docs/progress.md)，原产物保留在 `stage2c_acceptance_run01/acceptance.json` / `summary.md`。总时间为 **586.4829 → 274.7469 s**，P50 **9.2699 → 17.1934 s**，P95 **10.2255 → 18.4011 s**，峰值 allocated 显存 **10,239,534,080 → 14,546,409,984 bytes**；精确吞吐比 **2.134630008095207×**。
 
 结构审计只覆盖四条代表样本的可比上下文，raw-logits 选择审计只覆盖保存的五处分歧；这些证据支持批量计算数值扰动解释，不证明 BF16 是唯一原因，也不构成全量正确性证明。仅可声称同批 validation 上的离线吞吐收益与所述质量取舍，不宣称实车低延迟、实时/闭环部署、跨轮 KV cache 复用或严格预测等价。原 gate、历史产物及训练协议均不变，不追加 GPU 实验；Stage 3 Turn-Level GRPO 将单独建 PR。
+
+## Stage 3C / 3D：统一 Full-Train GRPO
+
+统一入口 `scripts/run_drivema_grpo.py` 使用 `configs/drivema_grpo.yaml`，复用 Stage 3A 的 fresh rollout / reward / advantage 和 Stage 3B 的 `update_group`、双 Adapter 与 checkpoint / optimizer 恢复。采样参数继续读取冻结的 `configs/drivema_stage3a.yaml`；其中 `train_samples` 和 rollout 输出目录不参与统一训练的数据选择。完整 train 由同一 temporal intake 加载，按 token 排序，每次用 Torch RNG 有放回均匀抽取一个 observation，G=4、一次 optimizer update；metadata 记录 manifest 身份、总数、eligible 数及排除原因，每步保存实际 token。
+
+默认累计 `max_steps=32`，在 Step 0 建立 SFT baseline，在 Step 32 保存完整 checkpoint 后执行相同 128 条 monitor，输出比较结果并正常停止。其他预算也在最后一步保存并验证；未来评测节点可以预先写入 schedule。继续训练需要用户审核真实 Pilot 结果后，显式指定 `--resume` 与更大的累计预算。Stage 3B PR #62 已合并且已有用户 Closeout；本入口的真实 4B Pilot、Full GRPO、性能改善和 GPU 续训仍待执行验证，本轮只运行 CPU fixtures。
+
+Checkpoint 同时包含 Current / Reference Adapter、AdamW、Torch CPU/CUDA RNG，以及 Python/NumPy RNG、global step、配置、数据身份、固定 monitor tokens、Step 0 sample-level baseline 和有效 advantage group 累计计数。`max_steps` 可以扩大，schedule 可以增加 checkpoint 之后的节点，checkpoint 输出频率可以调整；影响训练语义的配置或数据身份变化会拒绝恢复。LR 保持常数，不新增 scheduler。验证前后恢复所有 RNG；恢复运行写入新输出目录，原目录保留，步数从 checkpoint 的下一步继续。
+
+Monitor / Full validation 复用 Stage 2B 两轮 evaluator、greedy decoding、batch 1、parser 和指标定义，跳过概率 forward；sample-level 输出保留 action、waypoints、target 与 token。比较报告包含各自 valid-only ADE/FDE、动作 macro-F1 / per-class F1 / joint accuracy、invalid / parsing rates，以及共同有效样本上的配对 ADE/FDE 与分母。另报 stop / keep / straight 比例、终点位移、consistency 和 invalid 变化；这些是描述性诊断，微小变化不会自动触发 Full Training。128 条 monitor 只用于早期诊断，最终完整 validation 使用同一个 evaluator，同时评测 checkpoint 中冻结的 SFT Reference，保证比较 population 相同。
+
+AutoDL 命令模板（CLI 已通过 CPU 替代运行；下面的真实 GPU 任务须由用户执行，先设置 `NUSCENES_ROOT` / `VLA_DERIVED_ROOT` 并准备模型缓存、temporal train / validation 和 SFT `drivema/stage2b_full_run01/checkpoint_3564/adapter`）：
+
+```bash
+# 首次 32-step Pilot，内含 Step 0 / Step 32 monitor。
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --config configs/drivema_grpo.yaml \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+
+# 可选：独立复评 checkpoint_32；独立输出目录必须尚不存在。
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --mode evaluate-monitor \
+  --checkpoint "$VLA_DERIVED_ROOT/drivema/grpo_pilot_run01/checkpoint_32" \
+  --output-relative-dir drivema/grpo_step32_evaluation_run01 \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+
+# 用户批准后再执行；256 仅为累计预算示例，实际预算待 Pilot 结果决定。
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --resume "$VLA_DERIVED_ROOT/drivema/grpo_pilot_run01/checkpoint_32" \
+  --max-steps 256 --evaluation-steps 0 32 128 256 \
+  --output-relative-dir drivema/grpo_continuation_run01 \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+
+# 对上面示例的最终 checkpoint 做完整 validation，与冻结 SFT 配对比较。
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --mode evaluate-full \
+  --checkpoint "$VLA_DERIVED_ROOT/drivema/grpo_continuation_run01/checkpoint_256" \
+  --output-relative-dir drivema/grpo_full_validation_run01 \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+```
+
+主要产物：`metadata.json`、`monitor_tokens.json`、`baseline_predictions.jsonl` / `baseline_metrics.json`、`training_history.jsonl`、逐步 `rollout_N.json` / `update_N.json`、`checkpoint_N/{adapter,training_state.pt,unified_state.pt}`、`monitor_N_predictions.jsonl` / `monitor_N_metrics.json` / `monitor_N_comparison.json`、`summary.json`。Pilot 审阅使用 Step 32 comparison 加训练 history：检查 reward 各项、turn advantages、loss/KL、gradient norm、LoRA delta、生成有效率及有效 advantage group 比例，再结合配对预测判断是否继续。所有产物留在仓库外的 derived root。
+
+本机未设置真实 derived root，14,253 train / 3,594 validation 为冻结数据合同的预期规模，实际 eligible 数由真实 intake 报告；CPU 测试的 14,253 条是 producer-backed fixture，不作为真实数据验收。GPU 数值一致性、吞吐、显存和泛化改善均待验证；本入口不读取 test，也不自动执行完整 validation 或后续训练。
