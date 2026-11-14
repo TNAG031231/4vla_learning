@@ -1,5 +1,17 @@
 # Project Progress
 
+## Stage 3B：Turn-Level GRPO Policy Update
+
+- PR #62 概率对齐修复：loss 分母改用 fresh rollout 后、全组 backward/step 前独立 no-grad TF 重算的冻结 Old 概率；原始 Generation Scores 与 Stage 3A 结构保持不变。保存 old_tf / old_generation 和 raw / aligned ratio，按全组、候选及轮次统计 count、mean/max/p95 abs diff 和 diff>0.05 count；metadata 明确两种概率定义，未声称采样与 TF 数值等价。
+- 用户报告旧 HEAD `2e7e854` 的 RTX 4080 单步产生非零 LoRA 更新，342 tokens 中 23 个 Current–Generation 差异>0.05，max≈0.1105，Current/Reference TF 一致；原始 GPU artifacts 未独立读取。代码确认 cached incremental generation 与 uncached full TF 执行路径混用，BF16 / cache / kernel 等单独贡献待 GPU 对照验证；修复后真实 GPU 对齐待复验。
+- 修复前受控 +0.11 generation log-prob 偏差回归失败（未更新 ratio≈0.895834），修复后通过；保留真实 Tiny-Qwen 采样与独立 Old TF/Current TF 检查。联合 CPU 回归 **109 passed / 11 条既有类别 PEFT warnings**，包含非零 LoRA 更新、冻结 base/reference、缺轮/invalid/EOS 和 checkpoint/resume 一致性。
+- 新增 `src/phase0/drivema_stage3b.py`、`scripts/run_drivema_stage3b.py`、`configs/drivema_stage3b_smoke.yaml`、`tests/test_drivema_stage3b.py`；从已合并 Stage 3A 的 main 开发，#61 [Learning & Capability Closeout](https://github.com/TNAG031231/4vla_learning/pull/61#issuecomment-6821954332) 已发布。
+- 实现逐 token clipped ratio（epsilon=0.2）与非负 KL estimator `expm1(ref-current)-(ref-current)`（beta=0.01），按 token → present turn → candidate 归一化；保留 invalid 实际 token，缺失第二轮不产生 loss，Old / Advantage / Reference detach。
+- 一个共享 Qwen3-VL base、两套 Full SFT adapter；Current LoRA-only AdamW 更新，Reference 固定，Old 来自每步 fresh G=4 rollout。逐候选 forward/backward 累积，non-reentrant checkpointing、BF16 base、关闭 dropout；最多 1–2 optimizer steps，未进入 Pilot / Full。
+- Checkpoint 保存 current/reference adapters、AdamW、step、CPU/CUDA RNG 与 identity；CPU 保存恢复与连续执行参数及概率诊断完全一致。输出包括逐 token old/current/reference、ratio 分布、span/EOS/mask、loss/KL/clip、gradient norm、LoRA delta、时间与 GPU allocated/reserved 峰值，以及分项 reward、A1/A2、valid-only ADE/FDE/count、invalid 和零方差统计。
+- `codex4vla_env` 联合回归：Stage 3B / 3A / Stage 2B / SFT / inference **108 passed，10 条既有类别 PEFT warnings**；Stage 3B 13 项包含真实 Tiny-Qwen 随机采样与明确标注的受控候选更新、梯度累积等价、Reference 冻结、非零 LoRA 更新及生产 CLI 的 CPU 替代运行；`--help` / `--dry-run` 已执行。
+- 本次未运行真实 GPU。用户报告 Stage 3A RTX 4080 4 场景 / 16 候选 invalid 和 missing-turn rate 均为 0，Turn 1 / 2 零方差比例分别 50% / 0%；原始 GPU artifacts 未独立复算。Stage 3B 真实 4B 概率对齐、有限梯度、非零更新、16 GB 显存适配仍待用户执行 README 的 AutoDL CLI；Consistency 上升与 ADE 未改善的相邻 group 标记只作诊断，不能据 1–2 steps 声称质量提升。
+
 ## Stage 3A：Verifiable Reward / Group Rollout / Turn-Level Advantage
 
 - Stage 3A 已实现并通过 CPU 验证，开发分支依赖 Stage 2C 集成 [PR #60](https://github.com/TNAG031231/4vla_learning/pull/60)；集成与 Stage 3A PR 均待用户审阅，尚未将未合并功能记为 main 已具备。#58 post-merge Closeout 已发布，#59 用户 Closeout 已存在。
