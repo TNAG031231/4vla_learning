@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import asdict
+import json
 import math
+from pathlib import Path
 
 from torch import nn
 
@@ -9,6 +12,61 @@ from src.phase0.drivema_stage2_sft import Stage2Runner, evaluate
 from src.phase0.phase0_4b_evaluation import factorized_metrics
 from src.phase0.phase0_4b_protocol import SFTSample
 from src.phase0.phase0_4c_evaluation import aggregate_metrics
+
+
+def load_baseline_predictions(path: Path, samples: list[SFTSample], records: dict) -> list[dict]:
+    with path.open() as stream:
+        rows = [json.loads(line) for line in stream]
+    by_token = {row['sample_token']: row for row in rows}
+    if len(by_token) != len(rows):
+        raise ValueError('duplicate baseline sample_token')
+    if set(by_token) != {sample.sample_token for sample in samples}:
+        raise ValueError('baseline validation population differs: missing or unexpected samples')
+    for sample in samples:
+        row = by_token[sample.sample_token]
+        record = records[sample.sample_token]
+        expected = {'scene_token': sample.scene_token, 'split': 'validation',
+                    'target': asdict(sample.target), 'target_waypoints': record['future_waypoints'],
+                    'trajectory_valid_mask': record['trajectory_valid_mask']}
+        if sample.split != 'validation' or record['split'] != 'validation':
+            raise ValueError('baseline intake requires validation samples')
+        for key, value in expected.items():
+            if row[key] != value:
+                raise ValueError(f'baseline {sample.sample_token}: {key} mismatch')
+    return [by_token[sample.sample_token] for sample in samples]
+
+
+def baseline_provenance(path: Path, checkpoint: str, model_id: str, revision: str,
+                        inference: dict) -> dict:
+    metadata_path = path.parent / 'metadata.json'
+    summary_path = path.parent / 'training_summary.json'
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+    summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    checked, unavailable = {}, []
+    sources = [(metadata.get('provenance', {}), {'model_id': model_id, 'revision': revision}),
+               (metadata.get('config', {}), {'trajectory_max_new_tokens': inference['trajectory_max_new_tokens']}),
+               (metadata.get('inference', {}), {'batch_size': inference['batch_size'],
+                                               'optimized': inference['optimized'],
+                                               'action_generation': inference['action_generation']})]
+    for source, expected in sources:
+        for key, value in expected.items():
+            if key not in source:
+                unavailable.append(key)
+            elif source[key] != value:
+                raise ValueError(f'baseline provenance {key} mismatch')
+            else:
+                checked[key] = source[key]
+    if 'best' in summary:
+        selected = summary['best']['checkpoint']
+        expected_parts = Path(checkpoint).parts
+        if Path(selected).parts[-len(expected_parts):] != expected_parts:
+            raise ValueError('baseline provenance SFT checkpoint mismatch')
+        checked['checkpoint'] = selected
+    else:
+        unavailable.append('checkpoint')
+    return {'predictions': str(path.resolve()), 'checked': checked, 'unavailable': unavailable,
+            'metadata': str(metadata_path) if metadata_path.exists() else None,
+            'training_summary': str(summary_path) if summary_path.exists() else None}
 
 
 def behavior_statistics(rows: list[dict]) -> dict:

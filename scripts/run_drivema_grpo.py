@@ -13,6 +13,9 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
+from src.phase0.drivema_grpo_evaluation import (
+    baseline_provenance, behavior_statistics, load_baseline_predictions,
+)
 from src.phase0.drivema_grpo_train import (
     evaluate_and_save, fit, load_config, prepare_data, run_identity, validate_config,
 )
@@ -21,6 +24,9 @@ from src.phase0.drivema_stage2b import select_subset
 from src.phase0.drivema_stage3a import load_config as load_rollout_config
 from src.phase0.phase0_4b_lora_full import load_config as load_action_config
 from src.phase0.phase0_4b_protocol import StructuredCollator
+from src.phase0.phase0_4b_evaluation import factorized_metrics
+from src.phase0.phase0_4c_evaluation import aggregate_metrics
+from src.phase0.phase0_4c_full_train import write_predictions
 from src.phase0.phase0_4c_tiny_overfit import write_json
 from src.phase0.qwen3vl_dataset_adapter import collect_git_provenance, resolve_derived_path
 from src.phase0.qwen3vl_interface import FIXED_MODEL_ID, FIXED_REVISION
@@ -35,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--derived-root', type=Path, default=os.environ.get('VLA_DERIVED_ROOT'))
     parser.add_argument('--resume', type=Path, help='GRPO checkpoint; restores current/reference and training state')
     parser.add_argument('--checkpoint', type=Path, help='GRPO checkpoint for evaluation-only modes')
+    parser.add_argument('--baseline-predictions', type=Path,
+                        help='saved Stage 2B full validation JSONL; evaluate-full only; skips SFT inference')
     parser.add_argument('--max-steps', type=int, help='cumulative optimizer step budget, not additional steps')
     parser.add_argument('--evaluation-steps', nargs='+', type=int)
     parser.add_argument('--output-relative-dir', help='new directory relative to derived root, including on resume')
@@ -50,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error('training uses --resume, not --checkpoint')
     if args.mode != 'train' and (args.checkpoint is None or args.resume is not None):
         parser.error('evaluation requires --checkpoint and no --resume')
+    if args.baseline_predictions is not None and args.mode != 'evaluate-full':
+        parser.error('--baseline-predictions requires evaluate-full')
     if args.dry_run:
         print(json.dumps({'training': asdict(config), 'rollout': asdict(rollout),
                           'train_selection': 'all eligible train records; rollout.train_samples is unused',
@@ -64,6 +74,17 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({'data_intake': intake, 'full_train_selected': len(train)}, indent=2), flush=True)
     checkpoint = args.resume or args.checkpoint
     initial = resolve_derived_path(args.derived_root, rollout.checkpoint_relative_path)
+    semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
+    baseline_source = None
+    if args.baseline_predictions is not None:
+        baseline = load_baseline_predictions(args.baseline_predictions, validation, records)
+        baseline_source = baseline_provenance(
+            args.baseline_predictions, rollout.checkpoint_relative_path, FIXED_MODEL_ID, FIXED_REVISION,
+            {'trajectory_max_new_tokens': rollout.trajectory_max_new_tokens, 'batch_size': 1,
+             'optimized': True, 'action_generation': semantic.generation_kwargs})
+        baseline_metrics = {'action': factorized_metrics(baseline),
+                            'trajectory': aggregate_metrics(baseline, 'predicted_action'),
+                            'behavior': behavior_statistics(baseline)}
     from peft import PeftModel
     runtime = default_runtime_dependencies()
     device = runtime.device_selector('cuda:0')
@@ -76,7 +97,6 @@ def main(argv: list[str] | None = None) -> int:
     reference = checkpoint / 'adapter/reference' if checkpoint else initial / 'adapter'
     model.load_adapter(reference, adapter_name='reference', is_trainable=False)
     model.to(device)
-    semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
     runner = Stage2Runner(processor, StructuredCollator(processor, runtime.image_loader, args.dataset_root),
                           device, semantic.generation_kwargs, rollout.trajectory_max_new_tokens,
                           optimized=True, compute_log_probs=False)
@@ -95,7 +115,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError('evaluation model/data/monitor identity differs')
         output.mkdir(parents=True, exist_ok=False)
         population = validation if args.mode == 'evaluate-full' else monitor
-        if args.mode == 'evaluate-full':
+        if args.baseline_predictions is not None:
+            write_predictions(output / 'sft_full_predictions.jsonl', baseline)
+            write_json(output / 'sft_full_metrics.json', baseline_metrics)
+        elif args.mode == 'evaluate-full':
             baseline, _ = evaluate_and_save(model, runner, population, records, output, 'sft_full',
                                             adapter='reference')
         else:
@@ -106,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
                                             'step': state['step'], 'mode': args.mode,
                                             'population_tokens': [s.sample_token for s in population],
                                             'identity': state['identity']})
+        if baseline_source is not None:
+            write_json(output / 'baseline_source.json', baseline_source)
     return 0
 
 

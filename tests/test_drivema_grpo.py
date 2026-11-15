@@ -20,7 +20,10 @@ sys.path.insert(0, str(ROOT))
 from scripts import run_drivema_grpo as cli
 from src.phase0 import drivema_grpo_train as training
 from src.phase0 import drivema_stage3a
-from src.phase0.drivema_grpo_evaluation import compare_predictions, evaluate_population
+from src.phase0.drivema_grpo_evaluation import (
+    baseline_provenance, compare_predictions, evaluate_population, load_baseline_predictions,
+)
+from src.phase0.phase0_4c_full_train import write_predictions
 from src.phase0.drivema_stage2_protocol import trajectory_to_meta_action
 from src.phase0.drivema_stage2b import select_subset
 from test_drivema_stage2_sft import case, records, samples, processor, runner, tiny_qwen, lora_model
@@ -323,3 +326,108 @@ def test_cli_training_resume_and_both_evaluations(dual_model, controlled_rollout
     assert (tmp_path / 'full-eval/sft_full_predictions.jsonl').exists()
     assert not (tmp_path / 'full-eval/training_history.jsonl').exists()
     assert not (tmp_path / 'monitor-eval/training_history.jsonl').exists()
+    calls = []
+    original_evaluate = cli.evaluate_and_save
+
+    def current_only(*args, **kwargs):
+        assert kwargs.get('adapter', 'default') == 'default'
+        calls.append(len(args[2]))
+        return original_evaluate(*args, **kwargs)
+    monkeypatch.setattr(cli, 'evaluate_and_save', current_only)
+    saved = tmp_path / 'full-eval/sft_full_predictions.jsonl'
+    assert cli.main(common + ['--mode', 'evaluate-full', '--checkpoint', str(checkpoint),
+                              '--baseline-predictions', str(saved),
+                              '--output-relative-dir', 'reused-eval']) == 0
+    assert calls == [len(arguments['validation'])]
+    assert read_json(tmp_path / 'reused-eval/evaluate-full_1_comparison.json') == result
+    assert read_json(tmp_path / 'reused-eval/baseline_source.json')['predictions'] == str(saved)
+
+
+@pytest.fixture
+def saved_baseline(arguments, validation_predict, tmp_path):
+    rows, _ = evaluate_population(ScalarAdapters(), arguments['runner'], arguments['validation'], arguments['records'])
+    path = tmp_path / 'final_validation_predictions.jsonl'
+    write_predictions(path, rows)
+    return path, rows
+
+
+def test_saved_full_population_and_paired_metrics(saved_baseline, arguments):
+    path, source = saved_baseline
+    rows, samples, records = [], [], {}
+    for index in range(3594):
+        token = f'validation-{index}'
+        sample = replace(arguments['validation'][index % len(source)], sample_token=token)
+        row = deepcopy(source[index % len(source)])
+        row['sample_token'] = token
+        rows.append(row)
+        samples.append(sample)
+        records[token] = {'split': 'validation', 'future_waypoints': row['target_waypoints'],
+                          'trajectory_valid_mask': row['trajectory_valid_mask']}
+    write_predictions(path, list(reversed(rows)))
+    loaded = load_baseline_predictions(path, samples, records)
+    assert loaded == rows
+    current = deepcopy(rows)
+    current[0]['ade_3s_m'] = 3.594
+    comparison = compare_predictions(loaded, current)
+    assert comparison['common_valid_count'] == 3594
+    assert comparison['paired_errors']['ade_3s_m']['delta'] == pytest.approx(.001)
+    assert comparison['baseline']['action']['longitudinal_macro_f1'] is not None
+    assert comparison['baseline']['behavior']['trajectory_parsing_success_rate'] == 1
+
+
+@pytest.mark.parametrize('field', ['sample_token', 'scene_token', 'split', 'target',
+                                    'target_waypoints', 'trajectory_valid_mask', 'duplicate', 'missing'])
+def test_saved_baseline_rejects_population_and_gt_errors(saved_baseline, arguments, field):
+    path, rows = saved_baseline
+    if field == 'duplicate':
+        rows.append(rows[0])
+    elif field == 'missing':
+        rows.pop()
+    else:
+        rows[0][field] = 'wrong'
+    write_predictions(path, rows)
+    with pytest.raises(ValueError):
+        load_baseline_predictions(path, arguments['validation'], arguments['records'])
+
+
+def test_saved_baseline_rejects_malformed_json(saved_baseline, arguments):
+    path, _ = saved_baseline
+    path.write_text('{broken}\n')
+    with pytest.raises(json.JSONDecodeError):
+        load_baseline_predictions(path, arguments['validation'], arguments['records'])
+
+
+@pytest.mark.parametrize('mismatch', [None, 'model_id', 'revision', 'trajectory_max_new_tokens',
+                                      'batch_size', 'optimized', 'action_generation', 'checkpoint'])
+def test_available_sft_provenance(saved_baseline, mismatch):
+    path, _ = saved_baseline
+    checkpoint = 'drivema/stage2b_full_run01/checkpoint_3564'
+    inference = {'trajectory_max_new_tokens': 192, 'batch_size': 1, 'optimized': True,
+                 'action_generation': {'do_sample': False, 'num_beams': 1, 'max_new_tokens': 24}}
+    missing = baseline_provenance(path, checkpoint, 'model', 'revision', inference)
+    assert set(missing['unavailable']) == {'model_id', 'revision', 'trajectory_max_new_tokens',
+                                          'batch_size', 'optimized', 'action_generation', 'checkpoint'}
+    metadata = {'provenance': {'model_id': 'model', 'revision': 'revision'},
+                'config': {'trajectory_max_new_tokens': 192},
+                'inference': {key: value for key, value in inference.items() if key != 'trajectory_max_new_tokens'}}
+    summary = {'best': {'checkpoint': '/old-derived-root/' + checkpoint, 'step': 3564}}
+    for section in metadata.values():
+        if mismatch in section:
+            section[mismatch] = 'wrong'
+    if mismatch == 'checkpoint':
+        summary['best']['checkpoint'] = '/old-derived-root/drivema/other_run/checkpoint_3564'
+    (path.parent / 'metadata.json').write_text(json.dumps(metadata))
+    (path.parent / 'training_summary.json').write_text(json.dumps(summary))
+    if mismatch:
+        with pytest.raises(ValueError, match='provenance'):
+            baseline_provenance(path, checkpoint, 'model', 'revision', inference)
+    else:
+        checked = baseline_provenance(path, checkpoint, 'model', 'revision', inference)
+        assert checked['unavailable'] == []
+        assert checked['checked']['checkpoint'] == summary['best']['checkpoint']
+
+
+@pytest.mark.parametrize('mode', ['train', 'evaluate-monitor'])
+def test_baseline_argument_only_full(mode):
+    with pytest.raises(SystemExit):
+        cli.main(['--mode', mode, '--baseline-predictions', 'baseline.jsonl', '--dry-run'])
