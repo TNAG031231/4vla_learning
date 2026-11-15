@@ -1,0 +1,6 @@
+seed: 20261116
+gray_rgb: [128, 128, 128]
+checkpoint_relative_path: drivema/grpo_continuation_to256_run01/checkpoint_256
+sft_clean_relative_path: drivema/grpo_continuation_to256_run01/baseline_predictions.jsonl
+grpo_clean_relative_path: drivema/grpo_continuation_to256_run01/monitor_256_predictions.jsonl
+output_relative_dir: drivema/p3a_visual_ablation_run01
