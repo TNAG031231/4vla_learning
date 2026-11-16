@@ -20,7 +20,7 @@ from src.phase0.drivema_grpo_train import (
     evaluate_and_save, fit, load_config, prepare_data, run_identity, training_rollout_config, validate_config,
 )
 from src.phase0.drivema_grpo_replay import (
-    load_observation_replay, validate_replay_checkpoint, validate_replay_configuration,
+    load_observation_replay, load_observation_schedule, validate_replay_checkpoint, validate_replay_configuration,
 )
 from src.phase0.drivema_stage2_sft import Stage2Runner
 from src.phase0.drivema_stage2b import select_subset
@@ -48,8 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--max-steps', type=int, help='cumulative optimizer step budget, not additional steps')
     parser.add_argument('--evaluation-steps', nargs='+', type=int)
     parser.add_argument('--output-relative-dir', help='new directory relative to derived root, including on resume')
-    parser.add_argument('--observation-replay-archive', type=Path,
-                        help='original Stage 3D export ZIP; required for zero-consistency ablation')
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--observation-replay-archive', type=Path, help='original Stage 3D export ZIP')
+    source.add_argument('--observation-schedule', type=Path, help='frozen experiment observation schedule JSON')
     parser.add_argument('--dry-run', action='store_true', help='validate configuration only; no data/model loading')
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -59,8 +60,10 @@ def main(argv: list[str] | None = None) -> int:
     validate_config(config)
     rollout = training_rollout_config(ROOT, config)
     replay = load_observation_replay(args.observation_replay_archive) if args.observation_replay_archive else None
-    if config.consistency_weight == 0 and replay is None:
-        parser.error('zero-consistency ablation requires --observation-replay-archive')
+    if args.observation_schedule:
+        replay = load_observation_schedule(args.observation_schedule)
+    if config.consistency_weight != .5 and replay is None:
+        parser.error('consistency ablation requires --observation-replay-archive or --observation-schedule')
     if replay is not None:
         validate_replay_configuration(asdict(config), rollout, replay)
     if args.mode == 'train' and args.checkpoint is not None:

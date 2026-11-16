@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from src.phase0.drivema_grpo_evaluation import compare_predictions
+from src.phase0.drivema_grpo_bootstrap import action_behavior_bootstrap
 from src.phase0.drivema_stage2_protocol import trajectory_to_meta_action
 from src.phase0.drivema_stage3_rewards import assign_advantages
 from src.phase0.drivema_visual_metrics import align_predictions
@@ -101,6 +102,7 @@ def validation_diagnostics(baseline: list[dict], current: list[dict], reward: di
                          for label, values in sorted(subsets.items())}
     return {
         'comparison': compare_predictions(baseline, current),
+        'action_behavior_cluster_bootstrap': action_behavior_bootstrap(baseline, current, repetitions, seed),
         'metric_recomputation_max_abs_difference_m': max_difference,
         'overall': paired_statistics(pairs, **options), 'groups': grouped,
         'bootstrap': {'unit': 'scene; uniformly resample scenes with replacement, retain all their rows',

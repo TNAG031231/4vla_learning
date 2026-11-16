@@ -430,3 +430,213 @@ between AutoDL and Mac; checkpoint lineage comparisons use the run/checkpoint
 suffix so host-specific parent paths may change. Weights need not be uploaded.
 **GPU Pilot, 256-step training, Full Validation and all ablation quality conclusions
 remain pending.**
+
+## Parallel reward and coverage ablations (GPU execution pending)
+
+This section supersedes the single-worker 4-step execution recipe above. The
+historical offline findings and their confidence intervals remain unchanged.
+The current deployment target is **two simultaneous processes on one confirmed
+capable 32GB NVIDIA GPU**, each in an independent worktree. No local GPU training
+or new model inference has been performed.
+
+### Controlled design and acceptance
+
+| Round | Worker A | Worker B | Shared controls |
+|---|---|---|---|
+| Reward | consistency weight 0; 256 steps | consistency weight 0.25; 256 steps | Original Stage 3D step-to-observation mapping; saved weight-0.5/256-step baseline |
+| Coverage, pending reward analysis | 512 steps; 256 unique observations twice | 512 steps; 512 unique observations once | Explicitly selected common reward; equal update budget; fresh SFT initialization |
+
+Both rounds initialize independent Current LoRAs from Stage 2B
+`checkpoint_3564`, with the original SFT adapter as Frozen Reference. Model,
+revision, G=4, LR=1e-6, KL beta=0.01, clip epsilon=0.2, 0.5/0.5 turn loss,
+trajectory formula, advantage normalization, generation, coordinates and
+validation protocol retain the baseline identity. Stage 3A remains frozen at
+weight 0.5. Only GRPO experiment configuration permits 0/0.25/0.5.
+
+Each worker has separate process RNG state (same initial seed), optimizer,
+adapters, checkpoint/RNG state, history and outputs. Weight and experiment arm
+enter the checkpoint identity, preventing cross-arm resume. Independent RNG
+state does not imply identical generated candidates after policies diverge.
+A sampled RNG slot is consumed at each step, but the frozen schedule determines
+the actual observation, independently of candidate generation RNG consumption.
+
+`prepare_drivema_parallel.py` recovers all 256 original steps from the exported
+Rollout/history/metadata contract, preserving sample and scene tokens. The
+launcher compares the reward schedules against that original sequence before
+launching either worker. It starts both processes before waiting. A nonzero
+exit stops the sibling process group, records exit codes and preserves outputs;
+there is no automatic retry or output overwrite. Both worktrees must be clean
+tracked checkouts of the controller commit. Shared immutable model/data caches
+are permitted; mutable experiment state lives under worker-specific paths.
+
+The launcher records GPU UUID/total/free memory, disk headroom, process IDs,
+commands and per-worker logs. GPU and disk telemetry is sampled every five
+seconds; training history retains the existing per-process CUDA peak counters.
+The default admission thresholds (24 GiB GPU free, 40 GiB disk free) are operator
+headroom settings, **not measured experiment requirements or capacity claims**;
+adjust with `--min-free-gpu-gib` and `--min-free-disk-gib` after inspecting the
+server. Resource telemetry is observational during execution; disk exhaustion
+or GPU OOM is a worker failure, not an automatic change of experiment settings.
+
+Pilot acceptance requires both 32-step histories, finite diagnostics, observed
+nonzero gradients/LoRA updates, recomputed reward/advantage agreement, exact
+step/sample/scene alignment, matching unified/optimizer checkpoint identities
+and steps, and satisfactory GPU telemetry. Continuation requires explicit
+`--pilot-approved`; the audit is rerun before either process starts. The existing
+trainer restores optimizer and all RNG streams and enforces resume identity.
+Actual GPU resume and memory behavior remain pending. The 128-sample Monitor
+runs at steps 0, 32, 64, 128 and 256 (also 512 for coverage), using the original
+monitor population and evaluator.
+
+### AutoDL commands: first-round concurrent execution
+
+Run the following in **bash** in the existing repository, using the existing
+`codex4vla_env`. Set `GRPO_BASELINE_ARCHIVE` to the exported original ZIP, and
+retain the correct existing `NUSCENES_ROOT` and `VLA_DERIVED_ROOT`. The ZIP must
+retain the original member directory names. Paths below are new run names;
+do not point them at historical Stage 3D outputs. These GPU commands are
+prepared and CPU-validated; real AutoDL execution is pending.
+
+```bash
+git switch codex/phase-1-8-grpo-offline-diagnostics
+git pull --ff-only origin codex/phase-1-8-grpo-offline-diagnostics
+: "${NUSCENES_ROOT:?Set the existing dataset root}"
+: "${VLA_DERIVED_ROOT:?Set the existing derived root}"
+: "${GRPO_BASELINE_ARCHIVE:?Set the original diagnostics ZIP path}"
+export GRPO_SUITE="$VLA_DERIVED_ROOT/grpo_suites/reward_run01"
+export GRPO_WORKTREES="$VLA_DERIVED_ROOT/grpo_worktrees/reward_run01"
+export GRPO_RUN_REL=drivema/parallel_reward_run01
+export GRPO_SFT_PRED="$VLA_DERIVED_ROOT/drivema/stage2b_full_run01/final_validation_predictions.jsonl"
+GRPO_COMMIT=$(git rev-parse HEAD)
+git worktree add --detach "$GRPO_WORKTREES/worker_a" "$GRPO_COMMIT"
+git worktree add --detach "$GRPO_WORKTREES/worker_b" "$GRPO_COMMIT"
+conda run --no-capture-output -n codex4vla_env python scripts/prepare_drivema_parallel.py \
+  --round reward --baseline-archive "$GRPO_BASELINE_ARCHIVE" --output "$GRPO_SUITE"
+
+PARALLEL=(conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_parallel.py
+  --suite "$GRPO_SUITE/suite.json"
+  --worktree-a "$GRPO_WORKTREES/worker_a" --worktree-b "$GRPO_WORKTREES/worker_b"
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+  --run-relative-dir "$GRPO_RUN_REL" --gpu 0)
+
+# Configuration/command dry run: no GPU loading or training.
+"${PARALLEL[@]}" --stage pilot --dry-run
+
+# 1. Worker A (0) and Worker B (0.25): simultaneous 32-step Pilot.
+"${PARALLEL[@]}" --stage pilot
+```
+
+Review both `launch_pilot/worker_*_audit.json`, `resources.jsonl`,
+`process_status.json`, each worker's training history and checkpoint_32 under
+`$VLA_DERIVED_ROOT/$GRPO_RUN_REL`. Upload these real artifacts for review before
+approving continuation. Weight zero removes only the consistency contribution,
+not the trajectory or action reward and not the diagnostic consistency score.
+
+```bash
+# 2. Only after BOTH real Pilots pass: simultaneous continuation to total 256.
+"${PARALLEL[@]}" --stage continue --pilot-approved
+
+# 3. Only after successful continuation: simultaneous full 3,594-row validation.
+"${PARALLEL[@]}" --stage evaluate --baseline-predictions "$GRPO_SFT_PRED"
+
+# CPU report: weights 0, 0.25, historical 0.5, with SFT reference retained.
+conda run --no-capture-output -n codex4vla_env python scripts/report_drivema_parallel.py \
+  --suite "$GRPO_SUITE/suite.json" --run-root "$VLA_DERIVED_ROOT/$GRPO_RUN_REL" \
+  --output "$VLA_DERIVED_ROOT/grpo_reports/reward_run01" --bootstrap-repetitions 10000
+```
+
+The reporting path verifies historical SFT predictions against the ZIP, exact
+full population/targets, final checkpoint lineage, all training steps and
+recomputed rollout metrics. `comparison.json` contains each worker versus SFT
+and original GRPO, plus Worker B versus A. It reports ADE/FDE, longitudinal and
+lateral macro-F1 (including per-class metrics/confusion matrices), joint action
+accuracy, consistency, invalid rate, effective advantage groups and reward
+ranking conflicts. Paired scene-cluster bootstrap covers displacement deltas,
+improved fractions, macro-F1, joint accuracy, consistency and invalid-rate
+deltas. Macro-F1 is recomputed from pooled class counts for each scene draw;
+invalid action outputs remain false negatives. Undefined bootstrap replicates
+are counted explicitly. Trajectory-error ranking and ADE/FDE rankings remain
+separate. The weighted trajectory error still means 0.7 ADE + 0.3 FDE.
+
+### Coverage preparation gate
+
+Coverage is not launched by any first-round command. First review the complete
+three-weight result and explicitly choose a common reward with a written
+rationale. `prepare_drivema_parallel.py --round coverage` requires that completed
+report, the selected weight, rationale, and the original verified train-only
+manifest. Both arms start afresh from SFT, never from a reward-round checkpoint.
+
+Coverage A interleaves each original observation with its second visit.
+Coverage B interleaves the same original observation with a new observation.
+New observations are selected deterministically without replacement, preferring
+same scene + GT joint action, then GT action, then scene. Remaining mismatches
+are recorded rather than hidden. Schedules record step, sample, scene, visit,
+total visits, unique coverage, scene exposures, GT action exposures and match
+tiers. Exact distribution equality is not promised when eligible scenes lack
+matching observations. The current local ZIP lacks the original manifest;
+therefore real 512-observation schedules and GT-distribution matching are
+**not yet validated or frozen**. Generated candidate actions are never used as
+GT. A coverage dry run without inputs reports this blocked status and writes
+no schedules.
+
+After reward analysis, prepare using an explicitly reviewed weight (example
+shell variables below deliberately have no default selection):
+
+```bash
+: "${SELECTED_REWARD_WEIGHT:?Choose only after real first-round analysis}"
+: "${REWARD_SELECTION_RATIONALE:?Record evidence for the common reward}"
+conda run --no-capture-output -n codex4vla_env python scripts/prepare_drivema_parallel.py \
+  --round coverage --baseline-archive "$GRPO_BASELINE_ARCHIVE" \
+  --derived-root "$VLA_DERIVED_ROOT" \
+  --reward-results "$VLA_DERIVED_ROOT/grpo_reports/reward_run01/comparison.json" \
+  --consistency-weight "$SELECTED_REWARD_WEIGHT" --selection-rationale "$REWARD_SELECTION_RATIONALE" \
+  --output "$VLA_DERIVED_ROOT/grpo_suites/coverage_run01"
+```
+
+The same launcher supports the prepared coverage suite with independent new
+worktrees/run root, 32-step pilot and cumulative512 continuation. Coverage GPU
+execution remains gated on first-round review and is not scheduled here.
+
+### Learning and capability boundary
+
+This framework makes three controls auditable: reward weight, observation
+identity per optimizer step, and independent model/optimizer/RNG state. Equal
+seed alone cannot enforce equal observations when generation consumes RNG.
+Equal update budget also cannot distinguish repetition from wider coverage
+without frozen schedules and true GT distributions. Scene-cluster resampling
+captures within-scene correlation in validation; it does not estimate
+training-seed variability. One run per arm can support a matched experimental
+comparison, not a claim of stable superiority across random seeds.
+
+Code/CPU verification demonstrates orchestration, contracts and resume logic;
+it does not establish GPU feasibility, improved model quality, or a preferred
+reward. All new GPU metrics, real simultaneous VRAM usage, final action/error
+trade-offs and coverage conclusions remain pending uploaded artifacts.
+
+### Verification evidence for the parallel framework
+
+The full Stage 2/3 and offline-diagnostic CPU regression passed **184 tests**
+(16 existing PEFT fixture warnings; 74.28 s). After adding weight-0.25 real CPU
+LoRA resume and dual-worker report integration coverage, the focused parallel
+and ablation suite passed **22 tests** (4 PEFT fixture warnings; 46.59 s).
+The concurrent CPU-process test uses a mutual readiness barrier, proving both
+processes overlap; the failure test verifies sibling termination and persisted
+exit status. These subprocess tests do not load a GPU model.
+
+Real original ZIP preparation recovered all **256 unique observations** for
+both workers. Both 32/256-step worker configuration dry runs and all three
+launcher-stage command dry runs completed successfully. Coverage dry run
+reported missing completed reward analysis and original train-manifest evidence
+and wrote no coverage schedules. No new experiment outcome is reported here.
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q \
+  tests/test_drivema_parallel.py tests/test_drivema_grpo_ablation.py \
+  tests/test_drivema_grpo_diagnostics.py tests/test_drivema_grpo.py \
+  tests/test_drivema_stage3a.py tests/test_drivema_stage3b.py \
+  tests/test_drivema_stage2_sft.py tests/test_drivema_stage2_inference.py tests/test_drivema_stage2b.py
+```
+
+Final launcher-focused regression: **10 passed** (27.37 s), including GPU/disk
+admission failure before process start, output reuse rejection and exact
+baseline observation matching. Real GPU admission remains pending.

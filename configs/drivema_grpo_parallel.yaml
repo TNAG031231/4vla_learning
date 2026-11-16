@@ -1,0 +1,6 @@
+training_config: configs/drivema_grpo.yaml
+reward_weights: [0.0, 0.25]
+pilot_steps: 32
+reward_steps: 256
+coverage_steps: 512
+schedule_seed: 20261116

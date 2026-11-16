@@ -43,7 +43,7 @@ def test_grpo_only_override_and_frozen_stage3a(tmp_path):
         path.write_text(yaml.safe_dump(changed))
         with pytest.raises(ValueError, match='reward definition'):
             stage3a_config(path)
-    for value in (-1, .25, float('nan'), True):
+    for value in (-1, .1, float('nan'), True):
         with pytest.raises(ValueError, match='consistency weight'):
             training.validate_config(replace(cfg, consistency_weight=value))
 
@@ -111,9 +111,12 @@ def matched_arguments(arguments, config):
             'metadata': {**arguments['metadata'], 'observation_replay': replay}}
 
 
+@pytest.mark.parametrize('weight', [0., .25])
 def test_real_cpu_lora_replay_resume_and_unchanged_reference(dual_model, controlled_rollout, matched_arguments,
-                                                           config, validation_predict, monkeypatch, tmp_path):
-    cfg = replace(config, consistency_weight=0, max_steps=2, evaluation_steps=[0, 1, 2])
+                                                           config, validation_predict, monkeypatch, tmp_path, weight):
+    cfg = replace(config, consistency_weight=weight, max_steps=2, evaluation_steps=[0, 1, 2])
+    matched_arguments['rollout_config'] = replace(matched_arguments['rollout_config'], reward=replace(
+        matched_arguments['rollout_config'].reward, consistency_weight=weight))
     def rollout_with_extra_rng(**kwargs):
         torch.rand(37)
         return controlled_rollout[0](**kwargs)
@@ -133,14 +136,15 @@ def test_real_cpu_lora_replay_resume_and_unchanged_reference(dual_model, control
     for step in (1, 2):
         g = json.loads((tmp_path / f'continuous/rollout_{step}.json').read_text())
         assert all(g[k] == expected[step - 1][k] for k in expected[step - 1])
-        assert all(c['rewards']['turn_rewards'][1] == c['rewards']['trajectory'] for c in g['candidates'])
+        assert all(c['rewards']['turn_rewards'][1] == c['rewards']['trajectory'] + weight * c['rewards']['consistency']
+                   for c in g['candidates'])
         update = json.loads((tmp_path / f'continuous/update_{step}.json').read_text())
         assert update['lora_parameter_delta_l2'] > 0 and update['gradient_norm'] > 0
     assert json.loads((tmp_path / 'continuous/rollout_2.json').read_text()) == json.loads(
         (tmp_path / 'resumed/rollout_2.json').read_text())
     state = torch.load(checkpoint / 'unified_state.pt', weights_only=True)
     replay = matched_arguments['metadata']['observation_replay']
-    validate_replay_checkpoint(state, replay, 0)
+    validate_replay_checkpoint(state, replay, weight)
     with pytest.raises(ValueError, match='old GRPO forbidden'):
         validate_replay_checkpoint({'identity': replay['baseline_identity']}, replay, 0)
     changed = deepcopy(replay)
@@ -155,9 +159,10 @@ def test_real_cpu_lora_replay_resume_and_unchanged_reference(dual_model, control
                          matched_arguments['rollout_config'].reward, consistency_weight=.5)),
                      output=tmp_path / 'wrong-reward', resume=checkpoint,
                      **{k: v for k, v in matched_arguments.items() if k != 'rollout_config'})
-    report = report_cli.audit_ablation(replay, [tmp_path / 'pilot', tmp_path / 'resumed'], 2)
+    report = report_cli.audit_ablation(replay, [tmp_path / 'pilot', tmp_path / 'resumed'], 2, weight)
     assert report['verified_steps'] == 2
-    assert report['training']['ranking']['error_m']['combined']['pair_counts']['reversed'] == 0
+    if weight == 0:
+        assert report['training']['ranking']['error_m']['combined']['pair_counts']['reversed'] == 0
 
 
 def test_scene_mismatch_fails_before_update(dual_model, matched_arguments, config, tmp_path):

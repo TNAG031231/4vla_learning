@@ -50,7 +50,9 @@ def validate_replay_configuration(training: dict, rollout: RolloutConfig, replay
     if fixed != identity['training'] or actual != identity['rollout']:
         raise ValueError('ablation must preserve baseline training and rollout settings except consistency weight')
     if training['max_steps'] > len(replay['steps']):
-        raise ValueError('ablation budget exceeds the original 256 observations')
+        raise ValueError('ablation budget exceeds the frozen observation schedule')
+    if 'experiment' in replay and training['consistency_weight'] != replay['experiment']['consistency_weight']:
+        raise ValueError('reward differs from the frozen experiment schedule')
 
 
 def replay_identity(identity: dict, replay: dict) -> dict:
@@ -58,12 +60,28 @@ def replay_identity(identity: dict, replay: dict) -> dict:
     baseline['rollout']['reward']['consistency_weight'] = .5
     if baseline != replay['baseline_identity']:
         raise ValueError('replay model/data/train population/monitor/inference differs from baseline')
-    return {**identity, 'sampling': 'original_stage3d_observation_sequence; consume original randint slot',
-            'observation_sequence': replay['steps']}
+    result = {**identity, 'sampling': 'original_stage3d_observation_sequence; consume original randint slot',
+              'observation_sequence': replay['steps']}
+    if 'experiment' in replay:
+        result['experiment'] = replay['experiment']
+        if replay['experiment']['kind'] == 'coverage':
+            result['sampling'] = 'frozen_coverage_observation_sequence; consume original randint slot'
+    return result
 
 
 def validate_replay_checkpoint(state: dict, replay: dict, consistency_weight: float) -> None:
     identity = state['identity']
     if (identity.get('observation_sequence') != replay['steps']
-            or identity['rollout']['reward']['consistency_weight'] != consistency_weight):
+            or identity['rollout']['reward']['consistency_weight'] != consistency_weight
+            or identity.get('experiment') != replay.get('experiment')):
         raise ValueError('checkpoint must belong to this reward ablation and observation sequence; old GRPO forbidden')
+
+
+def load_observation_schedule(path: Path) -> dict:
+    replay = json.loads(path.read_text())
+    steps = replay['steps']
+    if ([row['optimizer_step'] for row in steps] != list(range(1, len(steps) + 1))
+            or len(steps) not in (256, 512)
+            or any(row['sample_token'] not in replay['baseline_identity']['train_tokens'] for row in steps)):
+        raise ValueError('invalid frozen observation schedule')
+    return replay

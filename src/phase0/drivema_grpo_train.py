@@ -42,8 +42,8 @@ def load_config(path: Path) -> TrainingConfig:
 
 
 def validate_config(config: TrainingConfig) -> None:
-    if type(config.consistency_weight) not in (int, float) or config.consistency_weight not in (0., .5):
-        raise ValueError('GRPO consistency weight supports only the frozen 0.5 baseline or 0 ablation')
+    if type(config.consistency_weight) not in (int, float) or config.consistency_weight not in (0., .25, .5):
+        raise ValueError('GRPO consistency weight supports only 0, 0.25 and the frozen 0.5 baseline')
     for name in ('max_steps', 'monitor_samples', 'checkpoint_interval'):
         if type(getattr(config, name)) is not int or getattr(config, name) < 1:
             raise ValueError(f'{name} must be a positive integer')
@@ -123,8 +123,8 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
     replay = metadata.get('observation_replay')
     if config.consistency_weight != rollout.reward.consistency_weight:
         raise ValueError('training and actual rollout consistency weights differ')
-    if config.consistency_weight == 0 and replay is None:
-        raise ValueError('zero-consistency ablation requires original observation replay')
+    if config.consistency_weight != .5 and replay is None:
+        raise ValueError('consistency ablation requires original observation replay')
     if replay is not None:
         validate_replay_configuration(asdict(config), rollout, replay)
         return replay_identity(identity, replay)
