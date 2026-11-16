@@ -354,3 +354,46 @@ conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.p
 主要产物：`metadata.json`、`monitor_tokens.json`、`baseline_predictions.jsonl` / `baseline_metrics.json`、`training_history.jsonl`、逐步 `rollout_N.json` / `update_N.json`、`checkpoint_N/{adapter,training_state.pt,unified_state.pt}`、`monitor_N_predictions.jsonl` / `monitor_N_metrics.json` / `monitor_N_comparison.json`、`summary.json`。Pilot 审阅使用 Step 32 comparison 加训练 history：检查 reward 各项、turn advantages、loss/KL、gradient norm、LoRA delta、生成有效率及有效 advantage group 比例，再结合配对预测判断是否继续。所有产物留在仓库外的 derived root。
 
 本机未设置真实 derived root，14,253 train / 3,594 validation 为冻结数据合同的预期规模，实际 eligible 数由真实 intake 报告；CPU 测试的 14,253 条是 producer-backed fixture，不作为真实数据验收。GPU 数值一致性、吞吐、显存和泛化改善均待验证；本入口不读取 test，也不自动执行完整 validation 或后续训练。
+
+### P3-A：Two-Turn VLA 视觉依赖消融
+
+独立入口 `scripts/run_drivema_visual_ablation.py`、配置 `configs/drivema_visual_ablation.yaml` 基于 PR #63 的 `76e6a47`。本阶段交付代码与 CPU 验收；真实 4B GPU sanity、128 条消融指标及显存需求均待用户决定后执行，现有 Full Validation 持续运行。
+
+- 复用 checkpoint_256 的 monitor 顺序和已有 SFT / GRPO Clean JSONL，严格核对 sample / scene / split / target / waypoint / mask；复用已有 validation manifest 身份合同，并核对 SFT 与 checkpoint 内 baseline 一致。GRPO Clean 来源为用户指定的 step-256 monitor 文件，checkpoint 不内嵌该次 current-policy predictions；实际文件与 checkpoint 的关联仍以原运行产物为依据。
+- 一个 Base Model 顺序启用冻结 `reference` / `default` Adapter；batch 1、原 greedy 配置、`compute_log_probs=False`，复用 Stage2Runner / optimized Two-Turn generation / 原 parser 与 evaluator，不训练。四种条件为 Gray、Scene Shuffle、History Gray、Current Gray；Clean 只编码输入做结构核验，不重新生成预测。
+- Gray 固定 RGB=(128,128,128)。Shuffle 从 validation 不同 scene 的有效帧抽取，按源槽位尺寸 bicubic resize；固定 seed=20261116，记录源/供体 observation token、真实 frame token、scene、路径和槽位；sanity 与 full 使用同一完整映射的前缀。有效历史按 oldest→current，最后一张有效图为当前帧；缺失槽位不生成图像。
+- 每条样本保存两条件的 `image_grid_thw`、图像数/尺寸和 image-token 位置，核对完整输入 IDs、attention mask、pixel tensor shape，并核对已有 Clean 的 Turn-1 prefix；失败保存 evidence 后停止。Turn 2 复用同一组视觉特征，其文本位置可随模型生成的 Turn-1 action 长度改变，这属于 Two-Turn 响应，而非输入槽位变化。
+- 全体与实际受干预子集分别统计；单帧 History Gray 标记 not-applicable，排除出历史贡献分析。动作变化率仅以两边 action 均成功解析的样本为分母，另报 action / trajectory validity transitions 与各自整体 invalid rate。ADE 沿用原 masked-GT 规则，FDE@3s 要求第六点有效；配对 delta 与 D_pred 分别报告分母，D_pred 是六个对应预测点距离的均值。跨模型差中差使用四条预测共同有效、GT horizon 可用的同一批样本。
+- 输出包含 metadata/config/seed、Donor Mapping、复用 Clean、8 组逐样本 predictions / input evidence / metrics / comparison 和 `summary.json`；summary 包括 GT 纵向/横向动作分组。缺失 prediction 视为未完成运行并报错，不从分母静默删除；invalid output 按原 evaluator 统计。`left/right` 仅表示横向运动，不能当作转弯标签。
+
+以下为 **AutoDL 待执行命令**；本轮未运行 GPU。沿用现有 `NUSCENES_ROOT`、`VLA_DERIVED_ROOT` 和 Hugging Face 缓存环境；运行时模型加载使用本地缓存，不下载第二份权重。`git worktree` 只创建独立 checkout，不改变现有 Full Validation 的代码、进程或产物；所有输出目录必须是新目录，重复执行会报错。
+
+```bash
+# 准备独立 worktree；不 checkout / reset 正在执行 Full Validation 的目录。
+git -C /root/workspace/4vla_grpo fetch origin codex/phase-1-8-p3a-visual-ablation
+git -C /root/workspace/4vla_grpo worktree add --detach /root/workspace/4vla_p3a origin/codex/phase-1-8-p3a-visual-ablation
+cd /root/workspace/4vla_p3a
+conda run -n codex4vla_env python scripts/run_drivema_visual_ablation.py --dry-run
+
+# 1. GPU Sanity：先检查实时显存及进程，确认允许启动后只运行 4 条。
+nvidia-smi
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_visual_ablation.py \
+  --samples 4 \
+  --output-relative-dir drivema/p3a_visual_sanity_run01
+
+# 2. Full P3-A：先检查 sanity summary / input evidence，确认后再次检查显存。
+# 程序要求 sanity 产物完整、配置一致且所有视觉结构核验通过。
+nvidia-smi
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_visual_ablation.py \
+  --samples 128 \
+  --sanity-output "$VLA_DERIVED_ROOT/drivema/p3a_visual_sanity_run01" \
+  --output-relative-dir drivema/p3a_visual_full_run01
+
+# 3. 结果汇总：仅读取保存产物，不加载模型；summary.json 已由运行入口保存。
+conda run -n codex4vla_env python scripts/run_drivema_visual_ablation.py \
+  --mode summarize --input-dir "$VLA_DERIVED_ROOT/drivema/p3a_visual_full_run01"
+```
+
+上述 sanity/full 应分别启动，先审阅再继续；发生显存压力时只停止新启动的 P3-A 前台进程（Ctrl-C），优先保护既有 Full Validation，不使用批量进程终止。可用显存和吞吐以届时 `nvidia-smi` 与运行结果为准。
+
+此实验是 test-time visual dependency analysis，不能替代重新训练的 Ego-only modality ablation；无预测变化不证明模型未使用视觉，误差变化与 GRPO 差中差也不构成严格模态因果效应或视觉能力排名。
