@@ -1,0 +1,12 @@
+rollout_config: configs/drivema_stage3a.yaml
+output_relative_dir: drivema/grpo_pilot_run01
+max_steps: 32
+learning_rate: 0.000001
+beta: 0.01
+epsilon: 0.2
+weight_decay: 0.0
+max_grad_norm: 1.0
+gradient_checkpointing: true
+monitor_samples: 128
+evaluation_steps: [0, 32]
+checkpoint_interval: 32
