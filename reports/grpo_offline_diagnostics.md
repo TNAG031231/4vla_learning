@@ -244,3 +244,189 @@ failures and the archive-to-CLI output path. Synthetic test numbers are not
 experimental results. Final CPU suite: **164 passed**, including 19 diagnostics
 tests, with 13 existing PEFT warnings (50.62 seconds); see the PR verification
 record for the full command. Staged diff and workspace hygiene checks passed.
+
+## Consistency Reward Ablation — implementation ready, GPU results pending
+
+**Research question:** does removing the consistency bonus improve trajectory
+accuracy, and what happens to action accuracy and action–trajectory agreement?
+The preceding real results remain the original weight-0.5 baseline. No ablation
+GPU run or improved metric is claimed in this section.
+
+The new `configs/drivema_grpo_no_consistency.yaml` changes only the reward
+coefficient to zero in the GRPO path. The Stage 3A YAML and strict loader remain
+frozen at 0.5; all other reward constraints remain active. The original
+`candidate_rewards`, `assign_advantages`, `update_group`, loss, sampler,
+checkpoint and evaluator are reused. Consistency is still computed and logged;
+its weighted contribution is zero, so Turn-2 reward equals trajectory reward,
+not zero total reward. Turn-1 reward is unchanged.
+
+Fixed controls are Qwen3-VL-4B-Instruct, original SFT `checkpoint_3564` for both
+fresh Current and frozen Reference adapters, original LoRA, G=4, LR=1e-6,
+KL beta=0.01, clip epsilon=0.2, existing equal weighting of present turn means
+(0.5/0.5 when both turns are present), trajectory formula, normalization,
+sampling configuration, coordinates and inference protocol. The only planned
+scientific treatment is consistency weight 0.5 → 0. The budget is **256 cumulative
+steps**, reached by a fresh 4-step Pilot followed by resume at step 5. Extra Pilot
+evaluation/checkpoint operations are operational controls; existing evaluation
+RNG isolation keeps them outside the training RNG stream.
+
+### Exact observation matching and initialization
+
+`--observation-replay-archive` reads all original Pilot/continuation rollouts and
+cross-checks every optimizer step and train sample token against training history.
+It preserves the **ordered 256 (step, sample_token, scene_token) records**, rather
+than regenerating observations from a seed. At training intake, train population,
+manifest identity, model, monitor tokens and inference settings must agree with
+the original run; every replay scene is checked against current train intake.
+Each generated rollout is checked against its expected step before the update.
+The original per-step `torch.randint` RNG slot is still consumed, while its drawn
+index is replaced by the fixed observation token. Candidate text/RNG trajectories
+may diverge after policy changes; exact observations do not imply identical
+candidates, GPU numerics or cross-seed stability.
+
+The sequence and actual reward weight enter checkpoint identity. A resume from
+original weight-0.5 GRPO, a changed replay sequence or incompatible settings fails.
+Fresh training loads Current and Reference from the original SFT adapter; only
+this experiment's new checkpoints may be resumed. Each run writes a new output
+directory and saves `observation_replay.json`, source execution provenance,
+full training/rollout configuration, per-step rollouts/updates/history,
+Current/Reference adapters, optimizer/RNG state and validation outputs.
+
+### CPU verification and remaining intake boundary
+
+The original real archive passes the new dry run: **256 ordered steps, 256 unique
+observations**, baseline training/rollout settings matched except consistency
+weight. The dry run reads saved artifacts/configuration only; it does not load
+models, images or the original temporal manifests, which remain on AutoDL.
+Actual train/validation intake and adapter identity still require the GPU host's
+existing artifacts. Saved source metadata is not a substitute for that intake.
+
+Producer-backed CPU tests cover zero-weight rewards/advantages, Stage 3A
+isolation, changed-config rejection, original sequence checks, extra RNG
+consumption, Tiny-Qwen LoRA updates, unchanged Reference, uninterrupted/resumed
+state equality, CLI SFT initialization and checkpoint reload, output collisions,
+old-GRPO rejection, Pilot audit and three-way full comparison. Synthetic
+3,594-row report fixtures test the pipeline, not model quality. No new dependency
+or local GPU execution is involved.
+
+Final CPU regression: **177 passed**, including 13 ablation tests, with 16 PEFT
+fixture warnings (68.85 seconds). Both the 4-step and 256-step configuration dry
+runs were executed against the real original ZIP; both recovered all 256 steps.
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 conda run -n codex4vla_env pytest -q \
+  tests/test_drivema_grpo_ablation.py tests/test_drivema_grpo_diagnostics.py \
+  tests/test_drivema_grpo.py tests/test_drivema_stage3a.py tests/test_drivema_stage3b.py \
+  tests/test_drivema_stage2_sft.py tests/test_drivema_stage2_inference.py tests/test_drivema_stage2b.py
+```
+
+### AutoDL RTX 4080 commands — user execution pending
+
+Use the existing AutoDL checkout/cache and `codex4vla_env`; the original baseline
+ZIP must contain the original directory names listed in the evidence section.
+Set `GRPO_BASELINE_ARCHIVE` to its actual location, and retain existing
+`NUSCENES_ROOT` / `VLA_DERIVED_ROOT`. All output names below must be unused.
+The training/evaluation commands below are **pending real GPU execution**; the
+same CLI paths are covered by CPU substitutes.
+
+```bash
+# Update the SAME PR branch in the checkout selected for this experiment.
+git fetch origin codex/phase-1-8-grpo-offline-diagnostics
+git switch codex/phase-1-8-grpo-offline-diagnostics
+git pull --ff-only origin codex/phase-1-8-grpo-offline-diagnostics
+
+# Place the original export here, or change this variable to its actual location.
+export GRPO_BASELINE_ARCHIVE="$HOME/grpo_diagnostics_inputs.zip"
+
+# 1. CPU-only source/config dry run; must show consistency_weight=0 and 256 steps.
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --config configs/drivema_grpo_no_consistency.yaml \
+  --observation-replay-archive "$GRPO_BASELINE_ARCHIVE" --dry-run
+
+# 2. Fresh SFT -> 4-step GPU Pilot; no --resume and no old GRPO checkpoint.
+nvidia-smi
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --config configs/drivema_grpo_no_consistency.yaml \
+  --observation-replay-archive "$GRPO_BASELINE_ARCHIVE" \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+
+# 3. CPU Pilot audit: exact step sequence, actual reward/advantage, finite logs,
+#    and at least one step with a positive gradient norm and nonzero LoRA update.
+conda run --no-capture-output -n codex4vla_env python scripts/report_drivema_grpo_ablation.py \
+  --baseline-archive "$GRPO_BASELINE_ARCHIVE" \
+  --run-dirs "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_pilot_run01" \
+  --steps 4 --output "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_pilot_audit_run01.json"
+```
+
+**Stop after Pilot for user review.** Inspect the audit plus all four
+`update_N.json` files for gradient/update magnitudes, KL, validity and effective
+advantage; check each candidate's `turn_rewards[1] == trajectory` even when its
+raw consistency score is nonzero. Review `monitor_4_comparison.json` on the
+original 128 observations; four steps are not a quality acceptance test. Audit
+success verifies recorded arithmetic/sequence/finite updates, not GPU convergence
+or performance. Continue only after this Pilot is accepted:
+
+```bash
+# 4. Resume THIS ablation at step 5; train to 256 cumulative steps.
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --config configs/drivema_grpo_no_consistency.yaml \
+  --observation-replay-archive "$GRPO_BASELINE_ARCHIVE" \
+  --resume "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_pilot_run01/checkpoint_4" \
+  --max-steps 256 --output-relative-dir drivema/grpo_no_consistency_to256_run01 \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+
+# The original 128-observation monitor runs at 0/4/32/64/128/256;
+# monitor_256_predictions/metrics/comparison.json are saved automatically.
+
+# 5. Audit the complete sequence and reward calculations before Full Validation.
+conda run --no-capture-output -n codex4vla_env python scripts/report_drivema_grpo_ablation.py \
+  --baseline-archive "$GRPO_BASELINE_ARCHIVE" \
+  --run-dirs "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_pilot_run01" \
+             "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_to256_run01" \
+  --steps 256 --output "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_training_audit_run01.json"
+
+# 6. Full 3,594-observation Validation, Current only; reuse validated historical SFT.
+conda run --no-capture-output -n codex4vla_env python scripts/run_drivema_grpo.py \
+  --config configs/drivema_grpo_no_consistency.yaml --mode evaluate-full \
+  --observation-replay-archive "$GRPO_BASELINE_ARCHIVE" \
+  --checkpoint "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_to256_run01/checkpoint_256" \
+  --baseline-predictions "$VLA_DERIVED_ROOT/drivema/stage2b_full_run01/final_validation_predictions.jsonl" \
+  --output-relative-dir drivema/grpo_no_consistency_full_validation_run01 \
+  --dataset-root "$NUSCENES_ROOT" --derived-root "$VLA_DERIVED_ROOT"
+
+# 7. CPU three-way report: SFT, original GRPO 256, consistency-zero GRPO 256.
+conda run --no-capture-output -n codex4vla_env python scripts/report_drivema_grpo_ablation.py \
+  --baseline-archive "$GRPO_BASELINE_ARCHIVE" \
+  --run-dirs "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_pilot_run01" \
+             "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_to256_run01" \
+  --steps 256 \
+  --evaluation-dir "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_full_validation_run01" \
+  --output "$VLA_DERIVED_ROOT/drivema/grpo_no_consistency_comparison_run01.json"
+```
+
+### GPU acceptance and reporting
+
+The final report audits original-vs-ablation observation sequence, effective and
+zero-variance groups, generated action distributions and reward-ranking conflicts;
+it then reports `original_grpo_vs_sft`, `ablation_vs_sft` and
+`ablation_vs_original_grpo`, including ADE/FDE, longitudinal/lateral macro-F1,
+per-class F1, confusion matrices, joint action accuracy, consistency, parsing and
+invalid rates. Paired errors and scene-cluster Bootstrap use the existing 10,000
+replicates/seed and identical target population; no test data are involved.
+
+Primary comparison is ablation minus original GRPO on Full Validation, while
+SFT remains a reference. Inspect weighted E alongside standalone ADE/FDE and
+any action/consistency regression. Weight zero removes consistency-induced
+weighted-E ranking conflicts by construction; that fact alone is not a learned
+trajectory-quality improvement. Other-metric reversals may remain because ADE
+and FDE are weighted together. One matched run is not cross-seed stability or
+proof of a universal optimal reward weight.
+
+For review, upload the new Pilot/continuation metadata, observation replay,
+training histories, all rollout/update JSONs, monitor predictions/metrics/comparisons,
+and the full-evaluation directory's metadata, baseline source, predictions and
+metrics, plus audit/comparison JSONs. Preserve directory names when moving results
+between AutoDL and Mac; checkpoint lineage comparisons use the run/checkpoint
+suffix so host-specific parent paths may change. Weights need not be uploaded.
+**GPU Pilot, 256-step training, Full Validation and all ablation quality conclusions
+remain pending.**

@@ -25,7 +25,8 @@ def mean(values: list) -> float | None:
     return float(np.mean(values)) if values else None
 
 
-def paired_statistics(pairs: list[tuple[dict, dict]], *, repetitions: int, seed: int) -> dict:
+def paired_statistics(pairs: list[tuple[dict, dict]], *, repetitions: int, seed: int,
+                      reference_label: str = 'sft', current_label: str = 'grpo') -> dict:
     result = {}
     for key in ERRORS:
         eligible = [(a, b) for a, b in pairs if a['prediction_valid'] and b['prediction_valid']
@@ -47,8 +48,8 @@ def paired_statistics(pairs: list[tuple[dict, dict]], *, repetitions: int, seed:
             }
         result[key] = {
             'sample_count': len(eligible), 'excluded_count': len(pairs) - len(eligible),
-            'scene_count': len(scenes), 'sft_mean_m': mean([a[key] for a, _ in eligible]),
-            'grpo_mean_m': mean([b[key] for _, b in eligible]), 'mean_delta_m': mean(delta.tolist()),
+            'scene_count': len(scenes), f'{reference_label}_mean_m': mean([a[key] for a, _ in eligible]),
+            f'{current_label}_mean_m': mean([b[key] for _, b in eligible]), 'mean_delta_m': mean(delta.tolist()),
             'median_delta_m': float(np.median(delta)) if len(delta) else None,
             'delta_quantiles_05_25_75_95_m': np.quantile(delta, [.05, .25, .75, .95]).tolist() if len(delta) else None,
             'improved': int((delta < 0).sum()), 'tied': int((delta == 0).sum()),
@@ -60,7 +61,10 @@ def paired_statistics(pairs: list[tuple[dict, dict]], *, repetitions: int, seed:
 
 
 def validation_diagnostics(baseline: list[dict], current: list[dict], reward: dict,
-                           repetitions: int, seed: int) -> dict:
+                           repetitions: int, seed: int, *, reference_label: str = 'sft',
+                           current_label: str = 'grpo') -> dict:
+    options = {'repetitions': repetitions, 'seed': seed,
+               'reference_label': reference_label, 'current_label': current_label}
     current = align_predictions(baseline, current)
     max_difference = 0.0
     for row in baseline + current:
@@ -93,18 +97,18 @@ def validation_diagnostics(baseline: list[dict], current: list[dict], reward: di
             label = (row['scene_token'] if axis == 'scene' else
                      f'{labels["longitudinal"]}/{labels["lateral"]}' if axis == 'joint' else labels[axis])
             subsets.setdefault(label, []).append(pair)
-        grouped[axis] = {label: paired_statistics(values, repetitions=repetitions, seed=seed)
+        grouped[axis] = {label: paired_statistics(values, **options)
                          for label, values in sorted(subsets.items())}
     return {
         'comparison': compare_predictions(baseline, current),
         'metric_recomputation_max_abs_difference_m': max_difference,
-        'overall': paired_statistics(pairs, repetitions=repetitions, seed=seed), 'groups': grouped,
+        'overall': paired_statistics(pairs, **options), 'groups': grouped,
         'bootstrap': {'unit': 'scene; uniformly resample scenes with replacement, retain all their rows',
                       'estimand': 'sample-weighted mean paired delta and improved fraction',
                       'repetitions': repetitions, 'seed': seed, 'interval': 'percentile 95%',
                       'single_scene': 'CI unavailable; descriptive point estimates only',
                       'scope': 'validation scene sampling uncertainty, not training-seed uncertainty'},
-        'delta_definition': 'GRPO minus SFT; negative is better; exact saved-value ties',
+        'delta_definition': f'{current_label} minus {reference_label}; negative is better; exact saved-value ties',
         'subgroups': 'GT factorized labels; descriptive, no multiplicity-adjusted significance claims',
     }
 

@@ -17,11 +17,13 @@ from src.phase0.drivema_grpo_evaluation import (
     baseline_provenance, behavior_statistics, load_baseline_predictions,
 )
 from src.phase0.drivema_grpo_train import (
-    evaluate_and_save, fit, load_config, prepare_data, run_identity, validate_config,
+    evaluate_and_save, fit, load_config, prepare_data, run_identity, training_rollout_config, validate_config,
+)
+from src.phase0.drivema_grpo_replay import (
+    load_observation_replay, validate_replay_checkpoint, validate_replay_configuration,
 )
 from src.phase0.drivema_stage2_sft import Stage2Runner
 from src.phase0.drivema_stage2b import select_subset
-from src.phase0.drivema_stage3a import load_config as load_rollout_config
 from src.phase0.phase0_4b_lora_full import load_config as load_action_config
 from src.phase0.phase0_4b_protocol import StructuredCollator
 from src.phase0.phase0_4b_evaluation import factorized_metrics
@@ -46,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--max-steps', type=int, help='cumulative optimizer step budget, not additional steps')
     parser.add_argument('--evaluation-steps', nargs='+', type=int)
     parser.add_argument('--output-relative-dir', help='new directory relative to derived root, including on resume')
+    parser.add_argument('--observation-replay-archive', type=Path,
+                        help='original Stage 3D export ZIP; required for zero-consistency ablation')
     parser.add_argument('--dry-run', action='store_true', help='validate configuration only; no data/model loading')
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -53,7 +57,12 @@ def main(argv: list[str] | None = None) -> int:
                  if getattr(args, key) is not None}
     config = replace(config, **overrides)
     validate_config(config)
-    rollout = load_rollout_config(ROOT / config.rollout_config)
+    rollout = training_rollout_config(ROOT, config)
+    replay = load_observation_replay(args.observation_replay_archive) if args.observation_replay_archive else None
+    if config.consistency_weight == 0 and replay is None:
+        parser.error('zero-consistency ablation requires --observation-replay-archive')
+    if replay is not None:
+        validate_replay_configuration(asdict(config), rollout, replay)
     if args.mode == 'train' and args.checkpoint is not None:
         parser.error('training uses --resume, not --checkpoint')
     if args.mode != 'train' and (args.checkpoint is None or args.resume is not None):
@@ -62,8 +71,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error('--baseline-predictions requires evaluate-full')
     if args.dry_run:
         print(json.dumps({'training': asdict(config), 'rollout': asdict(rollout),
-                          'train_selection': 'all eligible train records; rollout.train_samples is unused',
-                          'mode': args.mode}, indent=2))
+                          'train_selection': ('original step-by-step observation replay' if replay else
+                                              'all eligible train records; rollout.train_samples is unused'),
+                          'mode': args.mode,
+                          'observation_replay': {'steps': len(replay['steps']),
+                                                 'unique_observations': len({r['sample_token'] for r in replay['steps']}),
+                                                 'source': replay['source_archive']} if replay else None}, indent=2))
         return 0
     if args.dataset_root is None or args.derived_root is None:
         parser.error('provide dataset/derived roots')
@@ -73,6 +86,9 @@ def main(argv: list[str] | None = None) -> int:
     train, validation, records, intake = prepare_data(ROOT, args.derived_root)
     print(json.dumps({'data_intake': intake, 'full_train_selected': len(train)}, indent=2), flush=True)
     checkpoint = args.resume or args.checkpoint
+    if checkpoint is not None and replay is not None:
+        state = torch.load(checkpoint / 'unified_state.pt', map_location='cpu', weights_only=True)
+        validate_replay_checkpoint(state, replay, config.consistency_weight)
     initial = resolve_derived_path(args.derived_root, rollout.checkpoint_relative_path)
     semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
     baseline_source = None
@@ -105,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
                 'git_commit': collect_git_provenance(ROOT).commit, 'dtype': str(dtype), 'attention': 'sdpa',
                 'torch': str(torch.__version__), 'transformers': runtime.package_version('transformers'),
                 'peft': runtime.package_version('peft')}
+    if replay is not None:
+        metadata['observation_replay'] = replay
     if args.mode == 'train':
         fit(model=model, runner=runner, train=train, validation=validation, records=records,
             rollout_config=rollout, config=config, output=output, metadata=metadata, resume=args.resume)

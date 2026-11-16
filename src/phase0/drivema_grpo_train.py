@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import math
 from pathlib import Path
@@ -14,9 +14,10 @@ from torch import nn
 import yaml
 
 from src.phase0.drivema_grpo_evaluation import compare_predictions, evaluate_population
+from src.phase0.drivema_grpo_replay import MUTABLE_TRAINING_FIELDS, replay_identity, validate_replay_configuration
 from src.phase0.drivema_stage2_sft import Stage2Runner
 from src.phase0.drivema_stage2b import select_subset
-from src.phase0.drivema_stage3a import RolloutConfig, prepare_train, rollout_group
+from src.phase0.drivema_stage3a import RolloutConfig, load_config as load_stage3a_config, prepare_train, rollout_group
 from src.phase0.drivema_stage3b import GRPOConfig, activate_policy, restore_training, save_checkpoint, update_group
 from src.phase0.phase0_4b_lora_smoke import load_temporal_records
 from src.phase0.phase0_4b_protocol import SFTSample
@@ -31,6 +32,7 @@ class TrainingConfig(GRPOConfig):
     monitor_samples: int = 128
     evaluation_steps: list[int] = field(default_factory=lambda: [0, 32])
     checkpoint_interval: int = 32
+    consistency_weight: float = .5
 
 
 def load_config(path: Path) -> TrainingConfig:
@@ -40,6 +42,8 @@ def load_config(path: Path) -> TrainingConfig:
 
 
 def validate_config(config: TrainingConfig) -> None:
+    if type(config.consistency_weight) not in (int, float) or config.consistency_weight not in (0., .5):
+        raise ValueError('GRPO consistency weight supports only the frozen 0.5 baseline or 0 ablation')
     for name in ('max_steps', 'monitor_samples', 'checkpoint_interval'):
         if type(getattr(config, name)) is not int or getattr(config, name) < 1:
             raise ValueError(f'{name} must be a positive integer')
@@ -52,6 +56,11 @@ def validate_config(config: TrainingConfig) -> None:
             raise ValueError(f'{name} must be finite and nonnegative')
     if not 0 < config.epsilon < 1 or config.learning_rate == 0 or config.max_grad_norm == 0:
         raise ValueError('invalid optimizer settings')
+
+
+def training_rollout_config(repository: Path, config: TrainingConfig) -> RolloutConfig:
+    frozen = load_stage3a_config(repository / config.rollout_config)
+    return replace(frozen, reward=replace(frozen.reward, consistency_weight=config.consistency_weight))
 
 
 def prepare_data(repository: Path, derived_root: Path) -> tuple[list, list, dict, dict]:
@@ -100,8 +109,7 @@ def isolated_rng():
 
 def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFTSample],
                  monitor: list[SFTSample], runner: Stage2Runner, metadata: dict) -> dict:
-    mutable = ('max_steps', 'evaluation_steps', 'checkpoint_interval', 'output_relative_dir', 'rollout_config')
-    return {'training': {k: v for k, v in asdict(config).items() if k not in mutable},
+    identity = {'training': {k: v for k, v in asdict(config).items() if k not in MUTABLE_TRAINING_FIELDS},
             'rollout': {k: v for k, v in asdict(rollout).items() if k not in ('train_samples', 'output_relative_dir')},
             'train_tokens': [s.sample_token for s in train], 'monitor_tokens': [s.sample_token for s in monitor],
             'sampling': 'torch.randint; uniform_with_replacement; one_observation_per_optimizer_step',
@@ -112,6 +120,15 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
                            'trajectory_max_new_tokens': runner.trajectory_max_new_tokens,
                            'optimized': runner.optimized, 'batch_size': runner.inference_batch_size,
                            'compute_log_probs': runner.compute_log_probs}}
+    replay = metadata.get('observation_replay')
+    if config.consistency_weight != rollout.reward.consistency_weight:
+        raise ValueError('training and actual rollout consistency weights differ')
+    if config.consistency_weight == 0 and replay is None:
+        raise ValueError('zero-consistency ablation requires original observation replay')
+    if replay is not None:
+        validate_replay_configuration(asdict(config), rollout, replay)
+        return replay_identity(identity, replay)
+    return identity
 
 
 def validate_resume(state: dict, identity: dict, config: TrainingConfig) -> None:
@@ -161,6 +178,11 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
     monitor = select_subset(validation, config.monitor_samples, rollout_config.seed, 'validation')
     runner.compute_log_probs = False
     identity = run_identity(config, rollout_config, train, monitor, runner, metadata)
+    sequence = identity.get('observation_sequence')
+    by_token = {sample.sample_token: sample for sample in train}
+    if sequence is not None and any(by_token[row['sample_token']].scene_token != row['scene_token']
+                                    for row in sequence):
+        raise ValueError('replay observation scene differs from current train intake')
     state = None
     if resume:
         state = torch.load(resume / 'unified_state.pt', map_location='cpu', weights_only=True)
@@ -187,6 +209,8 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
     write_predictions(output / 'baseline_predictions.jsonl', baseline)
     write_json(output / 'baseline_metrics.json', baseline_metrics)
     write_json(output / 'monitor_tokens.json', identity['monitor_tokens'])
+    if sequence is not None:
+        write_json(output / 'observation_replay.json', metadata['observation_replay'])
     write_json(output / 'metadata.json', {**metadata, 'identity': identity, 'config': asdict(config),
                                         'resume': str(resume) if resume else None,
                                         'reference': 'frozen Stage 2B SFT; saved adapter/reference',
@@ -197,12 +221,16 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
             started = time.perf_counter()
             if cuda:
                 torch.cuda.reset_peak_memory_stats()
-            sample = train[int(torch.randint(len(train), (1,)))]
+            draw = int(torch.randint(len(train), (1,)))
+            sample = train[draw] if sequence is None else by_token[sequence[step - 1]['sample_token']]
             images = runner.images(sample)
             activate_policy(model, 'default')
             group = rollout_group(model=model, processor=runner.processor, sample=sample, images=images,
                                   record=records[sample.sample_token], config=rollout_config, device=runner.device)
             group['optimizer_step'] = step
+            if sequence is not None and any(group[key] != sequence[step - 1][key]
+                                            for key in ('optimizer_step', 'sample_token', 'scene_token')):
+                raise ValueError('generated rollout differs from original observation step')
             write_json(output / f'rollout_{step}.json', group)
             update = update_group(model, runner, sample, images, group, optimizer, config)
             update.update(group_metrics(group))
