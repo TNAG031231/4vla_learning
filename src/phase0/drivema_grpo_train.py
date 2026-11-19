@@ -14,7 +14,7 @@ from torch import nn
 import yaml
 
 from src.phase0.drivema_grpo_evaluation import compare_predictions, evaluate_population
-from src.phase0.drivema_grpo_replay import MUTABLE_TRAINING_FIELDS, replay_identity, validate_replay_configuration
+from src.phase0.drivema_grpo_replay import baseline_training_settings, replay_identity, validate_replay_configuration
 from src.phase0.drivema_stage2_sft import Stage2Runner
 from src.phase0.drivema_stage2b import select_subset
 from src.phase0.drivema_stage3a import RolloutConfig, load_config as load_stage3a_config, prepare_train, rollout_group
@@ -26,6 +26,9 @@ from src.phase0.phase0_4c_tiny_overfit import write_json
 from src.phase0.qwen3vl_dataset_adapter import load_config as load_ego_config, resolve_derived_path, sha256_file
 
 
+OBJECTIVE_CE_WEIGHTS = {'grpo': 0., 'grpo_ce': .1, 'ce_only': 1.}
+
+
 @dataclass(frozen=True)
 class TrainingConfig(GRPOConfig):
     max_steps: int = 32
@@ -33,6 +36,8 @@ class TrainingConfig(GRPOConfig):
     evaluation_steps: list[int] = field(default_factory=lambda: [0, 32])
     checkpoint_interval: int = 32
     consistency_weight: float = .5
+    objective: str = 'grpo'
+    trajectory_ce_weight: float = 0.
 
 
 def load_config(path: Path) -> TrainingConfig:
@@ -42,6 +47,9 @@ def load_config(path: Path) -> TrainingConfig:
 
 
 def validate_config(config: TrainingConfig) -> None:
+    if (config.objective not in OBJECTIVE_CE_WEIGHTS
+            or config.trajectory_ce_weight != OBJECTIVE_CE_WEIGHTS[config.objective]):
+        raise ValueError('objective and trajectory CE weight must match the frozen experiment arm')
     if type(config.consistency_weight) not in (int, float) or config.consistency_weight not in (0., .25, .5):
         raise ValueError('GRPO consistency weight supports only 0, 0.25 and the frozen 0.5 baseline')
     for name in ('max_steps', 'monitor_samples', 'checkpoint_interval'):
@@ -109,7 +117,7 @@ def isolated_rng():
 
 def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFTSample],
                  monitor: list[SFTSample], runner: Stage2Runner, metadata: dict) -> dict:
-    identity = {'training': {k: v for k, v in asdict(config).items() if k not in MUTABLE_TRAINING_FIELDS},
+    identity = {'training': baseline_training_settings(asdict(config)),
             'rollout': {k: v for k, v in asdict(rollout).items() if k not in ('train_samples', 'output_relative_dir')},
             'train_tokens': [s.sample_token for s in train], 'monitor_tokens': [s.sample_token for s in monitor],
             'sampling': 'torch.randint; uniform_with_replacement; one_observation_per_optimizer_step',
@@ -121,13 +129,17 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
                            'optimized': runner.optimized, 'batch_size': runner.inference_batch_size,
                            'compute_log_probs': runner.compute_log_probs}}
     replay = metadata.get('observation_replay')
+    if config.objective != 'grpo' and (replay is None or replay.get('experiment', {}).get('arm') != 'repeat256'):
+        raise ValueError('trajectory CE requires the Low-512 observation sequence')
     if config.consistency_weight != rollout.reward.consistency_weight:
         raise ValueError('training and actual rollout consistency weights differ')
     if config.consistency_weight != .5 and replay is None:
         raise ValueError('consistency ablation requires original observation replay')
     if replay is not None:
         validate_replay_configuration(asdict(config), rollout, replay)
-        return replay_identity(identity, replay)
+        identity = replay_identity(identity, replay)
+        if config.objective != 'grpo':
+            identity['trajectory_supervision'] = {'objective': config.objective, 'weight': config.trajectory_ce_weight}
     return identity
 
 
@@ -183,6 +195,11 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
     if sequence is not None and any(by_token[row['sample_token']].scene_token != row['scene_token']
                                     for row in sequence):
         raise ValueError('replay observation scene differs from current train intake')
+    if config.objective != 'grpo':
+        for token in dict.fromkeys(row['sample_token'] for row in sequence):
+            target = by_token[token].target
+            if not (target.longitudinal_valid and target.lateral_valid and all(records[token]['trajectory_valid_mask'])):
+                raise ValueError(f'trajectory CE requires a valid expert action and six valid waypoints: {token}')
     state = None
     if resume:
         state = torch.load(resume / 'unified_state.pt', map_location='cpu', weights_only=True)
@@ -225,24 +242,30 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
             sample = train[draw] if sequence is None else by_token[sequence[step - 1]['sample_token']]
             images = runner.images(sample)
             activate_policy(model, 'default')
-            group = rollout_group(model=model, processor=runner.processor, sample=sample, images=images,
-                                  record=records[sample.sample_token], config=rollout_config, device=runner.device)
-            group['optimizer_step'] = step
-            if sequence is not None and any(group[key] != sequence[step - 1][key]
-                                            for key in ('optimizer_step', 'sample_token', 'scene_token')):
-                raise ValueError('generated rollout differs from original observation step')
-            write_json(output / f'rollout_{step}.json', group)
-            update = update_group(model, runner, sample, images, group, optimizer, config)
-            update.update(group_metrics(group))
-            for turn in (0, 1):
-                effective[turn] += int(update['effective_advantage_group'][turn])
+            record = records[sample.sample_token]
+            group = None
+            if config.objective != 'ce_only':
+                group = rollout_group(model=model, processor=runner.processor, sample=sample, images=images,
+                                      record=record, config=rollout_config, device=runner.device)
+                group['optimizer_step'] = step
+                if sequence is not None and any(group[key] != sequence[step - 1][key]
+                                                for key in ('optimizer_step', 'sample_token', 'scene_token')):
+                    raise ValueError('generated rollout differs from original observation step')
+                write_json(output / f'rollout_{step}.json', group)
+            update = update_group(model, runner, sample, images, group, optimizer, config,
+                                  expert_record=record if config.objective != 'grpo' else None,
+                                  ce_weight=config.trajectory_ce_weight)
+            if group is not None:
+                update.update(group_metrics(group))
+                for turn in (0, 1):
+                    effective[turn] += int(update['effective_advantage_group'][turn])
+                update.update(effective_advantage_groups=effective.copy(),
+                              effective_advantage_group_rate=[count / step for count in effective])
             if cuda:
                 torch.cuda.synchronize()
-            update.update(step=step, sample_token=sample.sample_token,
+            update.update(step=step, sample_token=sample.sample_token, scene_token=sample.scene_token,
                           elapsed_seconds=time.perf_counter() - started,
-                          peak_allocated_bytes=torch.cuda.max_memory_allocated() if cuda else None,
-                          effective_advantage_groups=effective.copy(),
-                          effective_advantage_group_rate=[count / step for count in effective])
+                          peak_allocated_bytes=torch.cuda.max_memory_allocated() if cuda else None)
             write_json(output / f'update_{step}.json', update)
             compact = {k: v for k, v in update.items() if k != 'candidates'}
             history.write(json.dumps(compact, allow_nan=False) + '\n')

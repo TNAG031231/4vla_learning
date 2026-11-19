@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict
 import json
@@ -11,6 +12,26 @@ from src.phase0.drivema_stage3a import RolloutConfig
 
 MUTABLE_TRAINING_FIELDS = ('max_steps', 'evaluation_steps', 'checkpoint_interval',
                            'output_relative_dir', 'rollout_config', 'consistency_weight')
+
+
+def baseline_training_settings(training: dict) -> dict:
+    return {k: v for k, v in training.items()
+            if k not in (*MUTABLE_TRAINING_FIELDS, 'objective', 'trajectory_ce_weight')}
+
+
+def low512_replay(metadata: dict) -> dict:
+    replay = metadata['observation_replay']
+    experiment = replay['experiment']
+    steps = replay['steps']
+    counts = Counter(row['sample_token'] for row in steps)
+    if (metadata['mode'] != 'evaluate-full' or metadata['step'] != 512
+            or experiment['kind'] != 'coverage' or experiment['arm'] != 'repeat256'
+            or experiment['consistency_weight'] != .5
+            or [row['optimizer_step'] for row in steps] != list(range(1, 513))
+            or len(counts) != 256 or set(counts.values()) != {2}
+            or metadata['identity'] != replay_identity(replay['baseline_identity'], replay)):
+        raise ValueError('expected the original Low-512 full evaluation with its repeat256 schedule')
+    return replay
 
 
 def load_observation_replay(path: Path) -> dict:
@@ -43,7 +64,7 @@ def load_observation_replay(path: Path) -> dict:
 
 def validate_replay_configuration(training: dict, rollout: RolloutConfig, replay: dict) -> None:
     identity = replay['baseline_identity']
-    fixed = {k: v for k, v in training.items() if k not in MUTABLE_TRAINING_FIELDS}
+    fixed = baseline_training_settings(training)
     actual = asdict(rollout)
     actual = {k: v for k, v in actual.items() if k not in ('train_samples', 'output_relative_dir')}
     actual['reward']['consistency_weight'] = .5

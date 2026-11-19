@@ -116,8 +116,9 @@ def controlled_rollout(monkeypatch, processor):
     return produce, calls
 
 
+@pytest.mark.parametrize('ce_weight', [0., .1])
 def test_accumulation_matches_joint_backward_and_freezes_reference(dual_model, controlled_rollout,
-                                                                  runner, samples, records):
+                                                                  runner, samples, records, ce_weight):
     model = dual_model
     config = training.load_config(ROOT / 'configs/drivema_stage3b_smoke.yaml')
     config = replace(config, learning_rate=1e-3, max_grad_norm=100.)
@@ -137,11 +138,20 @@ def test_accumulation_matches_joint_backward_and_freezes_reference(dual_model, c
         current = torch.cat(assistant_log_probs(model, batch, spans))
         torch.testing.assert_close(current, ref)
         losses.append(training.grpo_loss(current, ref, policy_targets(c, 'cpu'), .2, .01)[0])
-    torch.stack(losses).mean().backward()
+    objective = torch.stack(losses).mean()
+    if ce_weight:
+        inputs, spans = runner.training_batch(sample, records['train'][0])
+        labels = inputs['labels'].clone()
+        labels[:, :spans[1].start] = -100
+        ce = model(**{**inputs, 'labels': labels}, use_cache=False).loss
+        objective = objective + ce_weight * ce
+    objective.backward()
     expected = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-    result = training.update_group(model, runner, sample, images, group, optimizer, config)
+    result = training.update_group(model, runner, sample, images, group, optimizer, config,
+                                   expert_record=records['train'][0] if ce_weight else None, ce_weight=ce_weight)
+    assert result['loss'] == pytest.approx(float(objective.detach()), abs=1e-6)
     for name, p in model.named_parameters():
         if name in expected:
             torch.testing.assert_close(p.grad, expected[name], atol=2e-6, rtol=1e-4)
