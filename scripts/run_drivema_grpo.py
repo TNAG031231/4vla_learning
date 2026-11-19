@@ -20,7 +20,8 @@ from src.phase0.drivema_grpo_train import (
     evaluate_and_save, fit, load_config, prepare_data, run_identity, training_rollout_config, validate_config,
 )
 from src.phase0.drivema_grpo_replay import (
-    load_observation_replay, load_observation_schedule, validate_replay_checkpoint, validate_replay_configuration,
+    load_observation_replay, load_observation_schedule, low512_replay, validate_replay_checkpoint,
+    validate_replay_configuration,
 )
 from src.phase0.drivema_stage2_sft import Stage2Runner
 from src.phase0.drivema_stage2b import select_subset
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--observation-replay-archive', type=Path, help='original Stage 3D export ZIP')
     source.add_argument('--observation-schedule', type=Path, help='frozen experiment observation schedule JSON')
+    source.add_argument('--low512-validation', type=Path, help='original repeat256 worker_a_full_validation directory')
     parser.add_argument('--dry-run', action='store_true', help='validate configuration only; no data/model loading')
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -62,6 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     replay = load_observation_replay(args.observation_replay_archive) if args.observation_replay_archive else None
     if args.observation_schedule:
         replay = load_observation_schedule(args.observation_schedule)
+    if (config.objective != 'grpo') != (args.low512_validation is not None):
+        parser.error('both trajectory CE arms require --low512-validation')
+    if args.low512_validation is not None:
+        replay = low512_replay(json.loads((args.low512_validation / 'metadata.json').read_text()))
     if config.consistency_weight != .5 and replay is None:
         parser.error('consistency ablation requires --observation-replay-archive or --observation-schedule')
     if replay is not None:
@@ -72,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error('evaluation requires --checkpoint and no --resume')
     if args.baseline_predictions is not None and args.mode != 'evaluate-full':
         parser.error('--baseline-predictions requires evaluate-full')
+    if args.low512_validation is not None and args.mode == 'evaluate-full' and args.baseline_predictions is None:
+        args.baseline_predictions = args.low512_validation / 'sft_full_predictions.jsonl'
     if args.dry_run:
         print(json.dumps({'training': asdict(config), 'rollout': asdict(rollout),
                           'train_selection': ('original step-by-step observation replay' if replay else
@@ -92,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
     if checkpoint is not None and replay is not None:
         state = torch.load(checkpoint / 'unified_state.pt', map_location='cpu', weights_only=True)
         validate_replay_checkpoint(state, replay, config.consistency_weight)
+        if args.low512_validation is not None and args.mode == 'evaluate-full' and state['step'] != 512:
+            parser.error('Low-512 full validation requires checkpoint step 512')
     initial = resolve_derived_path(args.derived_root, rollout.checkpoint_relative_path)
     semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
     baseline_source = None

@@ -107,12 +107,8 @@ def probability_diagnostics(current: torch.Tensor, old_tf: torch.Tensor, generat
     return result
 
 
-def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, images: list, group: dict,
-                 optimizer: torch.optim.Optimizer, config: GRPOConfig) -> dict:
-    activate_policy(model, 'default')
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    before = [p.detach().float().cpu().clone() for p in parameters]
-    optimizer.zero_grad(set_to_none=True)
+def backward_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, images: list,
+                   group: dict, config: GRPOConfig) -> dict:
     # Snapshot every old TF probability before any backward or optimizer step.
     activate_policy(model, 'default', backward=True)
     old_tf_log_probs = []
@@ -153,13 +149,6 @@ def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, imag
         (loss / len(group['candidates'])).backward()
         diagnostics.append(metrics)
         del loss, current, reference, inputs, targets
-    norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm, error_if_nonfinite=True)
-    optimizer.step()
-    delta = sum((p.detach().float().cpu() - previous).square().sum().item()
-                for p, previous in zip(parameters, before, strict=True)) ** .5
-    if not math.isfinite(delta):
-        raise FloatingPointError('nonfinite LoRA parameter update')
-    activate_policy(model, 'default')
     ratios = torch.tensor([r for d in diagnostics for r in d['ratios']])
     combined = {key: torch.tensor([v for d in diagnostics for v in d[key]]) for key in
                 ('current_log_probs', 'old_tf_log_probs', 'old_generation_log_probs', 'reference_log_probs', 'turn_ids')}
@@ -175,8 +164,33 @@ def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, imag
             'loss': sum(d['loss'] for d in diagnostics) / len(diagnostics),
             'policy_loss': sum(d['policy_loss'] for d in diagnostics) / len(diagnostics),
             'kl': sum(d['kl'] for d in diagnostics) / len(diagnostics),
-            'gradient_norm': float(norm), 'lora_parameter_delta_l2': delta,
             'candidates': diagnostics}
+
+
+def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, images: list, group: dict | None,
+                 optimizer: torch.optim.Optimizer, config: GRPOConfig, *,
+                 expert_record: dict | None = None, ce_weight: float = 1.) -> dict:
+    activate_policy(model, 'default', backward=True)
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    before = [p.detach().float().cpu().clone() for p in parameters]
+    optimizer.zero_grad(set_to_none=True)
+    metrics = backward_group(model, runner, sample, images, group, config) if group is not None else {'loss': 0.}
+    if expert_record is not None:
+        inputs, spans = runner.training_batch(sample, expert_record, images=images)
+        (log_probs,) = assistant_log_probs(model, inputs, [spans[1]])
+        trajectory_ce = -log_probs.mean()
+        (ce_weight * trajectory_ce).backward()
+        metrics.update(trajectory_ce=float(trajectory_ce.detach()), trajectory_tokens=log_probs.numel(),
+                       trajectory_ce_weight=ce_weight)
+        metrics['loss'] += ce_weight * metrics['trajectory_ce']
+    norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm, error_if_nonfinite=True)
+    optimizer.step()
+    delta = sum((p.detach().float().cpu() - previous).square().sum().item()
+                for p, previous in zip(parameters, before, strict=True)) ** .5
+    if not math.isfinite(delta):
+        raise FloatingPointError('nonfinite LoRA parameter update')
+    activate_policy(model, 'default')
+    return {**metrics, 'gradient_norm': float(norm), 'lora_parameter_delta_l2': delta}
 
 
 def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, path: Path,

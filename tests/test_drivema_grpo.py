@@ -92,7 +92,8 @@ def scalar_training(monkeypatch):
                                 'turn_advantages': [1., -1.], 'assistant_spans': []}],
                 'statistics': {'zero_variance': [False, False], 'invalid_rate': [0., 0.]}}
 
-    def update(model, runner, sample, images, group, optimizer, config):
+    def update(model, runner, sample, images, group, optimizer, config, *, expert_record, ce_weight):
+        assert expert_record is None and ce_weight == 0.
         optimizer.zero_grad()
         before = model.lora_A['default'].weight.detach().clone()
         loss = (model.lora_A['default'].weight - group['draw']).square().sum()
