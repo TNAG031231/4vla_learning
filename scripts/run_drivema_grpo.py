@@ -20,7 +20,7 @@ from src.phase0.drivema_grpo_train import (
     evaluate_and_save, fit, load_config, prepare_data, run_identity, training_rollout_config, validate_config,
 )
 from src.phase0.drivema_grpo_replay import (
-    load_observation_replay, load_observation_schedule, low512_replay, validate_replay_checkpoint,
+    extend_low512, load_observation_replay, load_observation_schedule, low512_replay, validate_replay_checkpoint,
     validate_replay_configuration,
 )
 from src.phase0.drivema_stage2_sft import Stage2Runner
@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--baseline-predictions', type=Path,
                         help='saved Stage 2B full validation JSONL; evaluate-full only; skips SFT inference')
     parser.add_argument('--max-steps', type=int, help='cumulative optimizer step budget, not additional steps')
+    parser.add_argument('--dual-ce-first-step', type=int, choices=(1, 513))
     parser.add_argument('--evaluation-steps', nargs='+', type=int)
     parser.add_argument('--output-relative-dir', help='new directory relative to derived root, including on resume')
     source = parser.add_mutually_exclusive_group()
@@ -57,8 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--dry-run', action='store_true', help='validate configuration only; no data/model loading')
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    overrides = {key: getattr(args, key) for key in ('max_steps', 'evaluation_steps', 'output_relative_dir')
-                 if getattr(args, key) is not None}
+    fields = ('max_steps', 'evaluation_steps', 'output_relative_dir', 'dual_ce_first_step')
+    overrides = {key: getattr(args, key) for key in fields if getattr(args, key) is not None}
     config = replace(config, **overrides)
     validate_config(config)
     rollout = training_rollout_config(ROOT, config)
@@ -67,8 +68,12 @@ def main(argv: list[str] | None = None) -> int:
         replay = load_observation_schedule(args.observation_schedule)
     if (config.objective != 'grpo') != (args.low512_validation is not None):
         parser.error('--low512-validation is required for the matched CE arms and applies only to them')
+    low_control = None
     if args.low512_validation is not None:
-        replay = low512_replay(json.loads((args.low512_validation / 'metadata.json').read_text()))
+        low_control = json.loads((args.low512_validation / 'metadata.json').read_text())
+        replay = low512_replay(low_control)
+        if config.objective == 'grpo_dual_ce':
+            replay = extend_low512(replay)
     if config.consistency_weight != .5 and replay is None:
         parser.error('consistency ablation requires --observation-replay-archive or --observation-schedule')
     if replay is not None:
@@ -100,9 +105,15 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint = args.resume or args.checkpoint
     if checkpoint is not None and replay is not None:
         state = torch.load(checkpoint / 'unified_state.pt', map_location='cpu', weights_only=True)
-        validate_replay_checkpoint(state, replay, config.consistency_weight)
-        if args.low512_validation is not None and args.mode == 'evaluate-full' and state['step'] != 512:
-            parser.error('Low-512 full validation requires checkpoint step 512')
+        if args.resume and config.dual_ce_first_step == 513 and state['step'] == 512:
+            if state['identity'] != low_control['identity']:
+                parser.error('B requires the original Low-512 checkpoint')
+        else:
+            validate_replay_checkpoint(state, replay, config.consistency_weight)
+        if low_control is not None and args.mode == 'evaluate-full':
+            allowed = (512, 768) if config.objective == 'grpo_dual_ce' else (512,)
+            if state['step'] not in allowed or state['step'] < config.dual_ce_first_step:
+                parser.error(f'unsupported full-validation checkpoint for this arm: {state["step"]}')
     initial = resolve_derived_path(args.derived_root, rollout.checkpoint_relative_path)
     semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
     baseline_source = None
@@ -142,7 +153,8 @@ def main(argv: list[str] | None = None) -> int:
         metadata['observation_replay'] = replay
     if args.mode == 'train':
         fit(model=model, runner=runner, train=train, validation=validation, records=records,
-            rollout_config=rollout, config=config, output=output, metadata=metadata, resume=args.resume)
+            rollout_config=rollout, config=config, output=output, metadata=metadata, resume=args.resume,
+            low512_parent_identity=low_control['identity'] if low_control else None)
     else:
         state = torch.load(checkpoint / 'unified_state.pt', map_location='cpu', weights_only=True)
         monitor = select_subset(validation, config.monitor_samples, rollout.seed, 'validation')

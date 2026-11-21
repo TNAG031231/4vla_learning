@@ -39,6 +39,11 @@ class TrainingConfig(GRPOConfig):
     objective: str = 'grpo'
     trajectory_ce_weight: float = 0.
     meta_action_ce_weight: float = 0.
+    dual_ce_first_step: int = 1
+
+    def dual_supervision(self) -> dict:
+        return {'first_step': self.dual_ce_first_step, 'trajectory_ce_weight': self.trajectory_ce_weight,
+                'meta_action_ce_weight': self.meta_action_ce_weight}
 
 
 def load_config(path: Path) -> TrainingConfig:
@@ -50,7 +55,13 @@ def load_config(path: Path) -> TrainingConfig:
 def validate_config(config: TrainingConfig) -> None:
     weight = OBJECTIVE_CE_WEIGHTS.get(config.objective)
     expected = (0., weight) if config.objective in ('grpo_meta_ce', 'meta_ce_only') else (weight, 0.)
-    if weight is None or (config.trajectory_ce_weight, config.meta_action_ce_weight) != expected:
+    if config.objective == 'grpo_dual_ce':
+        expected = (.1, .1)
+        if config.dual_ce_first_step not in (1, 513):
+            raise ValueError('dual CE must start at step 1 or 513')
+    elif weight is None or config.dual_ce_first_step != 1:
+        raise ValueError('unknown objective or unexpected dual CE starting step')
+    if (config.trajectory_ce_weight, config.meta_action_ce_weight) != expected:
         raise ValueError('objective and CE weights must match the frozen experiment arm')
     if type(config.consistency_weight) not in (int, float) or config.consistency_weight not in (0., .25, .5):
         raise ValueError('GRPO consistency weight supports only 0, 0.25 and the frozen 0.5 baseline')
@@ -140,7 +151,11 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
     if replay is not None:
         validate_replay_configuration(asdict(config), rollout, replay)
         identity = replay_identity(identity, replay)
-        if config.meta_action_ce_weight:
+        if config.objective == 'grpo_dual_ce':
+            if replay['experiment']['kind'] != 'dual_ce_768':
+                raise ValueError('dual CE requires the extended Low-512 replay')
+            identity['dual_supervision'] = config.dual_supervision()
+        elif config.meta_action_ce_weight:
             identity['meta_action_supervision'] = {
                 'objective': config.objective, 'weight': config.meta_action_ce_weight}
         elif config.trajectory_ce_weight:
@@ -188,7 +203,7 @@ def group_metrics(group: dict) -> dict:
 
 def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], validation: list[SFTSample],
         records: dict, rollout_config: RolloutConfig, config: TrainingConfig, output: Path,
-        metadata: dict, resume: Path | None = None) -> dict:
+        metadata: dict, resume: Path | None = None, low512_parent_identity: dict | None = None) -> dict:
     validate_config(config)
     if not train or any(s.split != 'train' for s in train):
         raise ValueError('GRPO requires nonempty train split')
@@ -210,7 +225,13 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
     state = None
     if resume:
         state = torch.load(resume / 'unified_state.pt', map_location='cpu', weights_only=True)
-        validate_resume(state, identity, config)
+        if config.dual_ce_first_step == 513 and state['step'] == 512:
+            if state['identity'] != low512_parent_identity or config.max_steps <= 512:
+                raise ValueError('B must continue the original pure GRPO Low-512 checkpoint')
+        else:
+            validate_resume(state, identity, config)
+    elif config.dual_ce_first_step == 513:
+        raise ValueError('B requires the Low-512 checkpoint to start at step 513')
     output.mkdir(parents=True, exist_ok=False)
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
@@ -220,7 +241,7 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
     torch.manual_seed(rollout_config.seed)
     random.seed(rollout_config.seed)
     np.random.seed(rollout_config.seed)
-    start = restore_training(optimizer, resume, identity) if resume else 0
+    start = restore_training(optimizer, resume, state['identity']) if resume else 0
     if state is not None:
         if start != state['step']:
             raise ValueError('checkpoint training states disagree on global step')
@@ -262,8 +283,8 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
                 write_json(output / f'rollout_{step}.json', group)
             update = update_group(model, runner, sample, images, group, optimizer, config,
                                   expert_record=record if config.objective != 'grpo' else None,
-                                  ce_weight=config.trajectory_ce_weight or config.meta_action_ce_weight,
-                                  action_only=bool(config.meta_action_ce_weight))
+                                  ce_weight=config.trajectory_ce_weight,
+                                  meta_action_ce_weight=config.meta_action_ce_weight)
             if group is not None:
                 update.update(group_metrics(group))
                 for turn in (0, 1):
