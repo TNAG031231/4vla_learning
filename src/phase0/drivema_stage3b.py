@@ -169,22 +169,30 @@ def backward_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, im
 
 def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, images: list, group: dict | None,
                  optimizer: torch.optim.Optimizer, config: GRPOConfig, *,
-                 expert_record: dict | None = None, ce_weight: float = 1., action_only: bool = False) -> dict:
+                 expert_record: dict | None = None, ce_weight: float = 1., action_only: bool = False,
+                 meta_action_ce_weight: float = 0.) -> dict:
     activate_policy(model, 'default', backward=True)
     parameters = [p for p in model.parameters() if p.requires_grad]
     before = [p.detach().float().cpu().clone() for p in parameters]
     optimizer.zero_grad(set_to_none=True)
     metrics = backward_group(model, runner, sample, images, group, config) if group is not None else {'loss': 0.}
     if expert_record is not None:
-        inputs, spans = runner.training_batch(sample, expert_record, images=images, action_only=action_only)
-        (log_probs,) = assistant_log_probs(model, inputs, [spans[-1]])
-        ce = -log_probs.mean()
-        (ce_weight * ce).backward()
-        target = 'meta_action' if action_only else 'trajectory'
-        metrics[f'{target}_ce'] = float(ce.detach())
-        metrics[f'{target}_tokens'] = log_probs.numel()
-        metrics[f'{target}_ce_weight'] = ce_weight
-        metrics['loss'] += ce_weight * metrics[f'{target}_ce']
+        trajectory_weight = 0. if action_only else ce_weight
+        action_weight = ce_weight if action_only else meta_action_ce_weight
+        inputs, spans = runner.training_batch(sample, expert_record, images=images, action_only=not trajectory_weight)
+        targets = {1: ('meta_action', action_weight), 2: ('trajectory', trajectory_weight)}
+        supervised = [span for span in spans if targets[span.turn][1]]
+        log_probs = assistant_log_probs(model, inputs, supervised)
+        losses = []
+        for span, logp in zip(supervised, log_probs, strict=True):
+            name, weight = targets[span.turn]
+            ce = -logp.mean()
+            losses.append(weight * ce)
+            metrics[f'{name}_ce'] = float(ce.detach())
+            metrics[f'{name}_tokens'] = logp.numel()
+            metrics[f'{name}_ce_weight'] = weight
+            metrics['loss'] += weight * metrics[f'{name}_ce']
+        torch.stack(losses).sum().backward()
     norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm, error_if_nonfinite=True)
     optimizer.step()
     delta = sum((p.detach().float().cpu() - previous).square().sum().item()

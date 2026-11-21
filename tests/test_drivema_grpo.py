@@ -86,17 +86,19 @@ class ScalarAdapters(nn.Module):
 def scalar_training(monkeypatch):
     def rollout(**kwargs):
         draw = float(torch.rand(1)) + random.random() + np.random.random()
-        return {'sample_token': kwargs['sample'].sample_token, 'draw': draw,
+        return {'sample_token': kwargs['sample'].sample_token, 'scene_token': kwargs['sample'].scene_token, 'draw': draw,
                 'candidates': [{'rewards': {'action': draw, 'trajectory': .5, 'consistency': .25,
                                            'turn_rewards': [draw, .625]},
                                 'turn_advantages': [1., -1.], 'assistant_spans': []}],
                 'statistics': {'zero_variance': [False, False], 'invalid_rate': [0., 0.]}}
 
-    def update(model, runner, sample, images, group, optimizer, config, *, expert_record, ce_weight, action_only):
-        assert expert_record is None and ce_weight == 0.
+    def update(model, runner, sample, images, group, optimizer, config, *, expert_record,
+               ce_weight, meta_action_ce_weight):
+        assert (expert_record is None) == (ce_weight == meta_action_ce_weight == 0.)
         optimizer.zero_grad()
         before = model.lora_A['default'].weight.detach().clone()
-        loss = (model.lora_A['default'].weight - group['draw']).square().sum()
+        target = group['draw'] + ce_weight + meta_action_ce_weight
+        loss = (model.lora_A['default'].weight - target).square().sum()
         loss.backward()
         gradient = torch.nn.utils.clip_grad_norm_([model.lora_A['default'].weight], config.max_grad_norm)
         optimizer.step()

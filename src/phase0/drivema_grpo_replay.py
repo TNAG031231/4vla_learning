@@ -16,7 +16,8 @@ MUTABLE_TRAINING_FIELDS = ('max_steps', 'evaluation_steps', 'checkpoint_interval
 
 def baseline_training_settings(training: dict) -> dict:
     return {k: v for k, v in training.items()
-            if k not in (*MUTABLE_TRAINING_FIELDS, 'objective', 'trajectory_ce_weight', 'meta_action_ce_weight')}
+            if k not in (*MUTABLE_TRAINING_FIELDS, 'objective', 'trajectory_ce_weight', 'meta_action_ce_weight',
+                         'dual_ce_first_step')}
 
 
 def low512_replay(metadata: dict) -> dict:
@@ -32,6 +33,16 @@ def low512_replay(metadata: dict) -> dict:
             or metadata['identity'] != replay_identity(replay['baseline_identity'], replay)):
         raise ValueError('expected the original Low-512 full evaluation with its repeat256 schedule')
     return replay
+
+
+def extend_low512(replay: dict) -> dict:
+    first_visits = [r for r in replay['steps'] if r['visit'] == 1]
+    if len(first_visits) != 256 or len({r['sample_token'] for r in first_visits}) != 256:
+        raise ValueError('expected 256 distinct first visits in Low-512')
+    tail = [{**r, 'optimizer_step': step, 'visit': 3} for step, r in enumerate(first_visits, 513)]
+    return {**{k: v for k, v in replay.items() if k != 'coverage'},
+            'experiment': {**replay['experiment'], 'kind': 'dual_ce_768'},
+            'steps': [{**r, 'total_visits': 3} for r in [*replay['steps'], *tail]]}
 
 
 def load_observation_replay(path: Path) -> dict:
@@ -85,7 +96,7 @@ def replay_identity(identity: dict, replay: dict) -> dict:
               'observation_sequence': replay['steps']}
     if 'experiment' in replay:
         result['experiment'] = replay['experiment']
-        if replay['experiment']['kind'] == 'coverage':
+        if replay['experiment']['kind'] in ('coverage', 'dual_ce_768'):
             result['sampling'] = 'frozen_coverage_observation_sequence; consume original randint slot'
     return result
 
