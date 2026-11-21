@@ -105,12 +105,12 @@ def test_rank_ties_constant_and_reversal():
     assert rank_relation([], [])['top_tie_averaged_regret_m'] is None
 
 
-def group_and_history(reward):
+def group_and_history(reward, first_x=1., second_x=1.1):
     candidates = []
     for index, (points, action) in enumerate([
-        ([[1., 0.]] * 6, {'longitudinal': 'keep', 'lateral': 'left'}),
-        ([[1.1, 0.]] * 6, {'longitudinal': 'stop', 'lateral': 'straight'}),
-        ([[1.1, 0.]] * 6, {'longitudinal': 'stop', 'lateral': 'straight'}),
+        ([[first_x, 0.]] * 6, {'longitudinal': 'keep', 'lateral': 'left'}),
+        ([[second_x, 0.]] * 6, {'longitudinal': 'stop', 'lateral': 'straight'}),
+        ([[second_x, 0.]] * 6, {'longitudinal': 'stop', 'lateral': 'straight'}),
         (None, None),
     ]):
         candidate = {'parsed_action': action, 'waypoints': points, 'sample_token': 'train-a',
@@ -131,13 +131,30 @@ def group_and_history(reward):
     return group, history
 
 
-def test_producer_rewards_consistency_conflict_and_coverage(reward):
-    from dataclasses import asdict
+def test_reward_shape_history_compares_rules_on_identical_valid_candidates(reward):
+    from dataclasses import replace
+    from src.phase0.drivema_grpo_train import group_metrics
+
+    group, _ = group_and_history(reward, first_x=4., second_x=5.)
+    assert 'ade_reward_ranking' not in group_metrics(group)
+    for mode in ('additive', 'multiplicative'):
+        metrics = group_metrics(group, replace(reward, composition=mode))
+        assert metrics['ade_reward_ranking'] == {
+            'non_tied_pairs': 2, 'additive_reversals': 2, 'multiplicative_reversals': 0}
+
+
+@pytest.mark.parametrize('composition', ['additive', 'multiplicative'])
+def test_producer_rewards_consistency_conflict_and_coverage(reward, composition):
+    from dataclasses import asdict, replace
+    reward = replace(reward, composition=composition)
+    metadata = asdict(reward)
+    if composition == 'additive':
+        del metadata['composition']
     g, h = group_and_history(reward)
     second, update = deepcopy(g), deepcopy(h)
     second['optimizer_step'] = update['step'] = 2
     update['effective_advantage_groups'] = [2 * x for x in h['effective_advantage_groups']]
-    result = rollout_diagnostics([g, second], [h, update], ['train-a', 'train-b'], asdict(reward))
+    result = rollout_diagnostics([g, second], [h, update], ['train-a', 'train-b'], metadata)
     assert result['unique_observations'] == 1 and result['repeated_draws'] == 1
     assert result['observation_coverage_fraction'] == .5
     assert result['invalid_trajectory_candidates'] == 2

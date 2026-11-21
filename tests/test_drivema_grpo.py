@@ -23,6 +23,8 @@ from src.phase0 import drivema_stage3a
 from src.phase0.drivema_grpo_evaluation import (
     baseline_provenance, compare_predictions, evaluate_population, load_baseline_predictions,
 )
+from src.phase0.drivema_grpo_replay import replay_identity, reward_shape_replay
+from src.phase0.drivema_grpo_schedules import coverage_schedules
 from src.phase0.phase0_4c_full_train import write_predictions
 from src.phase0.drivema_stage2_protocol import trajectory_to_meta_action
 from src.phase0.drivema_stage2b import select_subset
@@ -86,9 +88,11 @@ class ScalarAdapters(nn.Module):
 def scalar_training(monkeypatch):
     def rollout(**kwargs):
         draw = float(torch.rand(1)) + random.random() + np.random.random()
-        return {'sample_token': kwargs['sample'].sample_token, 'draw': draw,
+        sample = kwargs['sample']
+        return {'sample_token': sample.sample_token, 'scene_token': sample.scene_token, 'draw': draw,
                 'candidates': [{'rewards': {'action': draw, 'trajectory': .5, 'consistency': .25,
-                                           'turn_rewards': [draw, .625]},
+                                           'turn_rewards': [draw, .625],
+                                           'trajectory_metrics': {'prediction_valid': True, 'ade_3s_m': .5}},
                                 'turn_advantages': [1., -1.], 'assistant_spans': []}],
                 'statistics': {'zero_variance': [False, False], 'invalid_rate': [0., 0.]}}
 
@@ -123,6 +127,70 @@ def assert_nested_equal(left, right):
             assert_nested_equal(a, b)
     else:
         assert left == right
+
+
+@pytest.fixture
+def low512_control(arguments, config):
+    sample = arguments['train'][0]
+    train = [replace(sample, sample_token=f'train-{i}', scene_token=f'scene-{i % 16}') for i in range(512)]
+    arguments['train'] = train
+    for row in train:
+        arguments['records'][row.sample_token] = arguments['records'][sample.sample_token]
+    runner, rollout = arguments['runner'], arguments['rollout_config']
+    runner.compute_log_probs = False
+    monitor = select_subset(arguments['validation'], config.monitor_samples, rollout.seed, 'validation')
+    baseline = training.run_identity(config, rollout, train, monitor, runner, arguments['metadata'])
+    original = {'source_archive': 'fixture.zip', 'baseline_identity': baseline, 'steps': [
+        {'optimizer_step': i, 'sample_token': row.sample_token, 'scene_token': row.scene_token}
+        for i, row in enumerate(train[:256], 1)]}
+    low = coverage_schedules(original, train, .5, {'rationale': 'matched fixture'}, 20261116)['repeat256']
+    return {'mode': 'evaluate-full', 'step': 512, 'observation_replay': low,
+            'identity': replay_identity(baseline, low), 'population_tokens': [v.sample_token for v in arguments['validation']]}
+
+
+def test_low512_reward_shape_continuation(low512_control, config, arguments, scalar_training,
+                                          validation_predict, tmp_path):
+    low = low512_control
+    original = low['observation_replay']
+    cfg = replace(config, max_steps=512, evaluation_steps=[0, 512], checkpoint_interval=512)
+    original_metadata = arguments['metadata']
+    parent = ScalarAdapters()
+    arguments['metadata'] = {**original_metadata, 'observation_replay': original}
+    training.fit(model=parent, config=cfg, output=tmp_path / 'low', **arguments)
+    checkpoint = tmp_path / 'low/checkpoint_512'
+    state = torch.load(checkpoint / 'unified_state.pt', weights_only=True)
+    assert state['step'] == 512 and state['identity'] == low['identity']
+    assert 'composition' not in state['identity']['rollout']['reward']
+    for shape in ('additive', 'multiplicative'):
+        replay = reward_shape_replay(low, shape)
+        assert replay['steps'][:512] == original['steps']
+        assert [r['sample_token'] for r in replay['steps'][512:]] == [
+            r['sample_token'] for r in original['steps'] if r['visit'] == 1]
+        assert all(r['visit'] == r['total_visits'] == 3 for r in replay['steps'][512:])
+        arguments['metadata'] = {**original_metadata, 'observation_replay': replay}
+        rollout = arguments['rollout_config']
+        arguments['rollout_config'] = replace(rollout, reward=replace(rollout.reward, composition=shape))
+        child = deepcopy(parent)
+        kwargs = {**arguments, 'low512_identity': low['identity']}
+        cfg = replace(cfg, max_steps=513)
+        training.fit(model=child, config=cfg, output=tmp_path / shape, resume=checkpoint, **kwargs)
+        first = tmp_path / shape / 'checkpoint_513'
+        summary = training.fit(model=child, config=replace(cfg, max_steps=768), output=tmp_path / f'{shape}_again',
+                               resume=first, **kwargs)
+        assert summary['last_step'] == 768 and summary['optimizer_steps_this_run'] == 255
+        final_rollout = read_json(tmp_path / f'{shape}_again/rollout_768.json')
+        assert final_rollout['sample_token'] == replay['steps'][-1]['sample_token']
+        child_state = torch.load(first / 'unified_state.pt', weights_only=True)
+        assert child_state['identity'] == replay_identity(original['baseline_identity'], replay)
+        assert child_state['identity']['rollout']['reward']['composition'] == shape
+        first_rollout = read_json(tmp_path / shape / 'rollout_513.json')
+        assert first_rollout['sample_token'] == replay['steps'][512]['sample_token']
+    with pytest.raises(ValueError, match='identity'):
+        training.fit(model=child, config=replace(cfg, max_steps=514), output=tmp_path / 'wrong-arm',
+                     resume=tmp_path / 'additive/checkpoint_513', **kwargs)
+    with pytest.raises(ValueError, match='original Low-512'):
+        training.fit(model=child, config=cfg, output=tmp_path / 'wrong-parent', resume=checkpoint,
+                     **{**kwargs, 'low512_identity': original['baseline_identity']})
 
 
 def test_default_32_and_resume_33_match_continuous(config, arguments, validation_predict,
@@ -294,8 +362,11 @@ def test_cli_training_resume_and_both_evaluations(dual_model, controlled_rollout
     initial = tmp_path / arguments['rollout_config'].checkpoint_relative_path / 'adapter'
     dual_model.save_pretrained(initial, selected_adapters=['default'])
     unloaded = dual_model.unload()
+    local_model = tmp_path / 'local-qwen'
+    local_model.mkdir()
 
-    def load_base(*args):
+    def load_base(source, revision, dtype, attention, local_only):
+        assert source == str(local_model) and local_only
         model = Qwen3VLForConditionalGeneration(deepcopy(unloaded.config))
         model.load_state_dict(unloaded.state_dict())
         return model
@@ -310,7 +381,8 @@ def test_cli_training_resume_and_both_evaluations(dual_model, controlled_rollout
     monkeypatch.setattr(training, 'rollout_group', controlled_rollout[0])
     path = tmp_path / 'config.yaml'
     path.write_text(yaml.safe_dump(asdict(replace(config, max_steps=1, evaluation_steps=[0, 1]))))
-    common = ['--config', str(path), '--dataset-root', str(tmp_path), '--derived-root', str(tmp_path)]
+    common = ['--config', str(path), '--dataset-root', str(tmp_path), '--derived-root', str(tmp_path),
+              '--local-model-dir', str(local_model)]
     assert cli.main(common) == 0
     checkpoint = tmp_path / config.output_relative_dir / 'checkpoint_1'
     assert cli.main(common + ['--resume', str(checkpoint), '--max-steps', '2',

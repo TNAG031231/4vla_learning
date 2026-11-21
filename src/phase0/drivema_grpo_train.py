@@ -13,11 +13,13 @@ import torch
 from torch import nn
 import yaml
 
+from src.phase0.drivema_grpo_diagnostics import rank_relation
 from src.phase0.drivema_grpo_evaluation import compare_predictions, evaluate_population
 from src.phase0.drivema_grpo_replay import MUTABLE_TRAINING_FIELDS, replay_identity, validate_replay_configuration
 from src.phase0.drivema_stage2_sft import Stage2Runner
 from src.phase0.drivema_stage2b import select_subset
 from src.phase0.drivema_stage3a import RolloutConfig, load_config as load_stage3a_config, prepare_train, rollout_group
+from src.phase0.drivema_stage3_rewards import RewardConfig
 from src.phase0.drivema_stage3b import GRPOConfig, activate_policy, restore_training, save_checkpoint, update_group
 from src.phase0.phase0_4b_lora_smoke import load_temporal_records
 from src.phase0.phase0_4b_protocol import SFTSample
@@ -110,7 +112,8 @@ def isolated_rng():
 def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFTSample],
                  monitor: list[SFTSample], runner: Stage2Runner, metadata: dict) -> dict:
     identity = {'training': {k: v for k, v in asdict(config).items() if k not in MUTABLE_TRAINING_FIELDS},
-            'rollout': {k: v for k, v in asdict(rollout).items() if k not in ('train_samples', 'output_relative_dir')},
+            'rollout': {k: v for k, v in rollout.identity_fields().items()
+                        if k not in ('train_samples', 'output_relative_dir')},
             'train_tokens': [s.sample_token for s in train], 'monitor_tokens': [s.sample_token for s in monitor],
             'sampling': 'torch.randint; uniform_with_replacement; one_observation_per_optimizer_step',
             'model': metadata['model_id'], 'revision': metadata['revision'],
@@ -121,6 +124,8 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
                            'optimized': runner.optimized, 'batch_size': runner.inference_batch_size,
                            'compute_log_probs': runner.compute_log_probs}}
     replay = metadata.get('observation_replay')
+    if rollout.reward.composition != 'additive' and replay is None:
+        raise ValueError('reward-shape ablation requires the Low-512 observation schedule')
     if config.consistency_weight != rollout.reward.consistency_weight:
         raise ValueError('training and actual rollout consistency weights differ')
     if config.consistency_weight != .5 and replay is None:
@@ -156,22 +161,37 @@ def evaluate_and_save(model: nn.Module, runner: Stage2Runner, samples: list[SFTS
     return rows, metrics
 
 
-def group_metrics(group: dict) -> dict:
+def group_metrics(group: dict, reward: RewardConfig | None = None) -> dict:
     candidates = group['candidates']
     means = {key: sum(c['rewards'][key] for c in candidates) / len(candidates)
              for key in ('action', 'trajectory', 'consistency')}
-    return {'reward_means': means,
-            'total_reward_mean': sum(sum(c['rewards']['turn_rewards']) for c in candidates) / len(candidates),
-            'turn_advantages': [c['turn_advantages'] for c in candidates],
-            'group_statistics': group['statistics'],
-            'effective_advantage_group': [not zero for zero in group['statistics']['zero_variance']],
-            'generated_tokens_by_turn': [sum(len(s['token_ids']) for c in candidates for s in c['assistant_spans']
-                                             if s['turn'] == turn) for turn in (1, 2)]}
+    metrics = {
+        'reward_means': means,
+        'total_reward_mean': sum(sum(c['rewards']['turn_rewards']) for c in candidates) / len(candidates),
+        'turn_advantages': [c['turn_advantages'] for c in candidates],
+        'group_statistics': group['statistics'],
+        'effective_advantage_group': [not zero for zero in group['statistics']['zero_variance']],
+        'generated_tokens_by_turn': [sum(len(s['token_ids']) for c in candidates for s in c['assistant_spans']
+                                         if s['turn'] == turn) for turn in (1, 2)]}
+    if reward is not None:
+        valid = [c['rewards'] for c in candidates if c['rewards']['trajectory_metrics']['prediction_valid']]
+        errors = [r['trajectory_metrics']['ade_3s_m'] for r in valid]
+        pairs = {}
+        for mode in ('additive', 'multiplicative'):
+            rule = replace(reward, composition=mode)
+            scores = [rule.combine(r['trajectory'], r['consistency']) for r in valid]
+            pairs[mode] = rank_relation(scores, errors)['pairs']
+        additive = pairs['additive']
+        metrics['ade_reward_ranking'] = {
+            'non_tied_pairs': additive['concordant'] + additive['reversed'] + additive['reward_tied'],
+            'additive_reversals': additive['reversed'],
+            'multiplicative_reversals': pairs['multiplicative']['reversed']}
+    return metrics
 
 
 def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], validation: list[SFTSample],
         records: dict, rollout_config: RolloutConfig, config: TrainingConfig, output: Path,
-        metadata: dict, resume: Path | None = None) -> dict:
+        metadata: dict, resume: Path | None = None, low512_identity: dict | None = None) -> dict:
     validate_config(config)
     if not train or any(s.split != 'train' for s in train):
         raise ValueError('GRPO requires nonempty train split')
@@ -184,9 +204,18 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
                                     for row in sequence):
         raise ValueError('replay observation scene differs from current train intake')
     state = None
+    reward_shape = identity.get('experiment', {}).get('kind') == 'reward_shape'
+    if reward_shape and (resume is None or not 512 < config.max_steps <= 768):
+        raise ValueError('reward-shape training must resume Low-512 or its child through steps 513–768')
     if resume:
         state = torch.load(resume / 'unified_state.pt', map_location='cpu', weights_only=True)
-        validate_resume(state, identity, config)
+        if reward_shape and state['step'] == 512:
+            if state['identity'] != low512_identity:
+                raise ValueError('checkpoint differs from the original Low-512 identity')
+        else:
+            if reward_shape and state['step'] < 512:
+                raise ValueError('reward-shape checkpoint precedes Low-512')
+            validate_resume(state, identity, config)
     output.mkdir(parents=True, exist_ok=False)
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
@@ -196,7 +225,7 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
     torch.manual_seed(rollout_config.seed)
     random.seed(rollout_config.seed)
     np.random.seed(rollout_config.seed)
-    start = restore_training(optimizer, resume, identity) if resume else 0
+    start = restore_training(optimizer, resume, state['identity']) if resume else 0
     if state is not None:
         if start != state['step']:
             raise ValueError('checkpoint training states disagree on global step')
@@ -233,7 +262,7 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
                 raise ValueError('generated rollout differs from original observation step')
             write_json(output / f'rollout_{step}.json', group)
             update = update_group(model, runner, sample, images, group, optimizer, config)
-            update.update(group_metrics(group))
+            update.update(group_metrics(group, rollout_config.reward if reward_shape else None))
             for turn in (0, 1):
                 effective[turn] += int(update['effective_advantage_group'][turn])
             if cuda:

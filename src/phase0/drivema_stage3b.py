@@ -210,7 +210,7 @@ def fit(*, model: nn.Module, runner: Stage2Runner, samples: list[SFTSample], rec
                                   lr=config.learning_rate, weight_decay=config.weight_decay)
     identity = {'training': {k: v for k, v in asdict(config).items()
                              if k not in ('output_relative_dir', 'max_steps')},
-                'rollout': asdict(rollout_config), 'sample_tokens': [s.sample_token for s in samples],
+                'rollout': rollout_config.identity_fields(), 'sample_tokens': [s.sample_token for s in samples],
                 'model': metadata['model_id'], 'revision': metadata['revision']}
     torch.manual_seed(rollout_config.seed)
     start = restore_training(optimizer, resume, identity) if resume else 0

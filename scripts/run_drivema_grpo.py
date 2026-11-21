@@ -20,7 +20,8 @@ from src.phase0.drivema_grpo_train import (
     evaluate_and_save, fit, load_config, prepare_data, run_identity, training_rollout_config, validate_config,
 )
 from src.phase0.drivema_grpo_replay import (
-    load_observation_replay, load_observation_schedule, validate_replay_checkpoint, validate_replay_configuration,
+    load_observation_replay, load_observation_schedule, reward_shape_replay, validate_replay_checkpoint,
+    validate_replay_configuration,
 )
 from src.phase0.drivema_stage2_sft import Stage2Runner
 from src.phase0.drivema_stage2b import select_subset
@@ -41,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--mode', choices=('train', 'evaluate-monitor', 'evaluate-full'), default='train')
     parser.add_argument('--dataset-root', type=Path, default=os.environ.get('NUSCENES_ROOT'))
     parser.add_argument('--derived-root', type=Path, default=os.environ.get('VLA_DERIVED_ROOT'))
+    parser.add_argument('--local-model-dir', type=Path, default=os.environ.get('QWEN_LOCAL_DIR'),
+                        help='local snapshot of the same frozen Qwen base used by Low-512')
     parser.add_argument('--resume', type=Path, help='GRPO checkpoint; restores current/reference and training state')
     parser.add_argument('--checkpoint', type=Path, help='GRPO checkpoint for evaluation-only modes')
     parser.add_argument('--baseline-predictions', type=Path,
@@ -51,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--observation-replay-archive', type=Path, help='original Stage 3D export ZIP')
     source.add_argument('--observation-schedule', type=Path, help='frozen experiment observation schedule JSON')
+    source.add_argument('--low512-validation', type=Path, help='original Low-512 full-validation directory')
+    parser.add_argument('--reward-shape', choices=('additive', 'multiplicative'),
+                        help='Turn 2 reward for steps 513–768, with --low512-validation')
     parser.add_argument('--dry-run', action='store_true', help='validate configuration only; no data/model loading')
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -62,6 +68,18 @@ def main(argv: list[str] | None = None) -> int:
     replay = load_observation_replay(args.observation_replay_archive) if args.observation_replay_archive else None
     if args.observation_schedule:
         replay = load_observation_schedule(args.observation_schedule)
+    if (args.low512_validation is None) != (args.reward_shape is None):
+        parser.error('--low512-validation and --reward-shape must be provided together')
+    low512_identity = None
+    if args.reward_shape is not None:
+        low = json.loads((args.low512_validation / 'metadata.json').read_text())
+        replay = reward_shape_replay(low, args.reward_shape)
+        low512_identity = low['identity']
+        rollout = replace(rollout, reward=replace(rollout.reward, composition=args.reward_shape))
+        if args.mode == 'train' and (args.resume is None or config.max_steps <= 512):
+            parser.error('reward-shape training requires --resume and a cumulative budget of 513–768')
+        if args.mode == 'evaluate-full' and args.baseline_predictions is None:
+            args.baseline_predictions = args.low512_validation / 'sft_full_predictions.jsonl'
     if config.consistency_weight != .5 and replay is None:
         parser.error('consistency ablation requires --observation-replay-archive or --observation-schedule')
     if replay is not None:
@@ -91,7 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint = args.resume or args.checkpoint
     if checkpoint is not None and replay is not None:
         state = torch.load(checkpoint / 'unified_state.pt', map_location='cpu', weights_only=True)
-        validate_replay_checkpoint(state, replay, config.consistency_weight)
+        if args.reward_shape and args.resume and state['step'] == 512:
+            if state['identity'] != low512_identity:
+                raise ValueError('checkpoint differs from the original Low-512 identity')
+        else:
+            validate_replay_checkpoint(state, replay, config.consistency_weight)
+        if args.reward_shape and args.mode == 'evaluate-full' and state['step'] != 768:
+            raise ValueError('reward-shape full validation requires checkpoint step 768')
     initial = resolve_derived_path(args.derived_root, rollout.checkpoint_relative_path)
     semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
     baseline_source = None
@@ -110,8 +134,9 @@ def main(argv: list[str] | None = None) -> int:
     dtype = runtime.dtype_selector('bfloat16')
     if dtype != torch.bfloat16:
         raise ValueError('BF16-capable GPU required')
-    processor = runtime.processor_loader(FIXED_MODEL_ID, FIXED_REVISION, True)
-    base = runtime.model_loader(FIXED_MODEL_ID, FIXED_REVISION, dtype, 'sdpa', True)
+    model_source = str(args.local_model_dir.resolve(strict=True)) if args.local_model_dir else FIXED_MODEL_ID
+    processor = runtime.processor_loader(model_source, FIXED_REVISION, True)
+    base = runtime.model_loader(model_source, FIXED_REVISION, dtype, 'sdpa', True)
     model = PeftModel.from_pretrained(base, (checkpoint or initial) / 'adapter', is_trainable=True)
     reference = checkpoint / 'adapter/reference' if checkpoint else initial / 'adapter'
     model.load_adapter(reference, adapter_name='reference', is_trainable=False)
@@ -119,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     runner = Stage2Runner(processor, StructuredCollator(processor, runtime.image_loader, args.dataset_root),
                           device, semantic.generation_kwargs, rollout.trajectory_max_new_tokens,
                           optimized=True, compute_log_probs=False)
-    metadata = {'model_id': FIXED_MODEL_ID, 'revision': FIXED_REVISION,
+    metadata = {'model_id': FIXED_MODEL_ID, 'revision': FIXED_REVISION, 'model_source': model_source,
                 'initial_sft_checkpoint': rollout.checkpoint_relative_path, 'data_intake': intake,
                 'git_commit': collect_git_provenance(ROOT).commit, 'dtype': str(dtype), 'attention': 'sdpa',
                 'torch': str(torch.__version__), 'transformers': runtime.package_version('transformers'),
@@ -128,7 +153,8 @@ def main(argv: list[str] | None = None) -> int:
         metadata['observation_replay'] = replay
     if args.mode == 'train':
         fit(model=model, runner=runner, train=train, validation=validation, records=records,
-            rollout_config=rollout, config=config, output=output, metadata=metadata, resume=args.resume)
+            rollout_config=rollout, config=config, output=output, metadata=metadata, resume=args.resume,
+            low512_identity=low512_identity)
     else:
         state = torch.load(checkpoint / 'unified_state.pt', map_location='cpu', weights_only=True)
         monitor = select_subset(validation, config.monitor_samples, rollout.seed, 'validation')

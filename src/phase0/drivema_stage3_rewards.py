@@ -17,6 +17,15 @@ class RewardConfig:
     distance_scale_m: float
     consistency_weight: float
     advantage_eps: float
+    composition: str = 'additive'
+
+    def combine(self, trajectory: float, consistency: float) -> float:
+        bonus = self.consistency_weight * consistency
+        if self.composition == 'additive':
+            return trajectory + bonus
+        if self.composition == 'multiplicative':
+            return trajectory * (1 + bonus)
+        raise ValueError(f'unknown reward composition: {self.composition}')
 
 
 def candidate_rewards(candidate: dict, target: ActionTarget, waypoints: list,
@@ -49,7 +58,7 @@ def candidate_rewards(candidate: dict, target: ActionTarget, waypoints: list,
     return {'action': action_reward, 'trajectory': trajectory_reward,
             'consistency': consistency_reward, 'error_m': error, 'trajectory_rule': rule,
             'trajectory_metrics': metrics, 'trajectory_projection': projection,
-            'turn_rewards': [action_reward, trajectory_reward + config.consistency_weight * consistency_reward]}
+            'turn_rewards': [action_reward, config.combine(trajectory_reward, consistency_reward)]}
 
 
 def assign_advantages(candidates: list[dict], eps: float) -> dict:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict
 import json
 from pathlib import Path
 from zipfile import ZipFile
@@ -11,6 +11,28 @@ from src.phase0.drivema_stage3a import RolloutConfig
 
 MUTABLE_TRAINING_FIELDS = ('max_steps', 'evaluation_steps', 'checkpoint_interval',
                            'output_relative_dir', 'rollout_config', 'consistency_weight')
+
+
+def reward_shape_replay(low_metadata: dict, composition: str) -> dict:
+    if composition not in ('additive', 'multiplicative'):
+        raise ValueError('unsupported reward shape')
+    replay = low_metadata['observation_replay']
+    experiment, steps = replay['experiment'], replay['steps']
+    visits = Counter(row['sample_token'] for row in steps)
+    if (low_metadata['mode'] != 'evaluate-full' or low_metadata['step'] != 512
+            or experiment['kind'] != 'coverage' or experiment['arm'] != 'repeat256'
+            or experiment['consistency_weight'] != .5 or len(visits) != 256 or set(visits.values()) != {2}
+            or [row['optimizer_step'] for row in steps] != list(range(1, 513))
+            or low_metadata['identity'] != replay_identity(replay['baseline_identity'], replay)):
+        raise ValueError('reward-shape continuation requires the original pure GRPO Low-512 full validation')
+    first_visit = {row['sample_token']: row for row in steps if row['visit'] == 1}
+    if first_visit.keys() != visits.keys():
+        raise ValueError('expected one first visit per Low-512 observation')
+    tail = [{**row, 'optimizer_step': step, 'visit': 3, 'total_visits': 3}
+            for step, row in enumerate(first_visit.values(), 513)]
+    return {**{k: v for k, v in replay.items() if k != 'coverage'}, 'steps': [*steps, *tail],
+            'experiment': {'kind': 'reward_shape', 'arm': composition, 'consistency_weight': .5,
+                           'parent_step': 512, 'parent_experiment': experiment}}
 
 
 def load_observation_replay(path: Path) -> dict:
@@ -44,8 +66,13 @@ def load_observation_replay(path: Path) -> dict:
 def validate_replay_configuration(training: dict, rollout: RolloutConfig, replay: dict) -> None:
     identity = replay['baseline_identity']
     fixed = {k: v for k, v in training.items() if k not in MUTABLE_TRAINING_FIELDS}
-    actual = asdict(rollout)
-    actual = {k: v for k, v in actual.items() if k not in ('train_samples', 'output_relative_dir')}
+    experiment = replay.get('experiment', {})
+    composition = experiment['arm'] if experiment.get('kind') == 'reward_shape' else 'additive'
+    if rollout.reward.composition != composition:
+        raise ValueError('rollout reward shape differs from the experiment arm')
+    actual = {k: v for k, v in rollout.identity_fields().items() if k not in ('train_samples', 'output_relative_dir')}
+    if experiment.get('kind') == 'reward_shape':
+        actual['reward'].pop('composition', None)
     actual['reward']['consistency_weight'] = .5
     if fixed != identity['training'] or actual != identity['rollout']:
         raise ValueError('ablation must preserve baseline training and rollout settings except consistency weight')
@@ -57,6 +84,8 @@ def validate_replay_configuration(training: dict, rollout: RolloutConfig, replay
 
 def replay_identity(identity: dict, replay: dict) -> dict:
     baseline = deepcopy(identity)
+    if replay.get('experiment', {}).get('kind') == 'reward_shape':
+        baseline['rollout']['reward'].pop('composition', None)
     baseline['rollout']['reward']['consistency_weight'] = .5
     if baseline != replay['baseline_identity']:
         raise ValueError('replay model/data/train population/monitor/inference differs from baseline')
@@ -64,8 +93,11 @@ def replay_identity(identity: dict, replay: dict) -> dict:
               'observation_sequence': replay['steps']}
     if 'experiment' in replay:
         result['experiment'] = replay['experiment']
-        if replay['experiment']['kind'] == 'coverage':
+        if replay['experiment']['kind'] in ('coverage', 'reward_shape'):
             result['sampling'] = 'frozen_coverage_observation_sequence; consume original randint slot'
+        if replay['experiment']['kind'] == 'reward_shape':
+            result['rollout'] = {**identity['rollout'], 'reward': {
+                **identity['rollout']['reward'], 'composition': replay['experiment']['arm']}}
     return result
 
 
