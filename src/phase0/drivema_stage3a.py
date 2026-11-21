@@ -38,6 +38,12 @@ class RolloutConfig:
     top_k: int
     reward: RewardConfig
 
+    def identity_fields(self) -> dict:
+        fields = asdict(self)
+        if self.reward.composition == 'additive':
+            del fields['reward']['composition']
+        return fields
+
 
 def load_config(path: Path) -> RolloutConfig:
     values = yaml.safe_load(path.read_text())

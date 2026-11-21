@@ -14,7 +14,7 @@ import torch
 from src.phase0.drivema_grpo_evaluation import compare_predictions
 from src.phase0.drivema_grpo_bootstrap import action_behavior_bootstrap
 from src.phase0.drivema_stage2_protocol import trajectory_to_meta_action
-from src.phase0.drivema_stage3_rewards import assign_advantages
+from src.phase0.drivema_stage3_rewards import RewardConfig, assign_advantages
 from src.phase0.drivema_visual_metrics import align_predictions
 from src.phase0.phase0_4c_evaluation import prediction_metrics
 
@@ -137,6 +137,7 @@ def rank_relation(scores: list[float], errors: list[float]) -> dict:
 
 
 def rollout_diagnostics(groups: list[dict], history: list[dict], train_tokens: list[str], reward: dict) -> dict:
+    config = RewardConfig(**reward)
     tokens = Counter(g['sample_token'] for g in groups)
     rows, generated = [], Counter()
     effective = [0, 0]
@@ -150,7 +151,7 @@ def rollout_diagnostics(groups: list[dict], history: list[dict], train_tokens: l
                 or any(c['sample_token'] != group['sample_token'] for c in candidates)):
             raise ValueError('rollout/history/train population mismatch')
         derived = deepcopy(candidates)
-        statistics = assign_advantages(derived, reward['advantage_eps'])
+        statistics = assign_advantages(derived, config.advantage_eps)
         if statistics != group['statistics'] or statistics != update['group_statistics']:
             raise ValueError('saved group statistics differ from reward producer')
         if not np.allclose([c['turn_advantages'] for c in candidates],
@@ -173,10 +174,10 @@ def rollout_diagnostics(groups: list[dict], history: list[dict], train_tokens: l
             expected = 0.0
             if m['prediction_valid']:
                 error = (m['ade_3s_m'] if m['fde_3s_m'] is None else
-                         reward['ade_weight'] * m['ade_3s_m'] + reward['fde_weight'] * m['fde_3s_m'])
+                         config.ade_weight * m['ade_3s_m'] + config.fde_weight * m['fde_3s_m'])
                 if not math.isclose(error, r['error_m'], rel_tol=1e-12, abs_tol=1e-12):
                     raise ValueError('rollout weighted error mismatch')
-                expected = math.exp(-error / reward['distance_scale_m'])
+                expected = math.exp(-error / config.distance_scale_m)
             consistency = 0.0
             if m['prediction_valid'] and candidate['turn_complete'][0] and candidate['parsed_action'] is not None:
                 projection = trajectory_to_meta_action(candidate['waypoints'])
@@ -185,7 +186,7 @@ def rollout_diagnostics(groups: list[dict], history: list[dict], train_tokens: l
             if r['consistency'] != consistency:
                 raise ValueError('saved consistency differs from trajectory projection')
             if (not math.isclose(r['trajectory'], expected, rel_tol=1e-12, abs_tol=1e-12)
-                    or not math.isclose(r['turn_rewards'][1], expected + reward['consistency_weight'] * r['consistency'],
+                    or not math.isclose(r['turn_rewards'][1], config.combine(expected, consistency),
                                         rel_tol=1e-12, abs_tol=1e-12)):
                 raise ValueError('rollout reward formula mismatch')
         valid = [c['rewards'] for c in candidates if c['rewards']['trajectory_metrics']['prediction_valid']]

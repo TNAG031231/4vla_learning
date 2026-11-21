@@ -215,3 +215,51 @@ def test_resource_preflight_stops_before_process_start(suite, tmp_path, monkeypa
             '--worktree-b', str(tmp_path / 'b'), '--dataset-root', str(tmp_path), '--derived-root', str(tmp_path),
             '--run-relative-dir', 'run'])
     assert not (tmp_path / 'run').exists()
+
+
+def test_reward_shape_launcher_runs_two_matched_workers_before_evaluation(tmp_path, monkeypatch):
+    from scripts import run_drivema_reward_shape as launcher
+
+    low = tmp_path / 'worker_a_full_validation'
+    low.mkdir()
+    for name in ('metadata.json', 'sft_full_predictions.jsonl', 'evaluate-full_512_predictions.jsonl'):
+        (low / name).touch()
+    parent = tmp_path / 'worker_a_continuation/checkpoint_512'
+    (parent / 'adapter/reference').mkdir(parents=True)
+    for directory in (parent / 'adapter', parent / 'adapter/reference'):
+        (directory / 'adapter_config.json').touch()
+        (directory / 'adapter_model.safetensors').touch()
+    for name in ('unified_state.pt', 'training_state.pt'):
+        (parent / name).touch()
+    stages = []
+
+    def launch(commands, worktrees, environment, directory):
+        stages.append(directory.name)
+        assert environment['HF_HUB_OFFLINE'] == environment['TRANSFORMERS_OFFLINE'] == '1'
+        assert set(commands) == {'additive', 'multiplicative'}
+        for arm, command in commands.items():
+            def option(flag):
+                return command[command.index(flag) + 1]
+
+            assert option('--reward-shape') == arm
+            assert option('--low512-validation') == str(low)
+            assert option('--local-model-dir') == str(tmp_path)
+            assert option('--mode') == directory.name
+            if directory.name == 'train':
+                assert option('--resume') == str(parent)
+                assert option('--output-relative-dir') == f'run/{arm}'
+            else:
+                assert option('--checkpoint') == str(tmp_path / 'run' / arm / 'checkpoint_768')
+                assert option('--baseline-predictions') == str(low / 'sft_full_predictions.jsonl')
+                assert option('--output-relative-dir') == f'run/{arm}_full'
+
+    reports = []
+    monkeypatch.setattr(launcher, 'run_concurrent', launch)
+    monkeypatch.setattr(launcher, 'report', lambda args: reports.append(args) or 0)
+    args = ['--dataset-root', str(tmp_path), '--derived-root', str(tmp_path), '--local-model-dir', str(tmp_path),
+            '--low512-validation', str(low), '--run-relative-dir', 'run']
+    assert launcher.main(args) == 0
+    assert stages == ['train', 'evaluate-full']
+    assert reports == [['--low512-validation', str(low), '--run-root', str(tmp_path / 'run')]]
+    with pytest.raises(FileExistsError):
+        launcher.main(args)

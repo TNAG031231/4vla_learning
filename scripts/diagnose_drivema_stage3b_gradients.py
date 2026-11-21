@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     config = GRPOConfig(**source['config'])
     rollout = load_rollout_config(ROOT / config.rollout_config)
     if (source['model_id'] != FIXED_MODEL_ID or source['revision'] != FIXED_REVISION
-            or source['resume'] is not None or source['identity']['rollout'] != asdict(rollout)
+            or source['resume'] is not None or source['identity']['rollout'] != rollout.identity_fields()
             or group['optimizer_step'] != 1 or group['split'] != 'train'
             or group['sample_token'] not in source['identity']['sample_tokens']):
         raise ValueError('requires original SFT Step 1 rollout with matching model/rollout metadata')

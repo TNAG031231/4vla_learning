@@ -32,6 +32,14 @@ def reward_candidate(action, points):
     return {'parsed_action': action, 'waypoints': points, 'turn_complete': [True, points is not None]}
 
 
+def test_rollout_identity_preserves_frozen_reward_contract(config):
+    historical = yaml.safe_load((ROOT / 'configs/drivema_stage3a.yaml').read_text())
+    assert config.identity_fields() == historical
+    config = replace(config, reward=replace(config.reward, composition='multiplicative'))
+    historical['reward']['composition'] = 'multiplicative'
+    assert config.identity_fields() == historical
+
+
 @pytest.mark.parametrize('action,expected', [
     ({'longitudinal': 'keep', 'lateral': 'straight'}, 1.),
     ({'longitudinal': 'stop', 'lateral': 'straight'}, .5),
@@ -51,13 +59,15 @@ def test_rewards_correct_partial_wrong_invalid(config, action, expected):
     assert result['trajectory'] == result['consistency'] == 0
 
 
-def test_partial_gt_and_missing_endpoint(config):
+@pytest.mark.parametrize('composition', ['additive', 'multiplicative'])
+def test_partial_gt_and_missing_endpoint(config, composition):
     points = [[float(i), 0.] for i in range(1, 7)]
     predicted = [[x + 1, y] for x, y in points]
     predicted[-1][0] += 50
     c = reward_candidate({'longitudinal': 'stop', 'lateral': 'straight'}, predicted)
+    reward = replace(config.reward, composition=composition)
     result = candidate_rewards(c, ActionTarget(None, 'straight', False, True), points,
-                               [True] * 5 + [False], config.reward)
+                               [True] * 5 + [False], reward)
     assert result['action'] == 1
     assert result['trajectory'] == pytest.approx(math.exp(-1))
     assert result['trajectory_metrics']['fde_3s_m'] is None
@@ -70,6 +80,23 @@ def test_partial_gt_and_missing_endpoint(config):
     c['turn_complete'][0] = False
     assert candidate_rewards(c, ActionTarget('stop', None, True, False), points, [True] * 6,
                              config.reward)['action'] == 0
+
+
+def test_multiplicative_bonus_preserves_distance_signal_at_large_errors(config):
+    points = [[float(i), 0.] for i in range(1, 7)]
+    gt_points = [[x + 4, y] for x, y in points]
+    target = ActionTarget('keep', 'straight', True, True)
+    candidates = [reward_candidate({'longitudinal': 'stop', 'lateral': 'left'}, points),
+                  reward_candidate({'longitudinal': 'stop', 'lateral': 'straight'}, [[0., 0.]] * 6),
+                  reward_candidate(None, None)]
+    additive, multiplicative = [
+        [candidate_rewards(c, target, gt_points, [True] * 6, reward) for c in candidates]
+        for reward in (config.reward, replace(config.reward, composition='multiplicative'))]
+    assert [r['consistency'] for r in additive] == [0., 1., 0.]
+    assert [r['turn_rewards'][0] for r in multiplicative] == [0., .5, 0.]
+    assert additive[1]['turn_rewards'][1] > additive[0]['turn_rewards'][1]
+    assert [r['turn_rewards'][1] for r in multiplicative] == pytest.approx(
+        [math.exp(-4), 1.5 * math.exp(-8.25), 0.])
 
 
 def test_independent_advantages_zero_variance_and_missing_turn(config):
