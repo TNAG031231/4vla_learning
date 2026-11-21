@@ -80,12 +80,12 @@ class Stage2Runner:
         return [item["image"] for item in messages[0]["content"] if item["type"] == "image"]
 
     def training_batch(self, sample: SFTSample, record: dict, *,
-                       images: list | None = None) -> tuple[dict, list[AssistantSpan]]:
+                       images: list | None = None, action_only: bool = False) -> tuple[dict, list[AssistantSpan]]:
         if sample.split != "train" or record["split"] != "train":
             raise ValueError("SFT updates only permit train samples")
         inputs, spans = encode_teacher_forcing(
             self.processor, sample.observation, self.images(sample) if images is None else images,
-            sample.target.training_text(), record["future_waypoints"],
+            sample.target.training_text(), None if action_only else record["future_waypoints"],
         )
         return _move_batch(inputs, self.device), spans
 

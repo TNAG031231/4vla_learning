@@ -26,7 +26,7 @@ from src.phase0.phase0_4c_tiny_overfit import write_json
 from src.phase0.qwen3vl_dataset_adapter import load_config as load_ego_config, resolve_derived_path, sha256_file
 
 
-OBJECTIVE_CE_WEIGHTS = {'grpo': 0., 'grpo_ce': .1, 'ce_only': 1.}
+OBJECTIVE_CE_WEIGHTS = {'grpo': 0., 'grpo_ce': .1, 'ce_only': 1., 'grpo_meta_ce': .1, 'meta_ce_only': 1.}
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,7 @@ class TrainingConfig(GRPOConfig):
     consistency_weight: float = .5
     objective: str = 'grpo'
     trajectory_ce_weight: float = 0.
+    meta_action_ce_weight: float = 0.
 
 
 def load_config(path: Path) -> TrainingConfig:
@@ -47,9 +48,10 @@ def load_config(path: Path) -> TrainingConfig:
 
 
 def validate_config(config: TrainingConfig) -> None:
-    if (config.objective not in OBJECTIVE_CE_WEIGHTS
-            or config.trajectory_ce_weight != OBJECTIVE_CE_WEIGHTS[config.objective]):
-        raise ValueError('objective and trajectory CE weight must match the frozen experiment arm')
+    weight = OBJECTIVE_CE_WEIGHTS.get(config.objective)
+    expected = (0., weight) if config.objective in ('grpo_meta_ce', 'meta_ce_only') else (weight, 0.)
+    if weight is None or (config.trajectory_ce_weight, config.meta_action_ce_weight) != expected:
+        raise ValueError('objective and CE weights must match the frozen experiment arm')
     if type(config.consistency_weight) not in (int, float) or config.consistency_weight not in (0., .25, .5):
         raise ValueError('GRPO consistency weight supports only 0, 0.25 and the frozen 0.5 baseline')
     for name in ('max_steps', 'monitor_samples', 'checkpoint_interval'):
@@ -130,7 +132,7 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
                            'compute_log_probs': runner.compute_log_probs}}
     replay = metadata.get('observation_replay')
     if config.objective != 'grpo' and (replay is None or replay.get('experiment', {}).get('arm') != 'repeat256'):
-        raise ValueError('trajectory CE requires the Low-512 observation sequence')
+        raise ValueError('CE requires the Low-512 observation sequence')
     if config.consistency_weight != rollout.reward.consistency_weight:
         raise ValueError('training and actual rollout consistency weights differ')
     if config.consistency_weight != .5 and replay is None:
@@ -138,7 +140,10 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
     if replay is not None:
         validate_replay_configuration(asdict(config), rollout, replay)
         identity = replay_identity(identity, replay)
-        if config.objective != 'grpo':
+        if config.meta_action_ce_weight:
+            identity['meta_action_supervision'] = {
+                'objective': config.objective, 'weight': config.meta_action_ce_weight}
+        elif config.trajectory_ce_weight:
             identity['trajectory_supervision'] = {'objective': config.objective, 'weight': config.trajectory_ce_weight}
     return identity
 
@@ -198,8 +203,10 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
     if config.objective != 'grpo':
         for token in dict.fromkeys(row['sample_token'] for row in sequence):
             target = by_token[token].target
-            if not (target.longitudinal_valid and target.lateral_valid and all(records[token]['trajectory_valid_mask'])):
-                raise ValueError(f'trajectory CE requires a valid expert action and six valid waypoints: {token}')
+            if not (target.longitudinal_valid and target.lateral_valid):
+                raise ValueError(f'CE requires a valid expert joint action: {token}')
+            if config.trajectory_ce_weight and not all(records[token]['trajectory_valid_mask']):
+                raise ValueError(f'trajectory CE requires six valid waypoints: {token}')
     state = None
     if resume:
         state = torch.load(resume / 'unified_state.pt', map_location='cpu', weights_only=True)
@@ -233,6 +240,7 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
                                         'reference': 'frozen Stage 2B SFT; saved adapter/reference',
                                         'full_validation': 'separate explicit evaluation command'})
     cuda = torch.device(runner.device).type == 'cuda'
+    update_seconds = 0.
     with (output / 'training_history.jsonl').open('x') as history:
         for step in range(start + 1, config.max_steps + 1):
             started = time.perf_counter()
@@ -244,7 +252,7 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
             activate_policy(model, 'default')
             record = records[sample.sample_token]
             group = None
-            if config.objective != 'ce_only':
+            if config.objective not in ('ce_only', 'meta_ce_only'):
                 group = rollout_group(model=model, processor=runner.processor, sample=sample, images=images,
                                       record=record, config=rollout_config, device=runner.device)
                 group['optimizer_step'] = step
@@ -254,7 +262,8 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
                 write_json(output / f'rollout_{step}.json', group)
             update = update_group(model, runner, sample, images, group, optimizer, config,
                                   expert_record=record if config.objective != 'grpo' else None,
-                                  ce_weight=config.trajectory_ce_weight)
+                                  ce_weight=config.trajectory_ce_weight or config.meta_action_ce_weight,
+                                  action_only=bool(config.meta_action_ce_weight))
             if group is not None:
                 update.update(group_metrics(group))
                 for turn in (0, 1):
@@ -263,8 +272,11 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
                               effective_advantage_group_rate=[count / step for count in effective])
             if cuda:
                 torch.cuda.synchronize()
+            elapsed = time.perf_counter() - started
+            update_seconds += elapsed
             update.update(step=step, sample_token=sample.sample_token, scene_token=sample.scene_token,
-                          elapsed_seconds=time.perf_counter() - started,
+                          elapsed_seconds=elapsed, optimizer_remaining_seconds=(
+                              update_seconds / (step - start) * (config.max_steps - step)),
                           peak_allocated_bytes=torch.cuda.max_memory_allocated() if cuda else None)
             write_json(output / f'update_{step}.json', update)
             compact = {k: v for k, v in update.items() if k != 'candidates'}

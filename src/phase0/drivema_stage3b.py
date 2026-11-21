@@ -169,20 +169,22 @@ def backward_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, im
 
 def update_group(model: nn.Module, runner: Stage2Runner, sample: SFTSample, images: list, group: dict | None,
                  optimizer: torch.optim.Optimizer, config: GRPOConfig, *,
-                 expert_record: dict | None = None, ce_weight: float = 1.) -> dict:
+                 expert_record: dict | None = None, ce_weight: float = 1., action_only: bool = False) -> dict:
     activate_policy(model, 'default', backward=True)
     parameters = [p for p in model.parameters() if p.requires_grad]
     before = [p.detach().float().cpu().clone() for p in parameters]
     optimizer.zero_grad(set_to_none=True)
     metrics = backward_group(model, runner, sample, images, group, config) if group is not None else {'loss': 0.}
     if expert_record is not None:
-        inputs, spans = runner.training_batch(sample, expert_record, images=images)
-        (log_probs,) = assistant_log_probs(model, inputs, [spans[1]])
-        trajectory_ce = -log_probs.mean()
-        (ce_weight * trajectory_ce).backward()
-        metrics.update(trajectory_ce=float(trajectory_ce.detach()), trajectory_tokens=log_probs.numel(),
-                       trajectory_ce_weight=ce_weight)
-        metrics['loss'] += ce_weight * metrics['trajectory_ce']
+        inputs, spans = runner.training_batch(sample, expert_record, images=images, action_only=action_only)
+        (log_probs,) = assistant_log_probs(model, inputs, [spans[-1]])
+        ce = -log_probs.mean()
+        (ce_weight * ce).backward()
+        target = 'meta_action' if action_only else 'trajectory'
+        metrics[f'{target}_ce'] = float(ce.detach())
+        metrics[f'{target}_tokens'] = log_probs.numel()
+        metrics[f'{target}_ce_weight'] = ce_weight
+        metrics['loss'] += ce_weight * metrics[f'{target}_ce']
     norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm, error_if_nonfinite=True)
     optimizer.step()
     delta = sum((p.detach().float().cpu() - previous).square().sum().item()

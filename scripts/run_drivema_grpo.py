@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--mode', choices=('train', 'evaluate-monitor', 'evaluate-full'), default='train')
     parser.add_argument('--dataset-root', type=Path, default=os.environ.get('NUSCENES_ROOT'))
     parser.add_argument('--derived-root', type=Path, default=os.environ.get('VLA_DERIVED_ROOT'))
+    parser.add_argument('--local-model-dir', type=Path, help='local copy of the frozen Stage 2B base model revision')
     parser.add_argument('--resume', type=Path, help='GRPO checkpoint; restores current/reference and training state')
     parser.add_argument('--checkpoint', type=Path, help='GRPO checkpoint for evaluation-only modes')
     parser.add_argument('--baseline-predictions', type=Path,
@@ -65,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.observation_schedule:
         replay = load_observation_schedule(args.observation_schedule)
     if (config.objective != 'grpo') != (args.low512_validation is not None):
-        parser.error('both trajectory CE arms require --low512-validation')
+        parser.error('--low512-validation is required for the matched CE arms and applies only to them')
     if args.low512_validation is not None:
         replay = low512_replay(json.loads((args.low512_validation / 'metadata.json').read_text()))
     if config.consistency_weight != .5 and replay is None:
@@ -120,8 +121,11 @@ def main(argv: list[str] | None = None) -> int:
     dtype = runtime.dtype_selector('bfloat16')
     if dtype != torch.bfloat16:
         raise ValueError('BF16-capable GPU required')
-    processor = runtime.processor_loader(FIXED_MODEL_ID, FIXED_REVISION, True)
-    base = runtime.model_loader(FIXED_MODEL_ID, FIXED_REVISION, dtype, 'sdpa', True)
+    model_source = FIXED_MODEL_ID
+    if args.local_model_dir is not None:
+        model_source = str(args.local_model_dir.resolve(strict=True))
+    processor = runtime.processor_loader(model_source, FIXED_REVISION, True)
+    base = runtime.model_loader(model_source, FIXED_REVISION, dtype, 'sdpa', True)
     model = PeftModel.from_pretrained(base, (checkpoint or initial) / 'adapter', is_trainable=True)
     reference = checkpoint / 'adapter/reference' if checkpoint else initial / 'adapter'
     model.load_adapter(reference, adapter_name='reference', is_trainable=False)
@@ -129,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     runner = Stage2Runner(processor, StructuredCollator(processor, runtime.image_loader, args.dataset_root),
                           device, semantic.generation_kwargs, rollout.trajectory_max_new_tokens,
                           optimized=True, compute_log_probs=False)
-    metadata = {'model_id': FIXED_MODEL_ID, 'revision': FIXED_REVISION,
+    metadata = {'model_id': FIXED_MODEL_ID, 'revision': FIXED_REVISION, 'model_source': model_source,
                 'initial_sft_checkpoint': rollout.checkpoint_relative_path, 'data_intake': intake,
                 'git_commit': collect_git_provenance(ROOT).commit, 'dtype': str(dtype), 'attention': 'sdpa',
                 'torch': str(torch.__version__), 'transformers': runtime.package_version('transformers'),
