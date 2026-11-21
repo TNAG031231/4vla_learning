@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts import run_drivema_grpo as cli
 from scripts import report_drivema_low512_ce as report_cli
+from scripts import run_drivema_low512_meta as meta_cli
 from src.phase0 import drivema_grpo_train as training
 from src.phase0.drivema_grpo_replay import low512_replay, replay_identity
 from src.phase0.drivema_grpo_schedules import coverage_schedules
@@ -51,11 +52,11 @@ def low_control(arguments, config, tmp_path):
     return directory
 
 
-@pytest.mark.parametrize('arm', ['grpo_ce', 'ce_only'])
+@pytest.mark.parametrize('arm', ['grpo_ce', 'ce_only', 'grpo_meta_ce', 'meta_ce_only'])
 def test_low_schedule_updates_and_resume(arm, low_control, arguments, config, validation_predict,
                                          dual_model, controlled_rollout, monkeypatch, tmp_path):
     selected = training.load_config(ROOT / f'configs/drivema_low512_{arm}.yaml')
-    assert selected.max_steps == 512 and 256 in selected.evaluation_steps
+    assert selected.max_steps == 512 and selected.checkpoint_interval == 256
     cfg = replace(selected, max_steps=3, monitor_samples=config.monitor_samples, evaluation_steps=[0, 1, 3])
     monkeypatch.setattr(training, 'rollout_group', controlled_rollout[0])
     other = deepcopy(dual_model)
@@ -66,19 +67,23 @@ def test_low_schedule_updates_and_resume(arm, low_control, arguments, config, va
     assert_nested_equal(dual_model.state_dict(), other.state_dict())
     rows = [json.loads(line) for line in (tmp_path / 'single/training_history.jsonl').read_text().splitlines()]
     assert [r['sample_token'] for r in rows] == ['train-0', 'train-0', 'train-1']
+    target = 'meta_action' if selected.meta_action_ce_weight else 'trajectory'
+    ce = f'{target}_ce'
     for row in rows:
-        assert row['trajectory_ce'] > 0 and row['trajectory_tokens'] > 0 and row['lora_parameter_delta_l2'] > 0
-        assert row['trajectory_ce_weight'] == selected.trajectory_ce_weight
-    if arm == 'ce_only':
+        assert row[ce] > 0 and row[f'{target}_tokens'] > 0 and row['lora_parameter_delta_l2'] > 0
+        assert row[f'{ce}_weight'] == getattr(selected, f'{ce}_weight')
+    if arm in ('ce_only', 'meta_ce_only'):
         assert not controlled_rollout[1]
-        assert all(r['loss'] == r['trajectory_ce'] and 'kl' not in r for r in rows)
+        assert all(r['loss'] == r[ce] and 'kl' not in r for r in rows)
         assert not list((tmp_path / 'single').glob('rollout_*.json'))
     else:
         assert len(controlled_rollout[1]) == 6
-        assert all(r['loss'] == pytest.approx(r['policy_loss'] + cfg.beta * r['kl'] + .1 * r['trajectory_ce'])
+        assert all(r['loss'] == pytest.approx(r['policy_loss'] + cfg.beta * r['kl'] + .1 * r[ce])
                    for r in rows)
-    cross = replace(cfg, objective='ce_only' if arm == 'grpo_ce' else 'grpo_ce',
-                    trajectory_ce_weight=1. if arm == 'grpo_ce' else .1)
+    cross_arm = {'grpo_ce': 'grpo_meta_ce', 'grpo_meta_ce': 'grpo_ce',
+                 'ce_only': 'meta_ce_only', 'meta_ce_only': 'ce_only'}[arm]
+    cross = replace(training.load_config(ROOT / f'configs/drivema_low512_{cross_arm}.yaml'),
+                    max_steps=3, monitor_samples=cfg.monitor_samples, evaluation_steps=cfg.evaluation_steps)
     with pytest.raises(ValueError, match='identity'):
         training.fit(model=other, config=cross, output=tmp_path / 'cross', resume=checkpoint, **arguments)
 
@@ -98,33 +103,94 @@ def test_low512_source_and_supervision_intake(low_control, arguments, config, du
     assert not (tmp_path / 'bad').exists()
 
 
-def test_final_report_pairs_all_three_metrics(low_control, tmp_path):
+def test_meta_ce_requires_valid_joint_action_and_zero_trajectory_weight(low_control, arguments, config, dual_model,
+                                                                       tmp_path):
+    cfg = training.load_config(ROOT / 'configs/drivema_low512_meta_ce_only.yaml')
+    with pytest.raises(ValueError, match='CE weights'):
+        training.validate_config(replace(cfg, trajectory_ce_weight=.1))
+    sample = arguments['train'][0]
+    arguments['train'][0] = replace(sample, target=replace(sample.target, longitudinal=None, longitudinal_valid=False))
+    with pytest.raises(ValueError, match='valid expert joint action: train-0'):
+        training.fit(model=dual_model, config=replace(cfg, monitor_samples=config.monitor_samples),
+                     output=tmp_path / 'invalid', **arguments)
+
+
+@pytest.mark.parametrize('target,mixed,pure', [('trajectory', 'grpo_ce', 'ce_only'),
+                                              ('meta_action', 'grpo_meta_ce', 'meta_ce_only')])
+def test_final_report_pairs_all_three_metrics(target, mixed, pure, low_control, tmp_path):
     control = json.loads((low_control / 'metadata.json').read_text())
     control['population_tokens'] = [f'v{i}' for i in range(3594)]
     (low_control / 'metadata.json').write_text(json.dumps(control))
-    for name, error, weight in [('low512', 1., 0.), ('grpo_ce', .5, .1), ('ce_only', .75, 1.)]:
+    for name, error, weight in [('low512', 1., 0.), (mixed, .5, .1), (pure, .75, 1.)]:
         directory = tmp_path / name
         if weight:
             directory.mkdir()
-            identity = {**control['identity'], 'trajectory_supervision': {'objective': name, 'weight': weight}}
+            identity = {**control['identity'], f'{target}_supervision': {'objective': name, 'weight': weight}}
             (directory / 'metadata.json').write_text(json.dumps({**control, 'identity': identity}))
         template = prediction('v', 's', error)
         rows = [{**template, 'sample_token': token, 'scene_token': f's{i % 140}'}
                 for i, token in enumerate(control['population_tokens'])]
-        if name == 'grpo_ce':
+        if name == mixed:
             rows[0]['parsed_action'] = None
         write_predictions(directory / 'evaluate-full_512_predictions.jsonl', rows)
     output = tmp_path / 'comparison.json'
-    assert report_cli.main(['--low512', str(low_control), '--grpo-ce', str(tmp_path / 'grpo_ce'),
-                            '--ce-only', str(tmp_path / 'ce_only'), '--bootstrap-repetitions', '8',
+    assert report_cli.main(['--low512', str(low_control), '--target', target, '--grpo-ce', str(tmp_path / mixed),
+                            '--ce-only', str(tmp_path / pure), '--bootstrap-repetitions', '8',
                             '--output', str(output)]) == 0
     result = json.loads(output.read_text())
-    assert result['primary']['ce_only'] == {'ade_3s_m': .75, 'fde_3s_m': .75, 'joint_accuracy': 1.}
-    paired = result['paired']['grpo_ce_minus_low512']
+    assert result['primary'][pure] == {'ade_3s_m': .75, 'fde_3s_m': .75, 'joint_accuracy': 1.}
+    if target == 'meta_action':
+        assert result['longitudinal_errors'][mixed]['gt_stop_not_predicted_stop'] == 1
+        assert result['longitudinal_errors'][mixed]['gt_stop_error_mean_fde_3s_m'] == .5
+    paired = result['paired'][f'{mixed}_minus_low512']
     for key in ('ade_3s_m', 'fde_3s_m'):
         assert paired[key]['mean_delta_m'] == -.5
         assert paired[key]['cluster_bootstrap_95ci']['mean_delta_m'] == [-.5, -.5]
     assert paired['joint_accuracy_delta'] == pytest.approx(-1 / 3594)
     assert paired['joint_accuracy_bootstrap']['defined_replicates'] == 8
     with pytest.raises(ValueError, match='matched final checkpoint'):
-        report_cli.compare_arms(low_control, tmp_path / 'ce_only', tmp_path / 'grpo_ce', 8)
+        report_cli.compare_arms(low_control, tmp_path / pure, tmp_path / mixed, 8, target=target)
+
+
+@pytest.mark.parametrize('failed_training', [False, True])
+def test_meta_parallel_pipeline(failed_training, low_control, tmp_path, monkeypatch):
+    for name in ('sft_full_predictions.jsonl', 'evaluate-full_512_predictions.jsonl'):
+        write_predictions(low_control / name, [])
+    calls = []
+    reports = []
+    monkeypatch.setattr(meta_cli, 'report', lambda args: reports.append(args) or 0)
+
+    def launch(commands, worktrees, environment, directory):
+        calls.append(directory.name)
+        assert set(commands) == {'grpo_meta_ce', 'meta_ce_only'}
+        assert environment['HF_HUB_OFFLINE'] == environment['TRANSFORMERS_OFFLINE'] == '1'
+        for arm, command in commands.items():
+            def option(key):
+                return command[command.index(key) + 1]
+
+            assert Path(option('--config')).name == f'drivema_low512_{arm}.yaml'
+            assert option('--low512-validation') == str(low_control)
+            assert option('--local-model-dir') == str(tmp_path)
+            assert option('--mode') == directory.name
+            if directory.name == 'train':
+                assert option('--output-relative-dir') == f'run/{arm}' and '--checkpoint' not in command
+            else:
+                assert option('--output-relative-dir') == f'run/{arm}_full'
+                assert Path(option('--checkpoint')) == tmp_path / 'run' / arm / 'checkpoint_512'
+        if failed_training:
+            raise RuntimeError('worker failed')
+
+    monkeypatch.setattr(meta_cli, 'run_concurrent', launch)
+    args = ['--derived-root', str(tmp_path), '--dataset-root', str(tmp_path), '--run-relative-dir', 'run',
+            '--low512-validation', str(low_control), '--local-model-dir', str(tmp_path)]
+    if failed_training:
+        with pytest.raises(RuntimeError, match='worker failed'):
+            meta_cli.main(args)
+        assert calls == ['train'] and not reports
+    else:
+        assert meta_cli.main(args) == 0
+        assert calls == ['train', 'evaluate-full']
+        assert reports == [['--low512', str(low_control), '--target', 'meta_action',
+                            '--grpo-ce', str(tmp_path / 'run/grpo_meta_ce_full'),
+                            '--ce-only', str(tmp_path / 'run/meta_ce_only_full'),
+                            '--output', str(tmp_path / 'run/comparison.json')]]

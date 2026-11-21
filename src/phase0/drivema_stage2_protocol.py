@@ -81,20 +81,22 @@ class AssistantSpan:
 
 def encode_teacher_forcing(processor: object, observation: Observation,
                            images: Sequence[object], action_text: str,
-                           waypoints: Sequence[Sequence[float]]) -> tuple[dict, list[AssistantSpan]]:
+                           waypoints: Sequence[Sequence[float]] | None) -> tuple[dict, list[AssistantSpan]]:
     if parse_action(action_text) is None:
         raise ValueError("teacher forcing requires a valid joint action")
     first = inference_messages(observation, images)
-    second = second_turn_messages(first, action_text)
-    text = serialize_trajectory(waypoints)
-    full = second + [{"role": "assistant", "content": [{"type": "text", "text": text}]}]
+    turns = [(first, action_text)]
+    if waypoints is not None:
+        turns.append((second_turn_messages(first, action_text), serialize_trajectory(waypoints)))
+    messages, response = turns[-1]
+    full = messages + [{"role": "assistant", "content": [{"type": "text", "text": response}]}]
     inputs = processor.apply_chat_template(
         full, tokenize=True, add_generation_prompt=False, return_dict=True, return_tensors="pt",
     )
     validate_processor_inputs(inputs, expected_batch_size=1, expected_image_count=len(images))
     spans = []
     ids = inputs["input_ids"][0].tolist()
-    for turn, messages, response in ((1, first, action_text), (2, second, text)):
+    for turn, (messages, response) in enumerate(turns, start=1):
         prefix = processor.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",
         )["input_ids"][0].tolist()

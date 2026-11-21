@@ -116,9 +116,9 @@ def controlled_rollout(monkeypatch, processor):
     return produce, calls
 
 
-@pytest.mark.parametrize('ce_weight', [0., .1])
+@pytest.mark.parametrize('ce_weight,action_only', [(0., False), (.1, False), (.1, True)])
 def test_accumulation_matches_joint_backward_and_freezes_reference(dual_model, controlled_rollout,
-                                                                  runner, samples, records, ce_weight):
+                                                                  runner, samples, records, ce_weight, action_only):
     model = dual_model
     config = training.load_config(ROOT / 'configs/drivema_stage3b_smoke.yaml')
     config = replace(config, learning_rate=1e-3, max_grad_norm=100.)
@@ -142,7 +142,15 @@ def test_accumulation_matches_joint_backward_and_freezes_reference(dual_model, c
     if ce_weight:
         inputs, spans = runner.training_batch(sample, records['train'][0])
         labels = inputs['labels'].clone()
-        labels[:, :spans[1].start] = -100
+        if action_only:
+            labels[:, spans[0].end:] = -100
+            cropped, (action_span,) = runner.training_batch(sample, {'split': 'train'}, action_only=True)
+            assert action_span == spans[0]
+            assert cropped['input_ids'].size(1) < spans[1].start
+            torch.testing.assert_close(cropped['input_ids'][:, :action_span.end], inputs['input_ids'][:, :action_span.end])
+            assert cropped['input_ids'][0, action_span.end - 1] == runner.processor.tokenizer.eos_token_id
+        else:
+            labels[:, :spans[1].start] = -100
         ce = model(**{**inputs, 'labels': labels}, use_cache=False).loss
         objective = objective + ce_weight * ce
     objective.backward()
@@ -150,7 +158,8 @@ def test_accumulation_matches_joint_backward_and_freezes_reference(dual_model, c
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
     result = training.update_group(model, runner, sample, images, group, optimizer, config,
-                                   expert_record=records['train'][0] if ce_weight else None, ce_weight=ce_weight)
+                                   expert_record=records['train'][0] if ce_weight else None,
+                                   ce_weight=ce_weight, action_only=action_only)
     assert result['loss'] == pytest.approx(float(objective.detach()), abs=1e-6)
     for name, p in model.named_parameters():
         if name in expected:

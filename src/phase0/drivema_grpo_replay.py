@@ -16,7 +16,7 @@ MUTABLE_TRAINING_FIELDS = ('max_steps', 'evaluation_steps', 'checkpoint_interval
 
 def baseline_training_settings(training: dict) -> dict:
     return {k: v for k, v in training.items()
-            if k not in (*MUTABLE_TRAINING_FIELDS, 'objective', 'trajectory_ce_weight')}
+            if k not in (*MUTABLE_TRAINING_FIELDS, 'objective', 'trajectory_ce_weight', 'meta_action_ce_weight')}
 
 
 def low512_replay(metadata: dict) -> dict:
