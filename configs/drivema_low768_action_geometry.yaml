@@ -1,0 +1,5 @@
+training_config: configs/drivema_low768_reward_shape.yaml
+action_geometry_weight: 1.38
+low512_validation: drivema/parallel_coverage_run01/worker_a_full_validation
+control_root: drivema/low768_reward_shape_run01
+output_relative_dir: drivema/low768_action_geometry_run01

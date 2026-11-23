@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -13,9 +14,13 @@ MUTABLE_TRAINING_FIELDS = ('max_steps', 'evaluation_steps', 'checkpoint_interval
                            'output_relative_dir', 'rollout_config', 'consistency_weight')
 
 
-def reward_shape_replay(low_metadata: dict, composition: str) -> dict:
+def reward_shape_replay(low_metadata: dict, composition: str, *, action_geometry_weight: float = 0.) -> dict:
     if composition not in ('additive', 'multiplicative'):
         raise ValueError('unsupported reward shape')
+    if not math.isfinite(action_geometry_weight) or action_geometry_weight < 0:
+        raise ValueError('action geometry weight must be finite and nonnegative')
+    if action_geometry_weight and composition != 'additive':
+        raise ValueError('action geometry feedback requires the additive arm')
     replay = low_metadata['observation_replay']
     experiment, steps = replay['experiment'], replay['steps']
     visits = Counter(row['sample_token'] for row in steps)
@@ -30,9 +35,11 @@ def reward_shape_replay(low_metadata: dict, composition: str) -> dict:
         raise ValueError('expected one first visit per Low-512 observation')
     tail = [{**row, 'optimizer_step': step, 'visit': 3, 'total_visits': 3}
             for step, row in enumerate(first_visit.values(), 513)]
-    return {**{k: v for k, v in replay.items() if k != 'coverage'}, 'steps': [*steps, *tail],
-            'experiment': {'kind': 'reward_shape', 'arm': composition, 'consistency_weight': .5,
-                           'parent_step': 512, 'parent_experiment': experiment}}
+    child = {'kind': 'reward_shape', 'arm': composition, 'consistency_weight': .5,
+             'parent_step': 512, 'parent_experiment': experiment}
+    if action_geometry_weight:
+        child['action_geometry_weight'] = action_geometry_weight
+    return {**{k: v for k, v in replay.items() if k != 'coverage'}, 'steps': [*steps, *tail], 'experiment': child}
 
 
 def load_observation_replay(path: Path) -> dict:
@@ -70,9 +77,12 @@ def validate_replay_configuration(training: dict, rollout: RolloutConfig, replay
     composition = experiment['arm'] if experiment.get('kind') == 'reward_shape' else 'additive'
     if rollout.reward.composition != composition:
         raise ValueError('rollout reward shape differs from the experiment arm')
+    if rollout.reward.action_geometry_weight != experiment.get('action_geometry_weight', 0.):
+        raise ValueError('rollout action geometry weight differs from the experiment arm')
     actual = {k: v for k, v in rollout.identity_fields().items() if k not in ('train_samples', 'output_relative_dir')}
     if experiment.get('kind') == 'reward_shape':
         actual['reward'].pop('composition', None)
+        actual['reward'].pop('action_geometry_weight', None)
     actual['reward']['consistency_weight'] = .5
     if fixed != identity['training'] or actual != identity['rollout']:
         raise ValueError('ablation must preserve baseline training and rollout settings except consistency weight')
@@ -86,6 +96,7 @@ def replay_identity(identity: dict, replay: dict) -> dict:
     baseline = deepcopy(identity)
     if replay.get('experiment', {}).get('kind') == 'reward_shape':
         baseline['rollout']['reward'].pop('composition', None)
+        baseline['rollout']['reward'].pop('action_geometry_weight', None)
     baseline['rollout']['reward']['consistency_weight'] = .5
     if baseline != replay['baseline_identity']:
         raise ValueError('replay model/data/train population/monitor/inference differs from baseline')
@@ -98,6 +109,8 @@ def replay_identity(identity: dict, replay: dict) -> dict:
         if replay['experiment']['kind'] == 'reward_shape':
             result['rollout'] = {**identity['rollout'], 'reward': {
                 **identity['rollout']['reward'], 'composition': replay['experiment']['arm']}}
+            if 'action_geometry_weight' in replay['experiment']:
+                result['rollout']['reward']['action_geometry_weight'] = replay['experiment']['action_geometry_weight']
     return result
 
 

@@ -42,6 +42,8 @@ class RolloutConfig:
         fields = asdict(self)
         if self.reward.composition == 'additive':
             del fields['reward']['composition']
+        if self.reward.action_geometry_weight == 0:
+            del fields['reward']['action_geometry_weight']
         return fields
 
 
@@ -161,7 +163,8 @@ def rollout_group(*, model: nn.Module, processor: object, sample: SFTSample, ima
         candidate['rewards'] = candidate_rewards(candidate, sample.target, record['future_waypoints'],
                                                   record['trajectory_valid_mask'], config.reward)
         candidates.append(candidate)
-    statistics = assign_advantages(candidates, config.reward.advantage_eps)
+    statistics = assign_advantages(candidates, config.reward.advantage_eps,
+                                   action_geometry_weight=config.reward.action_geometry_weight)
     return {'schema_version': SCHEMA_VERSION, 'sample_token': sample.sample_token,
             'scene_token': sample.scene_token, 'split': sample.split, 'observation': asdict(sample.observation),
             'generation_config': [g.to_dict() for g in generation],

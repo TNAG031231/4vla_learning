@@ -151,14 +151,15 @@ def rollout_diagnostics(groups: list[dict], history: list[dict], train_tokens: l
                 or any(c['sample_token'] != group['sample_token'] for c in candidates)):
             raise ValueError('rollout/history/train population mismatch')
         derived = deepcopy(candidates)
-        statistics = assign_advantages(derived, config.advantage_eps)
+        statistics = assign_advantages(derived, config.advantage_eps,
+                                       action_geometry_weight=config.action_geometry_weight)
         if statistics != group['statistics'] or statistics != update['group_statistics']:
             raise ValueError('saved group statistics differ from reward producer')
         if not np.allclose([c['turn_advantages'] for c in candidates],
                            [c['turn_advantages'] for c in derived], rtol=1e-12, atol=1e-12):
             raise ValueError('saved advantages differ from reward producer')
         for turn in (0, 1):
-            active = not statistics['zero_variance'][turn]
+            active = any(c['turn_advantages'][turn] != 0 for c in derived)
             if active != update['effective_advantage_group'][turn]:
                 raise ValueError('history effective group mismatch')
             effective[turn] += active
@@ -237,7 +238,8 @@ def rollout_diagnostics(groups: list[dict], history: list[dict], train_tokens: l
         'observation_multiplicity': dict(Counter(tokens.values())),
         'unique_train_scenes': len({g['scene_token'] for g in groups}),
         'eligible_train_count': len(train_tokens), 'observation_coverage_fraction': len(tokens) / len(train_tokens),
-        'effective_advantage_groups': effective, 'zero_variance_groups': [len(groups) - n for n in effective],
+        'effective_advantage_groups': effective,
+        'zero_variance_groups': [sum(g['statistics']['zero_variance'][turn] for g in groups) for turn in (0, 1)],
         'groups_with_nonzero_advantage_and_present_tokens': actionable,
         'generated_action_distribution': dict(sorted(generated.items())),
         'gt_training_action_distribution': None,

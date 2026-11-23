@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import statistics
 
 import torch
 
@@ -18,6 +19,7 @@ class RewardConfig:
     consistency_weight: float
     advantage_eps: float
     composition: str = 'additive'
+    action_geometry_weight: float = 0.0
 
     def combine(self, trajectory: float, consistency: float) -> float:
         bonus = self.consistency_weight * consistency
@@ -61,21 +63,44 @@ def candidate_rewards(candidate: dict, target: ActionTarget, waypoints: list,
             'turn_rewards': [action_reward, config.combine(trajectory_reward, consistency_reward)]}
 
 
-def assign_advantages(candidates: list[dict], eps: float) -> dict:
+def _action_geometry_feedback(candidates: list[dict], weight: float) -> list[float]:
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, candidate in enumerate(candidates):
+        if candidate['turn_valid'][0]:
+            action = candidate['parsed_action']
+            groups.setdefault((action['longitudinal'], action['lateral']), []).append(index)
+    feedback = [0.] * len(candidates)
+    if len(groups) < 2:
+        return feedback
+    geometry = [c['rewards']['trajectory'] for c in candidates]
+    baseline = statistics.mean(geometry[i] for indices in groups.values() for i in indices)
+    for indices in groups.values():
+        delta = weight * (statistics.mean(geometry[i] for i in indices) - baseline)
+        for i in indices:
+            feedback[i] = delta
+    return feedback
+
+
+def assign_advantages(candidates: list[dict], eps: float, *, action_geometry_weight: float = 0.0) -> dict:
     rewards = torch.tensor([c['rewards']['turn_rewards'] for c in candidates], dtype=torch.float64)
     mean = rewards.mean(dim=0)
     std = rewards.std(dim=0, correction=1)
     zero = rewards.eq(rewards[0]).all(dim=0)
     advantages = (rewards - mean) / (std + eps)
     advantages[:, zero] = 0
+    stats = {'reward_mean': mean.tolist(), 'reward_std': std.tolist(),
+             'zero_variance': zero.tolist(), 'std_correction': 1,
+             'invalid_rate': [sum(not c['turn_valid'][turn] for c in candidates) / len(candidates)
+                              for turn in range(2)],
+             'missing_turn_rate': [sum(not c['turn_mask'][turn] for c in candidates) / len(candidates)
+                                   for turn in range(2)]}
+    if action_geometry_weight:
+        feedback = _action_geometry_feedback(candidates, action_geometry_weight)
+        advantages[:, 0] += advantages.new_tensor(feedback)
+        stats['action_geometry_feedback'] = feedback
     for candidate, value in zip(candidates, advantages.tolist(), strict=True):
         candidate['turn_advantages'] = value
-    return {'reward_mean': mean.tolist(), 'reward_std': std.tolist(),
-            'zero_variance': zero.tolist(), 'std_correction': 1,
-            'invalid_rate': [sum(not c['turn_valid'][turn] for c in candidates) / len(candidates)
-                             for turn in range(2)],
-            'missing_turn_rate': [sum(not c['turn_mask'][turn] for c in candidates) / len(candidates)
-                                  for turn in range(2)]}
+    return stats
 
 
 def summarize_groups(groups: list[dict]) -> dict:

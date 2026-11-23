@@ -57,6 +57,8 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument('--low512-validation', type=Path, help='original Low-512 full-validation directory')
     parser.add_argument('--reward-shape', choices=('additive', 'multiplicative'),
                         help='Turn 2 reward for steps 513–768, with --low512-validation')
+    parser.add_argument('--action-geometry-weight', type=float, default=0.,
+                        help='weight of within-observation geometry feedback on Turn 1 for additive Low-768')
     parser.add_argument('--dry-run', action='store_true', help='validate configuration only; no data/model loading')
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -70,12 +72,15 @@ def main(argv: list[str] | None = None) -> int:
         replay = load_observation_schedule(args.observation_schedule)
     if (args.low512_validation is None) != (args.reward_shape is None):
         parser.error('--low512-validation and --reward-shape must be provided together')
+    if args.action_geometry_weight and args.reward_shape != 'additive':
+        parser.error('--action-geometry-weight requires --reward-shape additive and --low512-validation')
     low512_identity = None
     if args.reward_shape is not None:
         low = json.loads((args.low512_validation / 'metadata.json').read_text())
-        replay = reward_shape_replay(low, args.reward_shape)
+        replay = reward_shape_replay(low, args.reward_shape, action_geometry_weight=args.action_geometry_weight)
         low512_identity = low['identity']
-        rollout = replace(rollout, reward=replace(rollout.reward, composition=args.reward_shape))
+        rollout = replace(rollout, reward=replace(rollout.reward, composition=args.reward_shape,
+                                                  action_geometry_weight=args.action_geometry_weight))
         if args.mode == 'train' and (args.resume is None or config.max_steps <= 512):
             parser.error('reward-shape training requires --resume and a cumulative budget of 513–768')
         if args.mode == 'evaluate-full' and args.baseline_predictions is None:
