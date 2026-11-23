@@ -124,7 +124,7 @@ def run_identity(config: TrainingConfig, rollout: RolloutConfig, train: list[SFT
                            'optimized': runner.optimized, 'batch_size': runner.inference_batch_size,
                            'compute_log_probs': runner.compute_log_probs}}
     replay = metadata.get('observation_replay')
-    if rollout.reward.composition != 'additive' and replay is None:
+    if (rollout.reward.composition != 'additive' or rollout.reward.action_geometry_weight) and replay is None:
         raise ValueError('reward-shape ablation requires the Low-512 observation schedule')
     if config.consistency_weight != rollout.reward.consistency_weight:
         raise ValueError('training and actual rollout consistency weights differ')
@@ -170,7 +170,7 @@ def group_metrics(group: dict, reward: RewardConfig | None = None) -> dict:
         'total_reward_mean': sum(sum(c['rewards']['turn_rewards']) for c in candidates) / len(candidates),
         'turn_advantages': [c['turn_advantages'] for c in candidates],
         'group_statistics': group['statistics'],
-        'effective_advantage_group': [not zero for zero in group['statistics']['zero_variance']],
+        'effective_advantage_group': [any(c['turn_advantages'][turn] != 0 for c in candidates) for turn in (0, 1)],
         'generated_tokens_by_turn': [sum(len(s['token_ids']) for c in candidates for s in c['assistant_spans']
                                          if s['turn'] == turn) for turn in (1, 2)]}
     if reward is not None:

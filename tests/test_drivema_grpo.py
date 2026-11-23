@@ -161,36 +161,80 @@ def test_low512_reward_shape_continuation(low512_control, config, arguments, sca
     state = torch.load(checkpoint / 'unified_state.pt', weights_only=True)
     assert state['step'] == 512 and state['identity'] == low['identity']
     assert 'composition' not in state['identity']['rollout']['reward']
-    for shape in ('additive', 'multiplicative'):
-        replay = reward_shape_replay(low, shape)
+    assert 'action_geometry_weight' not in state['identity']['rollout']['reward']
+    for arm, shape, weight in [('additive', 'additive', 0.), ('multiplicative', 'multiplicative', 0.),
+                               ('feedback', 'additive', 1.38)]:
+        replay = reward_shape_replay(low, shape, action_geometry_weight=weight)
         assert replay['steps'][:512] == original['steps']
         assert [r['sample_token'] for r in replay['steps'][512:]] == [
             r['sample_token'] for r in original['steps'] if r['visit'] == 1]
         assert all(r['visit'] == r['total_visits'] == 3 for r in replay['steps'][512:])
         arguments['metadata'] = {**original_metadata, 'observation_replay': replay}
         rollout = arguments['rollout_config']
-        arguments['rollout_config'] = replace(rollout, reward=replace(rollout.reward, composition=shape))
+        arguments['rollout_config'] = replace(rollout, reward=replace(rollout.reward, composition=shape,
+                                                                     action_geometry_weight=weight))
         child = deepcopy(parent)
         kwargs = {**arguments, 'low512_identity': low['identity']}
         cfg = replace(cfg, max_steps=513)
-        training.fit(model=child, config=cfg, output=tmp_path / shape, resume=checkpoint, **kwargs)
-        first = tmp_path / shape / 'checkpoint_513'
-        summary = training.fit(model=child, config=replace(cfg, max_steps=768), output=tmp_path / f'{shape}_again',
+        training.fit(model=child, config=cfg, output=tmp_path / arm, resume=checkpoint, **kwargs)
+        first = tmp_path / arm / 'checkpoint_513'
+        summary = training.fit(model=child, config=replace(cfg, max_steps=768), output=tmp_path / f'{arm}_again',
                                resume=first, **kwargs)
         assert summary['last_step'] == 768 and summary['optimizer_steps_this_run'] == 255
-        final_rollout = read_json(tmp_path / f'{shape}_again/rollout_768.json')
+        final_rollout = read_json(tmp_path / f'{arm}_again/rollout_768.json')
         assert final_rollout['sample_token'] == replay['steps'][-1]['sample_token']
         child_state = torch.load(first / 'unified_state.pt', weights_only=True)
         assert child_state['identity'] == replay_identity(original['baseline_identity'], replay)
         assert child_state['identity']['rollout']['reward']['composition'] == shape
-        first_rollout = read_json(tmp_path / shape / 'rollout_513.json')
+        assert child_state['identity']['rollout']['reward'].get('action_geometry_weight', 0.) == weight
+        first_rollout = read_json(tmp_path / arm / 'rollout_513.json')
         assert first_rollout['sample_token'] == replay['steps'][512]['sample_token']
-    with pytest.raises(ValueError, match='identity'):
-        training.fit(model=child, config=replace(cfg, max_steps=514), output=tmp_path / 'wrong-arm',
-                     resume=tmp_path / 'additive/checkpoint_513', **kwargs)
+        if arm != 'additive':
+            with pytest.raises(ValueError, match='identity'):
+                training.fit(model=child, config=replace(cfg, max_steps=514), output=tmp_path / 'wrong-arm',
+                             resume=tmp_path / 'additive/checkpoint_513', **kwargs)
     with pytest.raises(ValueError, match='original Low-512'):
         training.fit(model=child, config=cfg, output=tmp_path / 'wrong-parent', resume=checkpoint,
                      **{**kwargs, 'low512_identity': original['baseline_identity']})
+
+
+def test_action_geometry_cli_uses_low512_additive_replay(low512_control, config, tmp_path, capsys):
+    (tmp_path / 'metadata.json').write_text(json.dumps(low512_control))
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text(yaml.safe_dump(asdict(replace(config, max_steps=768))))
+    args = ['--config', str(config_path), '--resume', 'checkpoint_512', '--dry-run',
+            '--action-geometry-weight', '1.38']
+    with pytest.raises(SystemExit):
+        cli.main(args)
+    matched = args + ['--low512-validation', str(tmp_path), '--reward-shape']
+    with pytest.raises(SystemExit):
+        cli.main(matched + ['multiplicative'])
+    assert cli.main(matched + ['additive']) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan['rollout']['reward']['action_geometry_weight'] == 1.38
+    assert plan['observation_replay']['steps'] == 768
+
+
+def test_action_geometry_feedback_reaches_optimizer(dual_model, controlled_rollout, runner, samples, records,
+                                                   config):
+    from src.phase0.phase0_4b_protocol import ActionTarget
+
+    rollout = training.training_rollout_config(ROOT, config)
+    rollout = replace(rollout, reward=replace(rollout.reward, action_geometry_weight=1.38))
+    sample = replace(samples['train'][0], target=ActionTarget('accelerate', 'right', True, True))
+    images = runner.images(sample)
+    group = controlled_rollout[0](model=dual_model, processor=runner.processor, sample=sample, images=images,
+                                 record=records['train'][0], config=rollout, device='cpu')
+    signals = training.group_metrics(group, rollout.reward)
+    increments = signals['group_statistics']['action_geometry_feedback']
+    assert signals['group_statistics']['zero_variance'][0]
+    assert signals['effective_advantage_group'][0] and any(value != 0 for value in increments)
+
+    optimizer = torch.optim.AdamW(dual_model.parameters(), lr=config.learning_rate)
+    update = training.update_group(dual_model, runner, sample, images, group, optimizer, config)
+    assert update['lora_parameter_delta_l2'] > 0
+    for item, feedback in zip(update['candidates'], increments, strict=True):
+        assert item['turns'][0]['policy_loss'] == pytest.approx(-feedback, abs=1e-6)
 
 
 def test_default_32_and_resume_33_match_continuous(config, arguments, validation_predict,

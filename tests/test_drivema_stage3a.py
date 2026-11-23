@@ -117,6 +117,38 @@ def test_independent_advantages_zero_variance_and_missing_turn(config):
     assert summary['zero_variance_group_rate'] == [1, 1]
 
 
+@pytest.mark.parametrize('actions,geometry,action_valid,expected', [
+    ([('keep', 'left')] * 3 + [('keep', 'right')], [.8, .6, .4, .2], [True] * 4,
+     [.1, .1, .1, -.3]),
+    ([('keep', 'left'), ('stop', 'left'), ('keep', 'left'), ('keep', 'left')],
+     [.6, .6, 0., 0.], [True, True, True, False], [-.1, .2, -.1, 0.]),
+    ([('keep', 'left')] * 4, [.8, .6, .4, 0.], [True] * 4, [0.] * 4),
+    ([None] * 4, [0.] * 4, [False] * 4, [0.] * 4),
+])
+def test_action_geometry_feedback_after_label_normalization(config, actions, geometry, action_valid, expected):
+    candidates = []
+    for action, score, valid in zip(actions, geometry, action_valid, strict=True):
+        parsed = dict(zip(('longitudinal', 'lateral'), action)) if action else None
+        label = .5 if valid and parsed['longitudinal'] == 'keep' else 0.
+        bonus = .25 if score else 0.
+        candidates.append({'parsed_action': parsed, 'turn_valid': [valid, score > 0],
+                           'turn_mask': [True, valid],
+                           'rewards': {'trajectory': score, 'turn_rewards': [label, score + bonus]}})
+    eps = config.reward.advantage_eps
+    baseline = deepcopy(candidates)
+    base_stats = assign_advantages(baseline, eps)
+    stats = assign_advantages(candidates, eps, action_geometry_weight=1.38)
+    feedback = stats.pop('action_geometry_feedback')
+    assert stats == base_stats
+    assert feedback == pytest.approx([1.38 * delta for delta in expected])
+    if not any(expected):
+        assert feedback == [0.] * 4
+    for current, original, delta in zip(candidates, baseline, feedback, strict=True):
+        assert current['rewards'] == original['rewards']
+        assert current['turn_advantages'][0] == pytest.approx(original['turn_advantages'][0] + delta)
+        assert current['turn_advantages'][1] == original['turn_advantages'][1]
+
+
 def scripted_candidates(processor, responses, calls):
     pending = iter(responses)
 
