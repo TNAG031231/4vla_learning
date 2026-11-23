@@ -56,9 +56,11 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument('--observation-schedule', type=Path, help='frozen experiment observation schedule JSON')
     source.add_argument('--low512-validation', type=Path, help='original Low-512 full-validation directory')
     parser.add_argument('--reward-shape', choices=('additive', 'multiplicative'),
-                        help='Turn 2 reward for steps 513–768, with --low512-validation')
+                        help='Turn 2 reward for the matched Low-512 observation schedule')
     parser.add_argument('--action-geometry-weight', type=float, default=0.,
-                        help='weight of within-observation geometry feedback on Turn 1 for additive Low-768')
+                        help='weight of within-observation geometry feedback on Turn 1')
+    parser.add_argument('--feedback-start-step', type=int, choices=(1, 513), default=513,
+                        help='enable geometry feedback from SFT (1) or the Low-512 checkpoint (513)')
     parser.add_argument('--dry-run', action='store_true', help='validate configuration only; no data/model loading')
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -72,16 +74,18 @@ def main(argv: list[str] | None = None) -> int:
         replay = load_observation_schedule(args.observation_schedule)
     if (args.low512_validation is None) != (args.reward_shape is None):
         parser.error('--low512-validation and --reward-shape must be provided together')
-    if args.action_geometry_weight and args.reward_shape != 'additive':
-        parser.error('--action-geometry-weight requires --reward-shape additive and --low512-validation')
+    if (args.action_geometry_weight or args.feedback_start_step == 1) and args.reward_shape != 'additive':
+        parser.error('action geometry feedback requires --reward-shape additive and --low512-validation')
     low512_identity = None
+    from_low512 = args.reward_shape is not None and args.feedback_start_step == 513
     if args.reward_shape is not None:
         low = json.loads((args.low512_validation / 'metadata.json').read_text())
-        replay = reward_shape_replay(low, args.reward_shape, action_geometry_weight=args.action_geometry_weight)
+        replay = reward_shape_replay(low, args.reward_shape, action_geometry_weight=args.action_geometry_weight,
+                                     feedback_start_step=args.feedback_start_step)
         low512_identity = low['identity']
         rollout = replace(rollout, reward=replace(rollout.reward, composition=args.reward_shape,
                                                   action_geometry_weight=args.action_geometry_weight))
-        if args.mode == 'train' and (args.resume is None or config.max_steps <= 512):
+        if from_low512 and args.mode == 'train' and (args.resume is None or config.max_steps <= 512):
             parser.error('reward-shape training requires --resume and a cumulative budget of 513–768')
         if args.mode == 'evaluate-full' and args.baseline_predictions is None:
             args.baseline_predictions = args.low512_validation / 'sft_full_predictions.jsonl'
@@ -114,13 +118,13 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint = args.resume or args.checkpoint
     if checkpoint is not None and replay is not None:
         state = torch.load(checkpoint / 'unified_state.pt', map_location='cpu', weights_only=True)
-        if args.reward_shape and args.resume and state['step'] == 512:
+        if from_low512 and args.resume and state['step'] == 512:
             if state['identity'] != low512_identity:
                 raise ValueError('checkpoint differs from the original Low-512 identity')
         else:
             validate_replay_checkpoint(state, replay, config.consistency_weight)
-        if args.reward_shape and args.mode == 'evaluate-full' and state['step'] != 768:
-            raise ValueError('reward-shape full validation requires checkpoint step 768')
+        if args.reward_shape and args.mode == 'evaluate-full' and state['step'] != len(replay['steps']):
+            raise ValueError(f'reward-shape full validation requires checkpoint step {len(replay["steps"])}')
     initial = resolve_derived_path(args.derived_root, rollout.checkpoint_relative_path)
     semantic = load_action_config(ROOT / 'configs/phase0_4b_lora_full.yaml')
     baseline_source = None

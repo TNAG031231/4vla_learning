@@ -14,13 +14,18 @@ MUTABLE_TRAINING_FIELDS = ('max_steps', 'evaluation_steps', 'checkpoint_interval
                            'output_relative_dir', 'rollout_config', 'consistency_weight')
 
 
-def reward_shape_replay(low_metadata: dict, composition: str, *, action_geometry_weight: float = 0.) -> dict:
+def reward_shape_replay(low_metadata: dict, composition: str, *, action_geometry_weight: float = 0.,
+                        feedback_start_step: int = 513) -> dict:
     if composition not in ('additive', 'multiplicative'):
         raise ValueError('unsupported reward shape')
     if not math.isfinite(action_geometry_weight) or action_geometry_weight < 0:
         raise ValueError('action geometry weight must be finite and nonnegative')
     if action_geometry_weight and composition != 'additive':
         raise ValueError('action geometry feedback requires the additive arm')
+    if feedback_start_step not in (1, 513):
+        raise ValueError('feedback must start at step 1 or 513')
+    if feedback_start_step == 1 and not action_geometry_weight:
+        raise ValueError('step-1 geometry feedback requires a positive weight')
     replay = low_metadata['observation_replay']
     experiment, steps = replay['experiment'], replay['steps']
     visits = Counter(row['sample_token'] for row in steps)
@@ -29,10 +34,15 @@ def reward_shape_replay(low_metadata: dict, composition: str, *, action_geometry
             or experiment['consistency_weight'] != .5 or len(visits) != 256 or set(visits.values()) != {2}
             or [row['optimizer_step'] for row in steps] != list(range(1, 513))
             or low_metadata['identity'] != replay_identity(replay['baseline_identity'], replay)):
-        raise ValueError('reward-shape continuation requires the original pure GRPO Low-512 full validation')
+        raise ValueError('reward-shape replay requires the original pure GRPO Low-512 full validation')
     first_visit = {row['sample_token']: row for row in steps if row['visit'] == 1}
     if first_visit.keys() != visits.keys():
         raise ValueError('expected one first visit per Low-512 observation')
+    if feedback_start_step == 1:
+        early = {'kind': 'reward_shape', 'arm': composition, 'consistency_weight': .5,
+                 'feedback_start_step': 1, 'action_geometry_weight': action_geometry_weight,
+                 'schedule_experiment': experiment}
+        return {**replay, 'experiment': early}
     tail = [{**row, 'optimizer_step': step, 'visit': 3, 'total_visits': 3}
             for step, row in enumerate(first_visit.values(), 513)]
     child = {'kind': 'reward_shape', 'arm': composition, 'consistency_weight': .5,

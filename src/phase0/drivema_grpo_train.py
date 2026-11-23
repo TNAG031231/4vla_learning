@@ -204,16 +204,18 @@ def fit(*, model: nn.Module, runner: Stage2Runner, train: list[SFTSample], valid
                                     for row in sequence):
         raise ValueError('replay observation scene differs from current train intake')
     state = None
-    reward_shape = identity.get('experiment', {}).get('kind') == 'reward_shape'
-    if reward_shape and (resume is None or not 512 < config.max_steps <= 768):
+    experiment = identity.get('experiment', {})
+    reward_shape = experiment.get('kind') == 'reward_shape'
+    from_low512 = reward_shape and experiment.get('feedback_start_step', 513) == 513
+    if from_low512 and (resume is None or not 512 < config.max_steps <= 768):
         raise ValueError('reward-shape training must resume Low-512 or its child through steps 513–768')
     if resume:
         state = torch.load(resume / 'unified_state.pt', map_location='cpu', weights_only=True)
-        if reward_shape and state['step'] == 512:
+        if from_low512 and state['step'] == 512:
             if state['identity'] != low512_identity:
                 raise ValueError('checkpoint differs from the original Low-512 identity')
         else:
-            if reward_shape and state['step'] < 512:
+            if from_low512 and state['step'] < 512:
                 raise ValueError('reward-shape checkpoint precedes Low-512')
             validate_resume(state, identity, config)
     output.mkdir(parents=True, exist_ok=False)
