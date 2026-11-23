@@ -215,6 +215,53 @@ def test_action_geometry_cli_uses_low512_additive_replay(low512_control, config,
     assert plan['observation_replay']['steps'] == 768
 
 
+def test_early_feedback_starts_from_sft_on_the_original_draws_and_resumes_its_own_arm(
+        low512_control, config, arguments, scalar_training, validation_predict, tmp_path):
+    original = low512_control['observation_replay']
+    early = reward_shape_replay(low512_control, 'additive', action_geometry_weight=1.38, feedback_start_step=1)
+    assert early['steps'] == original['steps']
+    assert 'parent_step' not in early['experiment'] and early['experiment']['feedback_start_step'] == 1
+    with pytest.raises(ValueError, match='positive'):
+        reward_shape_replay(low512_control, 'additive', feedback_start_step=1)
+    cfg = replace(config, max_steps=2, evaluation_steps=[0, 2])
+    low = {**arguments, 'metadata': {**arguments['metadata'], 'observation_replay': original}}
+    treatment = {**arguments, 'metadata': {**arguments['metadata'], 'observation_replay': early}}
+    rollout = arguments['rollout_config']
+    treatment['rollout_config'] = replace(rollout, reward=replace(rollout.reward, action_geometry_weight=1.38))
+    model = ScalarAdapters()
+    for arm, inputs in [('control', low), ('early', treatment)]:
+        training.fit(model=model if arm == 'early' else ScalarAdapters(), config=cfg,
+                     output=tmp_path / arm, **inputs)
+    for step in (1, 2):
+        before = read_json(tmp_path / f'control/rollout_{step}.json')
+        after = read_json(tmp_path / f'early/rollout_{step}.json')
+        assert before['draw'] == after['draw']
+        assert before['sample_token'] == after['sample_token'] == original['steps'][step - 1]['sample_token']
+    early_checkpoint = tmp_path / 'early/checkpoint_2'
+    state = torch.load(early_checkpoint / 'unified_state.pt', weights_only=True)
+    assert state['identity'] == replay_identity(early['baseline_identity'], early)
+    continued = replace(cfg, max_steps=3, evaluation_steps=[0, 2, 3])
+    with pytest.raises(ValueError, match='identity'):
+        training.fit(model=model, config=continued, output=tmp_path / 'wrong',
+                     resume=tmp_path / 'control/checkpoint_2', **treatment)
+    result = training.fit(model=model, config=continued, output=tmp_path / 'resumed',
+                          resume=early_checkpoint, **treatment)
+    assert result['optimizer_steps_this_run'] == 1 and result['last_step'] == 3
+
+
+def test_early_feedback_cli_can_train_from_sft_and_evaluate_512(low512_control, config, tmp_path, capsys):
+    (tmp_path / 'metadata.json').write_text(json.dumps(low512_control))
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text(yaml.safe_dump(asdict(replace(config, max_steps=512))))
+    args = ['--config', str(config_path), '--feedback-start-step', '1', '--action-geometry-weight', '1.38',
+            '--reward-shape', 'additive', '--low512-validation', str(tmp_path), '--dry-run']
+    for options in ([], ['--mode', 'evaluate-full', '--checkpoint', 'checkpoint_512']):
+        assert cli.main(args + options) == 0
+        plan = json.loads(capsys.readouterr().out)
+        assert plan['observation_replay']['steps'] == 512
+        assert plan['rollout']['reward']['action_geometry_weight'] == 1.38
+
+
 def test_action_geometry_feedback_reaches_optimizer(dual_model, controlled_rollout, runner, samples, records,
                                                    config):
     from src.phase0.phase0_4b_protocol import ActionTarget
