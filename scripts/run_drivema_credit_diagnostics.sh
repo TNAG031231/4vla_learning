@@ -8,6 +8,7 @@ fi
 oracle_archive=$1
 result_dir=$2
 : "${VLA_DERIVED_ROOT:?set VLA_DERIVED_ROOT}" "${NUSCENES_ROOT:?set NUSCENES_ROOT}"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 run_dir=$(mktemp -d "$VLA_DERIVED_ROOT/drivema/action_credit_diagnostics_XXXXXXXX")
 run_name=${run_dir##*/}
